@@ -62,6 +62,59 @@ def ping():
     """Health check — app uses this to detect backend"""
     return jsonify({'status': 'ok', 'version': '1.0', 'message': 'CineRecap Backend running on your Android!'})
 
+
+# ── ANTHROPIC PROXY ───────────────────────
+@app.route('/anthropic', methods=['POST'])
+def anthropic_proxy():
+    data    = request.json
+    api_key = data.get('api_key', '')
+    prompt  = data.get('prompt', '')
+    model   = data.get('model', 'claude-sonnet-4-20250514')
+    max_tok = data.get('max_tokens', 1000)
+    if not api_key:
+        return jsonify({'error': 'No API key'}), 400
+    try:
+        r = requests.post(
+            'https://api.anthropic.com/v1/messages',
+            headers={'x-api-key': api_key, 'anthropic-version': '2023-06-01', 'Content-Type': 'application/json'},
+            json={'model': model, 'max_tokens': max_tok, 'messages': [{'role': 'user', 'content': prompt}]},
+            timeout=60
+        )
+        return jsonify(r.json()), r.status_code
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+# ── ELEVENLABS PROXY ──────────────────────
+@app.route('/elevenlabs', methods=['POST'])
+def elevenlabs_proxy():
+    data       = request.json
+    api_key    = data.get('api_key', '')
+    text       = data.get('text', '')
+    voice_id   = data.get('voice_id', 'pNInz6obpgDQGcFmaJgB')
+    stability  = data.get('stability', 0.6)
+    similarity = data.get('similarity', 0.75)
+    if not api_key:
+        return jsonify({'error': 'No API key'}), 400
+    try:
+        r = requests.post(
+            f'https://api.elevenlabs.io/v1/text-to-speech/{voice_id}',
+            headers={'xi-api-key': api_key, 'Content-Type': 'application/json', 'Accept': 'audio/mpeg'},
+            json={'text': text, 'model_id': 'eleven_monolingual_v1', 'voice_settings': {'stability': stability, 'similarity_boost': similarity}},
+            timeout=120
+        )
+        if r.status_code == 200:
+            audio_path = os.path.join(AUDIO_DIR, 'voiceover.mp3')
+            with open(audio_path, 'wb') as f:
+                f.write(r.content)
+            dur = subprocess.run(['ffprobe', '-v', 'quiet', '-show_entries', 'format=duration', '-of', 'csv=p=0', audio_path], capture_output=True, text=True)
+            duration = float(dur.stdout.strip() or 0)
+            size_mb  = round(os.path.getsize(audio_path) / 1e6, 1)
+            return jsonify({'status': 'ok', 'audio_path': audio_path, 'duration': duration, 'duration_fmt': f'{int(duration//60):02d}:{int(duration%60):02d}', 'size_mb': size_mb})
+        else:
+            return jsonify({'error': f'ElevenLabs error {r.status_code}: {r.text[:200]}'}), r.status_code
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 @app.route('/job/<jid>')
 def job_status(jid):
     """Poll job progress"""

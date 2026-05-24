@@ -889,7 +889,12 @@ async function genScript(){
   addL('t-s','ai','✦ Claude: Writing voiceover + timestamps…');apg('pg-s',60,1500);
   let data;
   try{data=await apiScript(title,genre,dur,inst,key)}
-  catch{data=demoData(title);addL('t-s','w','⚠ Demo mode — add Anthropic API key')}
+  catch(err){
+    data=demoData(title);
+    if(!backendConnected) addL('t-s','w','⚠ Connect Termux backend first — tap ⚙ and enter http://localhost:5000');
+    else if(!key) addL('t-s','w','⚠ Add Anthropic API key in ⚙ settings');
+    else addL('t-s','e','✗ API error: '+(err.message||'unknown — check your API key'));
+  }
   apg('pg-s',100,400);await W(400);
   addL('t-s','ok',`✓ ${data.timestamps.length} clips · ${data.wordCount} words`);
   document.getElementById('sbadge').textContent='DONE';
@@ -908,6 +913,19 @@ async function genScript(){
   document.getElementById('sout').style.display='block';
 }
 async function apiScript(title,genre,dur,inst,key){
+  if(!key)throw 0;
+  const prompt=`You are a YouTube movie recap scriptwriter. Create for "${title}" (${genre}) targeting ${dur}.${inst?`\nInstructions: ${inst}`:''}
+Return ONLY valid JSON no markdown:
+{"script":"Full voiceover...","wordCount":1200,"timestamps":[{"start":"00:04:30","end":"00:06:15","scene":"Scene description","emotion":"Tense"}]}
+8-12 timestamps. Emotions: Tense,Epic,Emotional,Dramatic,Action,Revelation,Hopeful,Dark,Climax`;
+  if(!backendConnected) throw new Error('Backend not connected');
+  const r=await fetch(backendUrl+'/anthropic',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({api_key:key,prompt,max_tokens:1000})});
+  const d=await r.json();
+  if(d.error) throw new Error(d.error);
+  const txt=d.content.map(i=>i.text||'').join('');
+  return JSON.parse(txt.replace(/```json|```/g,'').trim());
+}
+async function apiScript_UNUSED(title,genre,dur,inst,key){
   if(!key)throw 0;
   const r=await fetch('https://api.anthropic.com/v1/messages',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model:'claude-sonnet-4-20250514',max_tokens:1000,messages:[{role:'user',content:`You are a YouTube movie recap scriptwriter. Create for "${title}" (${genre}) targeting ${dur}.${inst?`\nInstructions: ${inst}`:''}
 Return ONLY valid JSON no markdown:
@@ -1202,6 +1220,16 @@ async function genSEO(){
   upSEO();toast('✓ SEO generated','ok');
 }
 async function apiSEO(title,key){
+  if(!key)throw 0;
+  const prompt=`YouTube SEO for movie recap of "${title}". ONLY JSON no markdown:\n{"title":"Clickbait title under 70 chars","description":"500+ chars with timestamps and CTA","tags":["up to 20 tags"]}`;
+  if(!backendConnected) throw new Error('Backend not connected');
+  const r=await fetch(backendUrl+'/anthropic',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({api_key:key,prompt,max_tokens:1000})});
+  const d=await r.json();
+  if(d.error) throw new Error(d.error);
+  const txt=d.content.map(i=>i.text||'').join('');
+  return JSON.parse(txt.replace(/```json|```/g,'').trim());
+}
+async function apiSEO_UNUSED(title,key){
   if(!key)throw 0;
   const r=await fetch('https://api.anthropic.com/v1/messages',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model:'claude-sonnet-4-20250514',max_tokens:1000,messages:[{role:'user',content:`YouTube SEO for movie recap of "${title}". ONLY JSON no markdown:\n{"title":"Clickbait title under 70 chars","description":"500+ chars with timestamps and CTA","tags":["up to 20 tags"]}`}]})});
   const d=await r.json();
