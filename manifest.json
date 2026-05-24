@@ -1,0 +1,35 @@
+{
+  "name": "CineRecap Studio",
+  "short_name": "CineRecap",
+  "description": "AI Movie Recap YouTube Automation",
+  "start_url": "/Cinereap-studio/",
+  "scope": "/Cinereap-studio/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#08090E",
+  "theme_color": "#E8C547",
+  "icons": [
+    {
+      "src": "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 192 192'><rect width='192' height='192' fill='%23E8C547'/><polygon points='70,50 70,142 152,96' fill='%2308090E'/></svg>",
+      "sizes": "192x192",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 512 512'><rect width='512' height='512' fill='%23E8C547'/><polygon points='180,130 180,382 400,256' fill='%2308090E'/></svg>",
+      "sizes": "512x512",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ],
+  "categories": ["productivity", "entertainment"],
+  "screenshots": [],
+  "shortcuts": [
+    {
+      "name": "New Recap",
+      "short_name": "New",
+      "description": "Start a new movie recap",
+      "url": "/Cinereap-studio/"
+    }
+  ]
+}
