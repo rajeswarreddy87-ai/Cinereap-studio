@@ -1,3 +1,42 @@
+
+      if (!_outroTtsOk) {
+        console.warn(`[render ${jobId}] OUTRO TTS: all providers failed — outro skipped`);
+      }
+
+      if (_outroTtsOk) {
+        console.log(`[render ${jobId}] OUTRO TTS: ${_outroDurSec.toFixed(1)}s — id=${_outroTtsId}`);
+        // Use footage from 55% into the film — avoids the climax/ending region
+        // that story beats already cover (last 30%), preventing the same footage
+        // appearing in the outro that viewers just watched in beats 70-80.
+        let _oSrcDur = 0;
+        try { _oSrcDur = await probeDurationSec(sourcePath); } catch {}
+        if (_oSrcDur > 60) {
+          const _oStart    = Math.max(30, _oSrcDur * 0.55);
+          const _oEnd      = Math.min(_oSrcDur - 3, _oStart + Math.max(_outroDurSec + 3, 15));
+          const _oClipPath = path.join(UPLOADS_DIR, `outro-clip-${jobId}.mp4`);
+          const _oArgs     = buildTrimArgs({ inputPath: sourcePath, startSec: _oStart, endSec: _oEnd, outputPath: _oClipPath, reencode: true });
+          await new Promise((res) => {
+            const ff = spawn("ffmpeg", _oArgs, { stdio: "ignore" });
+            const t  = setTimeout(() => { try { ff.kill("SIGKILL"); } catch {} res(); }, 90_000);
+            ff.on("close", (code) => {
+              clearTimeout(t);
+              if (code === 0) {
+                clipPaths.push(_oClipPath);
+                voiceoverFileIds.push(_outroTtsId);
+                console.log(`[render ${jobId}] OUTRO: appended clip (${_oStart.toFixed(0)}–${_oEnd.toFixed(0)}s) + TTS ${_outroTtsId}`);
+              } else {
+                console.warn(`[render ${jobId}] outro clip failed (code ${code}) — skipping`);
+              }
+              res();
+            });
+            ff.on("error", (e) => { clearTimeout(t); console.warn(`[render ${jobId}] outro clip error:`, e?.message || e); res(); });
+          });
+        }
+      }
+    }
+  } catch (outroErr) {
+    console.warn(`[render ${jobId}] outro generation failed (non-fatal):`, outroErr?.message || outroErr);
+  }
   // ── END OUTRO SEGMENT ─────────────────────────────────────────────────────
 
   const outputPath     = path.join(OUTPUT_DIR, `recap-${jobId}.mp4`);
@@ -155,44 +194,13 @@
       const _tsDurArr = Array.isArray(whisperBeatDurations) ? whisperBeatDurations
                       : Array.isArray(_perBeatTtsDurations) ? _perBeatTtsDurations
                       : null;
-      const _voiDur = (_tsDurArr && Number(_tsDurArr[_bi]) > 0.05)
+      const _contentDur = (_tsDurArr && Number(_tsDurArr[_bi]) > 0.05)
         ? Number(_tsDurArr[_bi])
         : await probeDurationSec(_voPath).catch(() => 0);
+      const _fileDur = await probeDurationSec(_voPath).catch(() => _contentDur);
+      const _isTailBeat = _beatOrder.indexOf(_bi) >= Math.max(0, _beatOrder.length - 3);
+      const _voiDur = _isTailBeat ? Math.max(_contentDur, _fileDur) : _contentDur;
 
       const _gap    = _voiDur - _vidDur;  // +ve = video short, -ve = video long
 
       if (_gap > 0.30 && _vidDur > 0) {
-        // CASE 1: video shorter than TTS by > 0.30s
-        const _beat      = beats[_bi];
-        const _nextBeat  = beats[_bi + 1];
-        const _beatStart = Number(_beat?.startSec || 0);
-        const _beatEnd   = Number(_beat?.endSec   || _beatStart + _vidDur);
-        const _nextStart = _nextBeat ? Number(_nextBeat.startSec) : _beatEnd + 120;
-        const _target    = _voiDur + 0.25;  // desired clip duration
-
-        let _extPath = _beatVideoPath;
-        let _extDur  = _vidDur;
-
-        // STEP 1+2: re-trim beat's own source window (same sceneIds), just longer
-        {
-          const _s1End = Math.min(_beatStart + _target, _nextStart - 0.1);
-          if (_s1End > _beatEnd + 0.2 && _beatStart >= 0) {
-            const _s1Path = path.join(UPLOADS_DIR, `beat-gf1-${jobId}-${String(_bi).padStart(3,"0")}.mp4`);
-            const _s1Ok   = await new Promise((res) => {
-              const ff = spawn("ffmpeg", buildTrimArgs({
-                inputPath: sourcePath, startSec: _beatStart, endSec: _s1End,
-                outputPath: _s1Path, reencode: true,
-              }), { stdio: "ignore" });
-              const t = setTimeout(() => { try { ff.kill("SIGKILL"); } catch {} res(false); }, 90_000);
-              ff.on("close", (code) => { clearTimeout(t); res(code === 0); });
-              ff.on("error", () => { clearTimeout(t); res(false); });
-            });
-            if (_s1Ok) {
-              const _s1Dur = await probeDurationSec(_s1Path).catch(() => 0);
-              if (_s1Dur > _extDur) { _extPath = _s1Path; _extDur = _s1Dur; }
-            }
-          }
-        }
-
-        // STEP 3: immediately adjacent scenes from same continuous event (+1, +2 only)
-        if (_target - _extDur > 0.30 && _scenesMap && Array.isArray(_beat?.sceneIds) && _beat.sceneIds.length > 0) {

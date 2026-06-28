@@ -1,83 +1,91 @@
-          const best = bucket.reduce((top, beat) =>
-            +(beat.importance || 0) >= +(top.importance || 0) ? beat : top
-          );
-          if (seenRefs.has(best)) return null;
-          seenRefs.add(best);
-          return best;
-        }).filter(Boolean);
-        for (const pb of protectedBeats) {
-          if (!kept.includes(pb) && kept.length < BEATS_TARGET + 8) {
-            kept.push(pb);
-            console.log(`[render ${jobId}] BEAT-TRIM: protected key scene kept (${String(pb.narration||"").slice(0,40)}…)`);
           }
+          console.log(
+            `[render ${jobId}] scene-sync: loaded ${beats.length} beats from ` +
+            `analyze job ${analyzeJob.id} — windows expanded to full scene ranges`,
+          );
+          await jobStore.update(jobId, {
+            message: `Scene sync: ${beats.length} scenes, windows expanded for unique footage`,
+          });
         }
-        kept.sort((a, b) => Number(a.startSec) - Number(b.startSec));
-
-        console.log(`[render ${jobId}] BEAT-TRIM: ${original.length}→${kept.length} beats (target=${BEATS_TARGET} for ${+targetMinutes || 20}min, stratified)`);
-        beats = kept;
-      } else {
-        console.log(`[render ${jobId}] BEAT-TRIM: ${beats.length} beats — under target (${BEATS_TARGET} for ${+targetMinutes || 20}min), keeping all`);
+      } catch (e) {
+        console.warn(`[render ${jobId}] could not auto-load analyze beats:`, e?.message || e);
       }
     }
-    // ── END RECAP LENGTH TARGET ───────────────────────────────────────────────
+  }
 
-    // ── HOOK V2 GENERATION ─────────────────────────────────────────────────
-    // Select top emotional beats by hookScore, ask Claude to write hook text
-    // referencing those exact beat IDs. Footage will come from the same beats.
-    // Mismatch between narration and footage is structurally impossible.
-    if (HOOK_V2 && Array.isArray(beats) && beats.length >= 5 && (SERVER_ANTHROPIC_KEY || SERVER_OPENAI_KEY)) {
-      try {
-        // Step 1: score each beat
-        const _hookIntroFloor = 120; // match body intro-skip — never hook with credits/logos
-        const _hv2Scored = beats.map((b, i) => {
-          const imp = +(b.importance    || 0);
-          const emo = +(b.emotionScore  || imp);
-          const sur = +(b.surpriseScore || imp);
-          const start = Number(b.startSec) || 0;
-          if (start < _hookIntroFloor) return { _idx: i, hookScore: -1, startSec: start };
-          return { _idx: i, hookScore: imp * 0.60 + emo * 0.30 + sur * 0.10, startSec: start };
-        }).filter((x) => x.hookScore >= 0);
+  // ---- v2.2 TRUE SYNC: if the caller sent per-beat narration windows, replace
+  // the incoming timestamps with a narration-paced timeline (no looping). We
+  // measure the voiceover length up front so each beat's on-screen duration
+  // matches how long it is spoken. `syncMode` then forces videoLoopCount=0.
+  let syncMode = false;
+  let syncBeatDurations = null;   // per-beat seconds (for music spans)
+  let syncMoods = null;           // per-beat moods (for music spans)
+  let voiceTotalPre = 0;
+  let _perBeatTtsDurations = null; // set by per-beat TTS; used for SRT + sync score
+  let whisperBeatDurations = null; // hoisted here so Phase-B gap-fill can read it
+  if (Array.isArray(beats) && beats.length > 0 &&
+      (voiceoverFileIds.length > 0 || !!(SERVER_SPEECHIFY_KEY || SERVER_OPENAI_KEY))) {
+    // ── UNIVERSAL BEAT NORMALISATION ──────────────────────────────────────
+    // Runs BEFORE anything else in the sync block so it applies whether
+    // beats came from the app request body OR were auto-loaded from the
+    // analyze job.  Previously the SKIP filter and window expansion only
+    // lived in the auto-load path, so app-sent beats (which bypass
+    // auto-load) still carried 6-second windows and SKIP entries —
+    // causing the planner to cycle the same 288s of footage 4+ times.
+    {
+      const beatsBefore = beats.length;
 
-        // Step 2: top 8 by hookScore, restore chronological order.
-        // FIX: Beats sent from the app often lack importance/emotionScore/surpriseScore
-        // fields, causing all hookScores to be 0. When that happens, the old code
-        // silently fell back to the first 8 chronological beats (opening scenes) which
-        // are dull and non-dramatic. Instead, when all scores are 0, sample from the
-        // climax region (40–80% through the story) which contains the peak drama.
-        const _allZeroHookScores = _hv2Scored.every(s => s.hookScore === 0);
-        let _hv2Top;
-        if (_allZeroHookScores) {
-          const n = beats.length;
-          const _climaxCandidates = _hv2Scored.filter(({ _idx }) => {
-            const frac = _idx / Math.max(1, n - 1);
-            return frac >= 0.40 && frac <= 0.80;
-          });
-          // Use climax region if it has at least 4 beats; otherwise use all beats
-          const _hv2Pool = _climaxCandidates.length >= 4 ? _climaxCandidates : _hv2Scored;
-          // Evenly sample 8 beats from the pool to get good coverage
-          const _stride = Math.max(1, Math.floor(_hv2Pool.length / 8));
-          _hv2Top = _hv2Pool
-            .filter((_, k) => k % _stride === 0)
-            .slice(0, 8)
-            .sort((a, b) => a._idx - b._idx);
-          console.log(`[render ${jobId}] HOOK-V2: no importance scores — sampling ${_hv2Top.length} beats from climax region (beats ${_hv2Top.map(x => x._idx).join(",")})`);
-        } else {
-          _hv2Top = _hv2Scored
-            .slice()
-            .sort((a, b) => b.hookScore - a.hookScore)
-            .slice(0, 8)
-            .sort((a, b) => a._idx - b._idx);
+      // ── PAIRED SORT: keep voiceoverFileIds in lockstep with beats ───────
+      // When the app sends one audio file per beat (lengths match), sorting
+      // beats by startSec without reordering the audio causes a complete
+      // narration-to-video mismatch: audio plays in script order while video
+      // plays in chronological order. Fix: tag each beat with its original
+      // index so we can reconstruct the audio order after sorting/filtering.
+      const voicePerBeat = voiceoverFileIds.length === beats.length && beats.length > 0;
+      let taggedBeats = beats.map((b, i) => ({ ...b, _origIdx: i }));
+
+      taggedBeats = taggedBeats
+        .filter((b) => {
+          // Drop only beats Claude labelled as SKIP or described as credits/logos.
+          // No hard time threshold — story content starts at different points
+          // per film and region.
+          const narr = String(b.narration || b.reason || "").trim();
+          if (narr.toUpperCase().startsWith("SKIP")) return false;
+          if (/\b(studio|logo|production\s*company|distributor|credit|title\s*card|opening\s*credit)\b/i.test(narr)) return false;
+          return true;
+        })
+        .sort((a, b) => Number(a.startSec) - Number(b.startSec))
+        .map((b, i, arr) => {
+          // Expand each window to the full scene range (next beat's startSec).
+          if (i < arr.length - 1) {
+            return { ...b, endSec: Math.max(Number(b.endSec), Number(arr[i + 1].startSec)) };
+          }
+          return b; // last beat: extended to safeCeiling below
+        });
+
+      // Reorder audio files to match the sorted beat order.
+      if (voicePerBeat && taggedBeats.length > 0) {
+        const origVoice = voiceoverFileIds.slice();
+        voiceoverFileIds = taggedBeats.map((b) => origVoice[b._origIdx]).filter(Boolean);
+        const reordered = taggedBeats.some((b, i) => b._origIdx !== i);
+        if (reordered) {
+          console.log(`[render ${jobId}] SYNC: reordered ${taggedBeats.length} voice files to match chronological beat order`);
         }
+      }
 
-        // Step 3: build prompt with stable beat IDs (array index)
-        const _hv2Lines = _hv2Top
-          .map(({ _idx }) => {
-            const b = beats[_idx];
-            return `Beat #${_idx} (${Math.round(b.startSec || 0)}s–${Math.round(b.endSec || 0)}s): ${String(b.narration || b.reason || "").trim().slice(0, 120)}`;
-          })
-          .join("\n");
+      // Strip internal tag before using beats downstream.
+      beats = taggedBeats.map(({ _origIdx, ...b }) => b);
 
-        const _hv2Prompt =
-`You write YouTube movie recap hooks (max 60 words, ~20s narration time).
+      const poolSec = beats.reduce((s, b) => s + Math.max(0, Number(b.endSec) - Number(b.startSec)), 0);
+      console.log(
+        `[render ${jobId}] SYNC: beats normalised ${beatsBefore}→${beats.length}` +
+        ` (SKIP/intro filtered, windows expanded, unique pool=${poolSec.toFixed(0)}s)`,
+      );
+    }
+    // ── END NORMALISATION ─────────────────────────────────────────────────
 
-Selected story beats:
+    // ── RECAP LENGTH TARGET ────────────────────────────────────────────────────
+    // Compute beat target from user-selected duration (passed as targetMinutes).
+    // Average TTS per beat ≈ 15s empirically; clamp between 40 and 120 beats.
+    // Save full beat list before trimming — hook footage lookup needs all scene indices.
+    _preTrimBeats = beats.slice();

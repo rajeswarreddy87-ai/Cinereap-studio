@@ -1,78 +1,78 @@
-/* ---------- /render-from-ingest: trim + concat directly from a cached source ---------- */
-app.post("/render-from-ingest", requireAuth, async (req, res) => {
-  const {
-    fileId,
-    timestamps,
-    voiceoverFileId,
-    voiceoverFileIds,    // new — array of MP3 chunks to concat
-    musicFileId,         // new — single MP3 to mix in (uploaded file)
-    musicMood,           // new — name of a built-in mood bed in /data/music
-    subtitlesSrt,        // new — raw .srt content to burn into video
-    musicVolumeDb,       // new — optional, defaults to -14 dB
-    beats,               // v2.2 — Option B: [{ startSec, endSec, narration, mood }] in narration order
-    sceneAdaptiveMusic,  // v2.2 — when true + beats present, switch music mood per scene span
-    analyzeJobId,        // v2.7 — ID of the analyze job whose frames CLIP should search
-    targetMinutes,       // user-selected recap length (minutes)
-    settings,
-  } = req.body || {};
-  if (!fileId) return res.status(400).json({ error: "fileId required" });
-  if (!Array.isArray(timestamps) || timestamps.length === 0) {
-    return res.status(400).json({ error: "timestamps required" });
-  }
-  const sourcePath = path.join(UPLOADS_DIR, fileId);
-  try { await fs.access(sourcePath); } catch { return res.status(404).json({ error: "fileId not found" }); }
+      // Stored as result.hookText — the render step prepends it automatically to
+      // every video so viewers see a dramatic tease before the story begins.
+      // Uses Claude (best quality); falls back to OpenAI if no Anthropic key.
+      let _hookText = null;
+      let _hookSceneIds = null; // hoisted so result storage below can always reference it
+      const _hookBeats = Array.isArray(parsed.beats) ? parsed.beats : [];
+      if (_hookBeats.length >= 5 && (claudeApiKey || openaiApiKey)) {
+        try {
+          const _beatLines = _hookBeats
+            .slice(0, 25)
+            .map((b, i) => `${i + 1}. ${String(b.narration || b.reason || "").trim().slice(0, 110)}`)
+            .join("\n");
+          // Build a sceneIds reference for the hook: top-5 highest-importance beats.
+          const _hookTopSceneIds = _hookBeats
+            .slice()
+            .sort((a, b) => (+(b.importance || 0)) - (+(a.importance || 0)))
+            .slice(0, 5)
+            .flatMap((b) => Array.isArray(b.sceneIds) ? b.sceneIds : [b.index])
+            .filter((v, i, arr) => Number.isFinite(v) && arr.indexOf(v) === i)
+            .sort((a, b) => a - b);
 
-  // Resolve voiceover file IDs into a list. Both legacy single-id and new
-  // array form are accepted; the array wins when both are provided.
-  const voiceIds = Array.isArray(voiceoverFileIds) && voiceoverFileIds.length > 0
-    ? voiceoverFileIds
-    : (voiceoverFileId ? [voiceoverFileId] : []);
-  for (const id of voiceIds) {
-    try { await fs.access(path.join(UPLOADS_DIR, id)); }
-    catch { return res.status(400).json({ error: `Missing voiceover: ${id}` }); }
-  }
-  if (musicFileId) {
-    try { await fs.access(path.join(UPLOADS_DIR, musicFileId)); }
-    catch { return res.status(400).json({ error: `Missing music: ${musicFileId}` }); }
-  }
-  // Resolve a built-in mood bed (no upload needed). Sanitise the mood name to a
-  // bare filename so it can never escape /data/music.
-  let resolvedMusicPath = null;
-  if (!musicFileId && typeof musicMood === "string" && musicMood.trim()) {
-    const safe = musicMood.trim().toLowerCase().replace(/[^a-z]/g, "");
-    const candidate = path.join(MUSIC_DIR, `${safe}.mp3`);
-    try { await fs.access(candidate); resolvedMusicPath = candidate; }
-    catch { return res.status(400).json({ error: `Unknown music mood: ${musicMood}` }); }
-  }
+          const _hookPrompt =
+`You write 50-80 word YouTube movie recap hooks (20-30 s narration time).
 
-  const jobId = nanoid(10);
-  const normalised = normaliseRenderSettings(settings || {});
-  await jobStore.create(jobId, {
-    status: "queued",
-    progress: 0,
-    message: "Queued",
-    kind: "render",
-    sourceFileId: fileId,
-    voiceoverFileIds: voiceIds,
-    musicFileId: musicFileId || null,
-    hasSubtitles: typeof subtitlesSrt === "string" && subtitlesSrt.trim().length > 0,
-    timestamps,
-    settings: normalised,
-  });
+Story beats:
+${_beatLines}
 
-  withAutoRetry(jobId, "render", () => runRenderFromIngest(jobId, {
-    sourcePath,
-    timestamps,
-    voiceoverFileIds: voiceIds,
-    musicFileId: musicFileId || null,
-    musicPathOverride: resolvedMusicPath,
-    subtitlesSrt: typeof subtitlesSrt === "string" ? subtitlesSrt : "",
-    musicVolumeDb,
-    beats: Array.isArray(beats) ? beats : null,
-    sceneAdaptiveMusic: sceneAdaptiveMusic !== false, // default ON when beats present
-    analyzeJobId: typeof analyzeJobId === "string" && analyzeJobId.trim() ? analyzeJobId.trim() : null,
-    targetMinutes: Number(targetMinutes) || Number(normalised?.targetMinutes) || 20,
-    settings: normalised,
-  })).catch(() => {});
+RULES — follow ALL:
+• Immediately grab attention. Short sentences. Fast pacing. Present tense. High tension.
+• Create curiosity, tension, and an unanswered question.
+• Do NOT reveal the ending, killer identity, final twist, resolution, or who survives.
+• Do NOT open with a character name, ordinary daily life, or slow exposition.
+• End with exactly one transition line such as "Let's go back to the beginning." or "To understand how this happened, let's start from the beginning."
 
-  res.json({ jobId });
+STRUCTURE: (1) shocking situation → (2) heighten danger/mystery → (3) unanswered question → (4) transition.
+
+ALSO choose hookSceneIds: an array of 3-6 scene indices (from the beat list above) whose
+footage best visually represents the hook narration. Pick from the most dramatic / high-action
+scenes. These will be used as the visual backdrop for the hook segment.
+
+Respond with valid JSON ONLY:
+{ "hookText": "<50-80 word hook>", "hookSceneIds": [<scene indices>] }
+No prose, no markdown, no other keys.`;
+
+          let _hookRaw = null;
+          if (claudeApiKey) {
+            const _hr = await fetch("https://api.anthropic.com/v1/messages", {
+              method: "POST",
+              headers: { "Content-Type": "application/json",
+                "x-api-key": claudeApiKey, "anthropic-version": "2023-06-01" },
+              body: JSON.stringify({ model: "claude-haiku-4-5", max_tokens: 300,
+                messages: [{ role: "user", content: _hookPrompt }] }),
+              signal: AbortSignal.timeout(25_000),
+            });
+            const _hd = await _hr.json();
+            _hookRaw = _hd?.content?.[0]?.text?.trim() || null;
+          } else {
+            const _hr = await fetch("https://api.openai.com/v1/chat/completions", {
+              method: "POST",
+              headers: { "Content-Type": "application/json", Authorization: `Bearer ${openaiApiKey}` },
+              body: JSON.stringify({ model: "gpt-4o-mini", max_tokens: 300,
+                messages: [{ role: "user", content: _hookPrompt }] }),
+              signal: AbortSignal.timeout(25_000),
+            });
+            const _hd = await _hr.json();
+            _hookRaw = _hd?.choices?.[0]?.message?.content?.trim() || null;
+          }
+          // Parse JSON response — fall back to treating raw content as plain hookText.
+          _hookSceneIds = _hookTopSceneIds;
+          if (_hookRaw) {
+            try {
+              const _fence = _hookRaw.match(/```(?:json)?\s*([\s\S]+?)```/);
+              const _src = _fence ? _fence[1].trim() : _hookRaw;
+              const _hj = JSON.parse(_src);
+              if (typeof _hj?.hookText === "string" && _hj.hookText.trim()) {
+                _hookText = _hj.hookText.trim();
+                if (Array.isArray(_hj.hookSceneIds) && _hj.hookSceneIds.length > 0) {
+                  // GPT is shown beats as "${i+1}. narration" (1-based positions).

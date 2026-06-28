@@ -1,9 +1,9 @@
-# CineRecap VPS Pipeline — Code Reference (v2.7.3)
+# CineRecap VPS Pipeline — Code Reference (v2.7.4)
 
 **Server path:** `/root/cinerecap-render-server/`  
 **Live URL:** `http://109.123.241.130:4040`  
 **Exported copies in this repo:** `docs-export/`
-**Latest VPS patch:** v2.7.3 — hook scope, CLIP scope, intro filter, final audio tail preservation.
+**Latest VPS patch:** v2.7.4 — post-trim hook footage, protected scene locks, Whisper candidate windows, optional Gemini Flash verifier, tail-beat full-MP3 gap fill.
 
 ---
 
@@ -29,6 +29,7 @@ Your Android app already follows this correctly (confirmed in `api.ts` + `index.
 | **Beat assembly / mux** | `src/index.js` | `docs-export/beat-mux-excerpt.js` | Per-beat video concat + `_muxVideoWithVoice()` |
 | **Hook generation** | `src/index.js` | `docs-export/hook-generation-excerpt.js` | HOOK-V2 Claude prompt + `sourceBeatIds` |
 | **Timeline sync block** | `src/index.js` | `docs-export/timeline-sync-excerpt.js` | Whisper align, sync score, subdivide |
+| **Gemini verifier** | `src/index.js` | `docs-export/gemini-verifier-excerpt.js` | Whisper/OpenCLIP/Gemini candidate verification |
 | **Render API** | `src/index.js` | `docs-export/render-route-excerpt.js` | `POST /render-from-ingest` |
 | **FFmpeg helpers** | `src/ffmpeg-args.js` | `docs-export/ffmpeg-args.js` | `buildTrimArgs()`, `buildRenderArgs()`, `setpts` slow-mo |
 | **Music ducking** | `src/music.js` + index.js | `docs-export/music.js` | Mood beds, sidechain compress |
@@ -109,7 +110,7 @@ Server reports **0.3–0.6s timing drift** — not 5–10s.
 4. **Music** — default bed `-26dB` (was `-18`), stronger ducking `ratio=12`
 5. **v2.7.1 fixes retained** — analyzeJobId auto-resolve, per-beat TTS, video speed-up in mux
 
-Verify: `GET /health` → `"version": "2.7.3"`
+Verify: `GET /health` → `"version": "2.7.4"`
 
 ---
 
@@ -185,3 +186,26 @@ Download `cinerecap-pipeline-code.tar.gz` for complete copy-paste archive.
 - Enforced intro-safe floor by filtering pre-logo/credits beats before timeline planning.
 - Removed beat-level video speed-up and padded video tail to actual MP3 duration so final words are not cut by `-shortest`.
 - Persisted final `result` metadata (`downloadUrl`, duration, size, hookIncluded, beatsRendered).
+
+
+## v2.7.4 additional fixes
+
+- Hook footage now resolves from the post-trim beat list used to write hook narration, fixing hook narration/video mismatch.
+- Protected story beats (funeral, cemetery, grave, death, shooting, climax, hospital, etc.) are locked against CLIP/text recentering so important visuals are not moved away from their analyzed source windows.
+- Source Whisper transcript cache is loaded during render and used to produce candidate timestamp windows for dialogue-heavy beats.
+- Optional Gemini Flash verifier added: when `GEMINI_API_KEY` is set, the server sends top candidate short clips (analyze/current/OpenCLIP/Whisper) and lets Gemini choose the best visual match.
+- Tail beats use actual MP3 duration for gap-fill so climax/final narration is less likely to play over a frozen last frame.
+- Default TTS speed is slightly slower (`0.95`) unless overridden by app/settings/env.
+
+### Gemini activation
+
+Add to `/root/cinerecap-render-server/.env` and recreate the container:
+
+```bash
+GEMINI_API_KEY=your_google_ai_studio_key
+GEMINI_MODEL=gemini-2.5-flash
+GEMINI_VERIFY_MAX_BEATS=80
+cd /root/cinerecap-render-server && docker compose up -d --force-recreate render
+```
+
+`GET /health` should then show `geminiVerifier: true`.
