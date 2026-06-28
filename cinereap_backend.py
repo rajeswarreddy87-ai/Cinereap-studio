@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 """
-CineRecap Studio — Termux Backend
-===================================
-Run this on your Android phone via Termux.
-It handles FFMPEG video clipping, rendering,
-and ElevenLabs voiceover generation locally.
+CineRecap Studio — Termux / VPS Backend
+=======================================
+Run on Android (Termux) or a VPS with FFmpeg installed.
 
 SETUP (run once in Termux):
   pkg update && pkg upgrade -y
@@ -13,17 +11,14 @@ SETUP (run once in Termux):
 
 RUN:
   python cinereap_backend.py
-
-Then in the app settings, set Backend URL to:
-  http://localhost:5000
 """
 
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
-import subprocess, os, json, requests, threading, uuid, time
+import subprocess, os, json, requests, threading, uuid, time, re, shutil
 
 app = Flask(__name__)
-CORS(app)  # Allow requests from GitHub Pages
+CORS(app)
 
 # ── Directories ──────────────────────────
 BASE_DIR = os.path.expanduser('~/cinereap')
@@ -31,11 +26,17 @@ UPLOAD_DIR = os.path.join(BASE_DIR, 'uploads')
 CLIPS_DIR  = os.path.join(BASE_DIR, 'clips')
 OUTPUT_DIR = os.path.join(BASE_DIR, 'output')
 AUDIO_DIR  = os.path.join(BASE_DIR, 'audio')
+SYNC_DIR   = os.path.join(BASE_DIR, 'sync_segments')
 
-for d in [UPLOAD_DIR, CLIPS_DIR, OUTPUT_DIR, AUDIO_DIR]:
+for d in [UPLOAD_DIR, CLIPS_DIR, OUTPUT_DIR, AUDIO_DIR, SYNC_DIR]:
     os.makedirs(d, exist_ok=True)
 
-# ── Job tracking ─────────────────────────
+# Sync tuning — professional recap channels stay within this range
+MIN_SPEED = 0.75
+MAX_SPEED = 1.35
+TARGET_FPS = 24
+TARGET_W, TARGET_H = 1920, 1080
+
 jobs = {}
 
 def new_job(name):
@@ -51,7 +52,145 @@ def finish(jid, result=None, error=None):
     jobs[jid]['status'] = 'done' if not error else 'error'
     jobs[jid]['progress'] = 100
     jobs[jid]['result'] = result
-    if error: jobs[jid]['error'] = error
+    if error:
+        jobs[jid]['error'] = error
+
+def parse_timestamp(ts):
+    """Convert HH:MM:SS, MM:SS, or seconds to float seconds."""
+    if ts is None:
+        return 0.0
+    if isinstance(ts, (int, float)):
+        return float(ts)
+    s = str(ts).strip()
+    if re.match(r'^\d+(\.\d+)?$', s):
+        return float(s)
+    parts = s.split(':')
+    if len(parts) == 3:
+        return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+    if len(parts) == 2:
+        return int(parts[0]) * 60 + float(parts[1])
+    return 0.0
+
+def probe_duration(path):
+    if not path or not os.path.exists(path):
+        return 0.0
+    result = subprocess.run(
+        ['ffprobe', '-v', 'quiet', '-show_entries', 'format=duration', '-of', 'csv=p=0', path],
+        capture_output=True, text=True
+    )
+    try:
+        return float(result.stdout.strip() or 0)
+    except ValueError:
+        return 0.0
+
+def run_ffmpeg(cmd, jid=None, label='ffmpeg'):
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0 and jid:
+        log(jid, f'✗ {label} failed: {result.stderr[-200:]}')
+    return result
+
+def scale_pad_filter():
+    return (
+        f'scale={TARGET_W}:{TARGET_H}:force_original_aspect_ratio=decrease,'
+        f'pad={TARGET_W}:{TARGET_H}:(ow-iw)/2:(oh-ih)/2'
+    )
+
+def extract_clip(movie_path, start, end, clip_path, mode='precise', jid=None):
+    """Extract a clip with frame-accurate seeking when possible."""
+    ss = str(start)
+    to = str(end)
+    vf = scale_pad_filter()
+
+    if mode == 'fast':
+        cmd = ['ffmpeg', '-y', '-i', movie_path, '-ss', ss, '-to', to, '-vf', vf,
+               '-c:v', 'libx264', '-preset', 'fast', '-crf', '20', '-an', '-r', str(TARGET_FPS), clip_path]
+    elif mode == 'cinematic':
+        cmd = ['ffmpeg', '-y', '-i', movie_path, '-ss', ss, '-to', to,
+               '-vf', vf + ',vignette', '-c:v', 'libx264', '-preset', 'fast', '-crf', '20',
+               '-an', '-r', str(TARGET_FPS), clip_path]
+    else:
+        cmd = ['ffmpeg', '-y', '-i', movie_path, '-ss', ss, '-to', to, '-vf', vf,
+               '-c:v', 'libx264', '-preset', 'fast', '-crf', '20', '-an', '-r', str(TARGET_FPS), clip_path]
+
+    return run_ffmpeg(cmd, jid, f'clip {os.path.basename(clip_path)}').returncode == 0
+
+def clamp_speed_ratio(video_dur, audio_dur):
+    """Compute PTS ratio to match video length to audio length."""
+    if video_dur <= 0 or audio_dur <= 0:
+        return 1.0
+    ratio = video_dur / audio_dur
+    return max(MIN_SPEED, min(MAX_SPEED, ratio))
+
+def sync_segment_video_to_audio(video_path, audio_path, output_path, jid=None):
+    """
+    Time-stretch video to match narration audio, then mux.
+    This is the core professional-sync primitive used by recap channels.
+    """
+    video_dur = probe_duration(video_path)
+    audio_dur = probe_duration(audio_path)
+    ratio = clamp_speed_ratio(video_dur, audio_dur)
+
+    if jid:
+        log(jid, f'  sync: video={video_dur:.2f}s audio={audio_dur:.2f}s ratio={ratio:.3f}')
+
+    vf = scale_pad_filter()
+    filt = (
+        f'[0:v]{vf},setpts=PTS/{ratio},fps={TARGET_FPS}[v];'
+        f'[1:a]aformat=sample_rates=48000:channel_layouts=stereo,apad[a]'
+    )
+
+    cmd = [
+        'ffmpeg', '-y', '-i', video_path, '-i', audio_path,
+        '-filter_complex', filt,
+        '-map', '[v]', '-map', '[a]',
+        '-c:v', 'libx264', '-preset', 'fast', '-crf', '20',
+        '-c:a', 'aac', '-b:a', '192k',
+        '-shortest', '-avoid_negative_ts', 'make_zero',
+        output_path
+    ]
+    return run_ffmpeg(cmd, jid, 'segment sync').returncode == 0
+
+def elevenlabs_tts(text, voice_id, api_key, output_path, stability=0.6, similarity=0.75):
+    if not text or not text.strip():
+        return False, 'Empty text'
+    url = f'https://api.elevenlabs.io/v1/text-to-speech/{voice_id}'
+    headers = {'xi-api-key': api_key, 'Content-Type': 'application/json', 'Accept': 'audio/mpeg'}
+    payload = {
+        'text': text.strip(),
+        'model_id': 'eleven_monolingual_v1',
+        'voice_settings': {'stability': stability, 'similarity_boost': similarity}
+    }
+    try:
+        response = requests.post(url, json=payload, headers=headers, timeout=120)
+        if response.status_code != 200:
+            return False, f'ElevenLabs {response.status_code}: {response.text[:200]}'
+        with open(output_path, 'wb') as f:
+            f.write(response.content)
+        return True, None
+    except Exception as ex:
+        return False, str(ex)
+
+def concat_segments(segment_paths, output_path, jid=None):
+    concat_file = os.path.join(BASE_DIR, 'concat_sync.txt')
+    with open(concat_file, 'w') as f:
+        for p in segment_paths:
+            f.write(f"file '{p}'\n")
+
+    # Re-encode on concat for uniform codec/fps — avoids stream-copy drift
+    cmd = [
+        'ffmpeg', '-y', '-f', 'concat', '-safe', '0', '-i', concat_file,
+        '-c:v', 'libx264', '-preset', 'medium', '-crf', '23',
+        '-c:a', 'aac', '-b:a', '192k',
+        '-r', str(TARGET_FPS),
+        '-avoid_negative_ts', 'make_zero',
+        output_path
+    ]
+    return run_ffmpeg(cmd, jid, 'concat').returncode == 0
+
+def clear_dir(path):
+    if os.path.isdir(path):
+        shutil.rmtree(path, ignore_errors=True)
+    os.makedirs(path, exist_ok=True)
 
 # ══════════════════════════════════════════
 #  ROUTES
@@ -59,18 +198,24 @@ def finish(jid, result=None, error=None):
 
 @app.route('/ping')
 def ping():
-    """Health check — app uses this to detect backend"""
-    return jsonify({'status': 'ok', 'version': '1.0', 'message': 'CineRecap Backend running on your Android!'})
+    return jsonify({
+        'status': 'ok',
+        'version': '2.0-sync',
+        'message': 'CineRecap Backend with segment sync',
+        'sync': True
+    })
 
+@app.route('/health')
+def health():
+    return jsonify({'ok': True, 'version': '2.0-sync', 'features': ['segment-sync', 'per-segment-tts']})
 
-# ── ANTHROPIC PROXY ───────────────────────
 @app.route('/anthropic', methods=['POST'])
 def anthropic_proxy():
-    data    = request.json
+    data = request.json
     api_key = data.get('api_key', '')
-    prompt  = data.get('prompt', '')
-    model   = data.get('model', 'claude-sonnet-4-20250514')
-    max_tok = data.get('max_tokens', 1000)
+    prompt = data.get('prompt', '')
+    model = data.get('model', 'claude-sonnet-4-20250514')
+    max_tok = data.get('max_tokens', 4000)
     if not api_key:
         return jsonify({'error': 'No API key'}), 400
     try:
@@ -78,49 +223,37 @@ def anthropic_proxy():
             'https://api.anthropic.com/v1/messages',
             headers={'x-api-key': api_key, 'anthropic-version': '2023-06-01', 'Content-Type': 'application/json'},
             json={'model': model, 'max_tokens': max_tok, 'messages': [{'role': 'user', 'content': prompt}]},
-            timeout=60
+            timeout=120
         )
         return jsonify(r.json()), r.status_code
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-# ── ELEVENLABS PROXY ──────────────────────
 @app.route('/elevenlabs', methods=['POST'])
 def elevenlabs_proxy():
-    data       = request.json
-    api_key    = data.get('api_key', '')
-    text       = data.get('text', '')
-    voice_id   = data.get('voice_id', 'pNInz6obpgDQGcFmaJgB')
-    stability  = data.get('stability', 0.6)
+    data = request.json
+    api_key = data.get('api_key', '')
+    text = data.get('text', '')
+    voice_id = data.get('voice_id', 'pNInz6obpgDQGcFmaJgB')
+    stability = data.get('stability', 0.6)
     similarity = data.get('similarity', 0.75)
     if not api_key:
         return jsonify({'error': 'No API key'}), 400
-    try:
-        r = requests.post(
-            f'https://api.elevenlabs.io/v1/text-to-speech/{voice_id}',
-            headers={'xi-api-key': api_key, 'Content-Type': 'application/json', 'Accept': 'audio/mpeg'},
-            json={'text': text, 'model_id': 'eleven_monolingual_v1', 'voice_settings': {'stability': stability, 'similarity_boost': similarity}},
-            timeout=120
-        )
-        if r.status_code == 200:
-            audio_path = os.path.join(AUDIO_DIR, 'voiceover.mp3')
-            with open(audio_path, 'wb') as f:
-                f.write(r.content)
-            dur = subprocess.run(['ffprobe', '-v', 'quiet', '-show_entries', 'format=duration', '-of', 'csv=p=0', audio_path], capture_output=True, text=True)
-            duration = float(dur.stdout.strip() or 0)
-            size_mb  = round(os.path.getsize(audio_path) / 1e6, 1)
-            return jsonify({'status': 'ok', 'audio_path': audio_path, 'duration': duration, 'duration_fmt': f'{int(duration//60):02d}:{int(duration%60):02d}', 'size_mb': size_mb})
-        else:
-            return jsonify({'error': f'ElevenLabs error {r.status_code}: {r.text[:200]}'}), r.status_code
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+    audio_path = os.path.join(AUDIO_DIR, 'voiceover.mp3')
+    ok, err = elevenlabs_tts(text, voice_id, api_key, audio_path, stability, similarity)
+    if not ok:
+        return jsonify({'error': err}), 500
+    duration = probe_duration(audio_path)
+    return jsonify({
+        'status': 'ok', 'audio_path': audio_path, 'duration': duration,
+        'duration_fmt': f'{int(duration//60):02d}:{int(duration%60):02d}',
+        'size_mb': round(os.path.getsize(audio_path) / 1e6, 1)
+    })
 
 @app.route('/job/<jid>')
 def job_status(jid):
-    """Poll job progress"""
     return jsonify(jobs.get(jid, {'status': 'not_found'}))
 
-# ── UPLOAD MOVIE ──────────────────────────
 @app.route('/upload', methods=['POST'])
 def upload_movie():
     if 'file' not in request.files:
@@ -130,89 +263,53 @@ def upload_movie():
     path = os.path.join(UPLOAD_DIR, filename)
     f.save(path)
 
-    # Get video info
-    result = subprocess.run([
-        'ffprobe', '-v', 'quiet', '-print_format', 'json',
-        '-show_format', '-show_streams', path
-    ], capture_output=True, text=True)
-
+    result = subprocess.run(
+        ['ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_format', '-show_streams', path],
+        capture_output=True, text=True
+    )
     info = json.loads(result.stdout) if result.returncode == 0 else {}
     duration = float(info.get('format', {}).get('duration', 0))
 
     return jsonify({
-        'filename': filename,
-        'path': path,
-        'duration': duration,
+        'filename': filename, 'path': path, 'duration': duration,
         'duration_fmt': f'{int(duration//3600):02d}:{int((duration%3600)//60):02d}:{int(duration%60):02d}',
         'size_mb': round(os.path.getsize(path) / 1e6, 1)
     })
 
-# ── CLIP EXTRACTION ───────────────────────
 @app.route('/clip', methods=['POST'])
 def extract_clips():
     data = request.json
     movie_path = data.get('movie_path')
-    timestamps  = data.get('timestamps', [])
-    mode        = data.get('mode', 'fast')  # fast | precise | cinematic
+    timestamps = data.get('timestamps', [])
+    mode = data.get('mode', 'precise')
 
     if not movie_path or not os.path.exists(movie_path):
         return jsonify({'error': 'Movie file not found'}), 400
 
+    clear_dir(CLIPS_DIR)
     jid = new_job('clip_extraction')
 
     def run():
         clips = []
         total = len(timestamps)
-        log(jid, f'Starting extraction of {total} clips...')
+        log(jid, f'Starting extraction of {total} clips (mode={mode})...')
 
         for i, ts in enumerate(timestamps):
             clip_name = f'clip_{str(i+1).zfill(2)}.mp4'
             clip_path = os.path.join(CLIPS_DIR, clip_name)
+            jobs[jid]['progress'] = int((i / max(total, 1)) * 85)
+            log(jid, f'Extracting clip {i+1}/{total}: {ts.get("start")} → {ts.get("end")}')
 
-            jobs[jid]['progress'] = int((i / total) * 85)
-            log(jid, f'Extracting clip {i+1}/{total}: {ts["start"]} → {ts["end"]}')
-
-            if mode == 'fast':
-                # Stream copy — fastest, no re-encode
-                cmd = [
-                    'ffmpeg', '-y',
-                    '-ss', ts['start'],
-                    '-to', ts['end'],
-                    '-i', movie_path,
-                    '-c', 'copy',
-                    clip_path
-                ]
-            elif mode == 'precise':
-                # Re-encode for frame accuracy
-                cmd = [
-                    'ffmpeg', '-y',
-                    '-i', movie_path,
-                    '-ss', ts['start'],
-                    '-to', ts['end'],
-                    '-c:v', 'libx264', '-preset', 'fast',
-                    '-c:a', 'aac',
-                    clip_path
-                ]
-            else:  # cinematic
-                cmd = [
-                    'ffmpeg', '-y',
-                    '-ss', ts['start'],
-                    '-to', ts['end'],
-                    '-i', movie_path,
-                    '-vf', 'scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,vignette',
-                    '-c:v', 'libx264', '-preset', 'fast', '-crf', '20',
-                    '-c:a', 'aac',
-                    clip_path
-                ]
-
-            result = subprocess.run(cmd, capture_output=True, text=True)
-
-            if result.returncode == 0:
+            if extract_clip(movie_path, ts['start'], ts['end'], clip_path, mode, jid):
                 size = os.path.getsize(clip_path) / 1e6
-                clips.append({'name': clip_name, 'path': clip_path, 'size_mb': round(size, 1), 'index': i+1})
-                log(jid, f'✓ clip_{str(i+1).zfill(2)}.mp4 ({size:.1f} MB)')
+                clips.append({
+                    'name': clip_name, 'path': clip_path, 'size_mb': round(size, 1),
+                    'index': i + 1, 'duration': probe_duration(clip_path),
+                    'start': ts.get('start'), 'end': ts.get('end'), 'scene': ts.get('scene', '')
+                })
+                log(jid, f'✓ {clip_name} ({size:.1f} MB, {probe_duration(clip_path):.1f}s)')
             else:
-                log(jid, f'✗ Error on clip {i+1}: {result.stderr[:100]}')
+                log(jid, f'✗ Error on clip {i+1}')
 
         finish(jid, {'clips': clips, 'clips_dir': CLIPS_DIR, 'total': len(clips)})
         log(jid, f'✓ Done! {len(clips)} clips extracted.')
@@ -220,15 +317,19 @@ def extract_clips():
     threading.Thread(target=run, daemon=True).start()
     return jsonify({'job_id': jid})
 
-# ── VOICEOVER (ElevenLabs) ────────────────
 @app.route('/voiceover', methods=['POST'])
 def generate_voiceover():
-    data       = request.json
-    script     = data.get('script', '')
-    voice_id   = data.get('voice_id', 'pNInz6obpgDQGcFmaJgB')  # Adam default
-    api_key    = data.get('elevenlabs_key', '')
-    stability  = data.get('stability', 0.6)
+    """Legacy single-file voiceover (kept for compatibility)."""
+    data = request.json
+    script = data.get('script', '')
+    voice_id = data.get('voice_id', 'pNInz6obpgDQGcFmaJgB')
+    api_key = data.get('elevenlabs_key', '')
+    stability = data.get('stability', 0.6)
     similarity = data.get('similarity', 0.75)
+    segments = data.get('segments', [])
+
+    if segments:
+        return generate_voiceover_segments_internal(data)
 
     if not api_key:
         return jsonify({'error': 'ElevenLabs API key required'}), 400
@@ -238,185 +339,264 @@ def generate_voiceover():
     jid = new_job('voiceover')
 
     def run():
-        log(jid, 'Connecting to ElevenLabs API...')
-        jobs[jid]['progress'] = 20
-
-        url = f'https://api.elevenlabs.io/v1/text-to-speech/{voice_id}'
-        headers = {
-            'xi-api-key': api_key,
-            'Content-Type': 'application/json',
-            'Accept': 'audio/mpeg'
-        }
-        payload = {
-            'text': script,
-            'model_id': 'eleven_monolingual_v1',
-            'voice_settings': {
-                'stability': stability,
-                'similarity_boost': similarity
-            }
-        }
-
-        log(jid, f'Sending {len(script)} chars to TTS engine...')
+        log(jid, 'Generating single voiceover file (legacy mode)...')
         jobs[jid]['progress'] = 40
-
-        try:
-            response = requests.post(url, json=payload, headers=headers, stream=True)
-            if response.status_code != 200:
-                finish(jid, error=f'ElevenLabs error: {response.status_code} {response.text[:200]}')
-                return
-
-            audio_path = os.path.join(AUDIO_DIR, 'voiceover.mp3')
-            with open(audio_path, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    f.write(chunk)
-
-            jobs[jid]['progress'] = 90
-            size_mb = os.path.getsize(audio_path) / 1e6
-
-            # Get duration
-            dur_result = subprocess.run([
-                'ffprobe', '-v', 'quiet', '-show_entries', 'format=duration',
-                '-of', 'csv=p=0', audio_path
-            ], capture_output=True, text=True)
-            duration = float(dur_result.stdout.strip() or 0)
-
-            log(jid, f'✓ Voiceover: {duration:.0f}s · {size_mb:.1f}MB')
-            finish(jid, {
-                'audio_path': audio_path,
-                'duration': duration,
-                'size_mb': round(size_mb, 1),
-                'duration_fmt': f'{int(duration//60):02d}:{int(duration%60):02d}'
-            })
-        except Exception as ex:
-            finish(jid, error=str(ex))
+        audio_path = os.path.join(AUDIO_DIR, 'voiceover.mp3')
+        ok, err = elevenlabs_tts(script, voice_id, api_key, audio_path, stability, similarity)
+        if not ok:
+            finish(jid, error=err)
+            return
+        duration = probe_duration(audio_path)
+        log(jid, f'✓ Voiceover: {duration:.0f}s')
+        finish(jid, {
+            'audio_path': audio_path, 'duration': duration,
+            'size_mb': round(os.path.getsize(audio_path) / 1e6, 1),
+            'duration_fmt': f'{int(duration//60):02d}:{int(duration%60):02d}',
+            'mode': 'legacy'
+        })
 
     threading.Thread(target=run, daemon=True).start()
     return jsonify({'job_id': jid})
 
-# ── FINAL RENDER ──────────────────────────
+def generate_voiceover_segments_internal(data):
+    """Per-segment TTS — required for professional A/V sync."""
+    segments = data.get('segments', [])
+    voice_id = data.get('voice_id', 'pNInz6obpgDQGcFmaJgB')
+    api_key = data.get('elevenlabs_key', '')
+    stability = data.get('stability', 0.6)
+    similarity = data.get('similarity', 0.75)
+
+    if not api_key:
+        return jsonify({'error': 'ElevenLabs API key required'}), 400
+    if not segments:
+        return jsonify({'error': 'segments array required'}), 400
+
+    clear_dir(AUDIO_DIR)
+    jid = new_job('voiceover_segments')
+
+    def run():
+        results = []
+        total = len(segments)
+        total_audio = 0.0
+        log(jid, f'Generating {total} per-segment voiceovers for sync...')
+
+        for i, seg in enumerate(segments):
+            narration = seg.get('narration') or seg.get('text') or ''
+            if not narration.strip():
+                log(jid, f'⚠ Segment {i+1}: no narration text, skipping')
+                continue
+
+            audio_name = f'audio_{str(i+1).zfill(2)}.mp3'
+            audio_path = os.path.join(AUDIO_DIR, audio_name)
+            jobs[jid]['progress'] = int((i / max(total, 1)) * 90)
+            log(jid, f'TTS segment {i+1}/{total}: {len(narration)} chars')
+
+            ok, err = elevenlabs_tts(narration, voice_id, api_key, audio_path, stability, similarity)
+            if not ok:
+                log(jid, f'✗ Segment {i+1} failed: {err}')
+                continue
+
+            dur = probe_duration(audio_path)
+            total_audio += dur
+            results.append({
+                'index': i + 1,
+                'audio_path': audio_path,
+                'duration': dur,
+                'narration': narration[:80] + ('...' if len(narration) > 80 else ''),
+                'start': seg.get('start'),
+                'end': seg.get('end'),
+                'scene': seg.get('scene', '')
+            })
+            log(jid, f'✓ audio_{str(i+1).zfill(2)}.mp3 = {dur:.2f}s')
+
+        finish(jid, {
+            'segments': results,
+            'total_duration': total_audio,
+            'duration_fmt': f'{int(total_audio//60):02d}:{int(total_audio%60):02d}',
+            'mode': 'segments',
+            'count': len(results)
+        })
+        log(jid, f'✓ {len(results)} segment voiceovers · total {total_audio:.1f}s')
+
+    threading.Thread(target=run, daemon=True).start()
+    return jsonify({'job_id': jid})
+
 @app.route('/render', methods=['POST'])
 def final_render():
-    data        = request.json
-    clips_dir   = data.get('clips_dir', CLIPS_DIR)
-    audio_path  = data.get('audio_path', os.path.join(AUDIO_DIR, 'voiceover.mp3'))
-    music_vol   = data.get('music_volume', 0.15)
-    transition  = data.get('transition', 'crossfade')
-    codec       = data.get('codec', 'h264')
-    crf         = data.get('crf', 23)
+    data = request.json
+    sync_mode = data.get('sync_mode', True)
+    segments = data.get('segments', [])
+    movie_path = data.get('movie_path')
+    clips_dir = data.get('clips_dir', CLIPS_DIR)
+    audio_path = data.get('audio_path', os.path.join(AUDIO_DIR, 'voiceover.mp3'))
+    mode = data.get('clip_mode', 'precise')
+    crf = data.get('crf', 23)
     output_name = data.get('output_name', 'recap_final.mp4')
+    music_path = data.get('music_path')
+    music_volume = float(data.get('music_volume', 0.12))
+
+    if sync_mode and segments and movie_path:
+        return sync_render_internal(data)
 
     jid = new_job('final_render')
 
-    def run():
-        log(jid, 'Starting final render...')
+    def run_legacy():
+        log(jid, 'Legacy render (no per-segment sync) — consider using sync_mode=true')
         jobs[jid]['progress'] = 5
-
-        # Get all clips sorted
-        clips = sorted([
-            os.path.join(clips_dir, f)
-            for f in os.listdir(clips_dir)
-            if f.endswith('.mp4')
-        ])
-
+        clips = sorted([os.path.join(clips_dir, f) for f in os.listdir(clips_dir) if f.endswith('.mp4')])
         if not clips:
-            finish(jid, error='No clips found in clips directory')
+            finish(jid, error='No clips found')
             return
 
-        log(jid, f'Found {len(clips)} clips to merge')
-        jobs[jid]['progress'] = 10
-
-        # Build concat list
         concat_file = os.path.join(BASE_DIR, 'concat.txt')
         with open(concat_file, 'w') as f:
             for clip in clips:
                 f.write(f"file '{clip}'\n")
 
-        # Step 1: Concatenate clips
         merged_video = os.path.join(BASE_DIR, 'merged.mp4')
-        log(jid, 'Merging video clips...')
-        subprocess.run([
-            'ffmpeg', '-y', '-f', 'concat', '-safe', '0',
-            '-i', concat_file,
-            '-c', 'copy',
-            merged_video
-        ], capture_output=True)
+        run_ffmpeg(['ffmpeg', '-y', '-f', 'concat', '-safe', '0', '-i', concat_file,
+                    '-c:v', 'libx264', '-preset', 'medium', '-crf', str(crf),
+                    '-c:a', 'aac', '-r', str(TARGET_FPS), merged_video], jid)
         jobs[jid]['progress'] = 35
-        log(jid, '✓ Clips merged')
 
-        # Step 2: Mix voiceover + render
         output_path = os.path.join(OUTPUT_DIR, output_name)
-
-        has_audio = os.path.exists(audio_path)
-        log(jid, f'Mixing voiceover: {"yes" if has_audio else "no"}')
-
-        if has_audio:
+        if os.path.exists(audio_path):
             cmd = [
-                'ffmpeg', '-y',
-                '-i', merged_video,
-                '-i', audio_path,
+                'ffmpeg', '-y', '-i', merged_video, '-i', audio_path,
                 '-filter_complex',
-                f'[0:a]volume=0.1[va];[1:a]volume=1.0[vo];[va][vo]amix=inputs=2:duration=shortest[aout]',
-                '-map', '0:v',
-                '-map', '[aout]',
-                '-c:v', 'libx264',
-                '-preset', 'medium',
-                '-crf', str(crf),
-                '-c:a', 'aac', '-b:a', '192k',
-                '-shortest',
-                output_path
+                '[1:a]aformat=sample_rates=48000:channel_layouts=stereo[vo];[vo]apad[aout]',
+                '-map', '0:v', '-map', '[aout]',
+                '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k',
+                '-shortest', output_path
             ]
         else:
-            cmd = [
-                'ffmpeg', '-y',
-                '-i', merged_video,
-                '-c:v', 'libx264',
-                '-preset', 'medium',
-                '-crf', str(crf),
-                '-c:a', 'aac',
-                output_path
-            ]
-
-        jobs[jid]['progress'] = 40
-        log(jid, 'Encoding final video (this may take a few minutes)...')
+            cmd = ['ffmpeg', '-y', '-i', merged_video, '-c', 'copy', output_path]
 
         proc = subprocess.Popen(cmd, capture_output=True, text=True)
-
-        # Simulate progress during encoding
-        for p in range(40, 90, 5):
-            if proc.poll() is not None: break
-            time.sleep(3)
-            jobs[jid]['progress'] = p
-            log(jid, f'Encoding... {p}%')
-
         proc.wait()
-        jobs[jid]['progress'] = 95
-
-        if proc.returncode == 0 and os.path.exists(output_path):
-            size_mb = os.path.getsize(output_path) / 1e6
-
-            # Get final duration
-            dur = subprocess.run([
-                'ffprobe', '-v', 'quiet', '-show_entries', 'format=duration',
-                '-of', 'csv=p=0', output_path
-            ], capture_output=True, text=True)
-            duration = float(dur.stdout.strip() or 0)
-
-            log(jid, f'✓ Render complete! {output_name} · {size_mb:.0f}MB · {duration:.0f}s')
-            finish(jid, {
-                'output_path': output_path,
-                'output_name': output_name,
-                'size_mb': round(size_mb, 1),
-                'duration': duration,
-                'duration_fmt': f'{int(duration//60):02d}:{int(duration%60):02d}',
-                'download_url': f'/download/{output_name}'
-            })
+        if proc.returncode == 0:
+            duration = probe_duration(output_path)
+            finish(jid, {'output_path': output_path, 'output_name': output_name,
+                         'duration': duration, 'mode': 'legacy',
+                         'download_url': f'/download/{output_name}'})
         else:
-            finish(jid, error=f'Render failed: {proc.stderr[-300:]}')
+            finish(jid, error='Render failed')
+
+    threading.Thread(target=run_legacy, daemon=True).start()
+    return jsonify({'job_id': jid})
+
+def sync_render_internal(data):
+    """Professional sync pipeline: per-segment clip + TTS alignment."""
+    segments = data.get('segments', [])
+    movie_path = data.get('movie_path')
+    mode = data.get('clip_mode', 'precise')
+    crf = data.get('crf', 23)
+    output_name = data.get('output_name', 'recap_final.mp4')
+    music_path = data.get('music_path')
+    music_volume = float(data.get('music_volume', 0.12))
+
+    if not movie_path or not os.path.exists(movie_path):
+        return jsonify({'error': 'movie_path not found'}), 400
+
+    clear_dir(SYNC_DIR)
+    jid = new_job('sync_render')
+
+    def run():
+        log(jid, '═══ SYNC RENDER: per-segment alignment ═══')
+        synced_paths = []
+        total = len(segments)
+        total_video = 0.0
+        total_audio = 0.0
+
+        for i, seg in enumerate(segments):
+            idx = seg.get('index', i + 1)
+            audio_path = seg.get('audio_path')
+            start = seg.get('start')
+            end = seg.get('end')
+
+            if not audio_path or not os.path.exists(audio_path):
+                log(jid, f'⚠ Segment {idx}: missing audio, skipping')
+                continue
+            if not start or not end:
+                log(jid, f'⚠ Segment {idx}: missing timestamps, skipping')
+                continue
+
+            jobs[jid]['progress'] = int((i / max(total, 1)) * 80)
+            raw_clip = os.path.join(SYNC_DIR, f'raw_{str(idx).zfill(2)}.mp4')
+            synced = os.path.join(SYNC_DIR, f'synced_{str(idx).zfill(2)}.mp4')
+
+            log(jid, f'Segment {idx}/{total}: extract {start}→{end}')
+            if not extract_clip(movie_path, start, end, raw_clip, mode, jid):
+                continue
+
+            audio_dur = probe_duration(audio_path)
+            video_dur = probe_duration(raw_clip)
+            log(jid, f'  aligning video {video_dur:.2f}s → audio {audio_dur:.2f}s')
+
+            if not sync_segment_video_to_audio(raw_clip, audio_path, synced, jid):
+                continue
+
+            synced_dur = probe_duration(synced)
+            synced_paths.append(synced)
+            total_video += synced_dur
+            total_audio += audio_dur
+            log(jid, f'✓ synced_{str(idx).zfill(2)}.mp4 = {synced_dur:.2f}s')
+
+        if not synced_paths:
+            finish(jid, error='No synced segments produced')
+            return
+
+        jobs[jid]['progress'] = 85
+        log(jid, f'Concatenating {len(synced_paths)} synced segments...')
+        merged = os.path.join(SYNC_DIR, 'merged_synced.mp4')
+        if not concat_segments(synced_paths, merged, jid):
+            finish(jid, error='Concat failed')
+            return
+
+        output_path = os.path.join(OUTPUT_DIR, output_name)
+        jobs[jid]['progress'] = 92
+
+        if music_path and os.path.exists(music_path):
+            log(jid, f'Mixing background music at {int(music_volume*100)}%')
+            mv = music_volume
+            filt = (
+                f'[0:a]volume=1.0[vo];[1:a]volume={mv}[mu];'
+                f'[vo][mu]amix=inputs=2:duration=first:dropout_transition=2[aout]'
+            )
+            cmd = [
+                'ffmpeg', '-y', '-i', merged, '-i', music_path,
+                '-filter_complex', filt,
+                '-map', '0:v', '-map', '[aout]',
+                '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k',
+                '-shortest', output_path
+            ]
+        else:
+            shutil.copy2(merged, output_path)
+
+        duration = probe_duration(output_path)
+        size_mb = round(os.path.getsize(output_path) / 1e6, 1)
+        log(jid, f'✓ SYNC COMPLETE: {output_name} · {duration:.1f}s · {size_mb}MB')
+        log(jid, f'  segments={len(synced_paths)} total_audio={total_audio:.1f}s')
+
+        finish(jid, {
+            'output_path': output_path,
+            'output_name': output_name,
+            'size_mb': size_mb,
+            'duration': duration,
+            'duration_fmt': f'{int(duration//60):02d}:{int(duration%60):02d}',
+            'download_url': f'/download/{output_name}',
+            'mode': 'sync',
+            'segments_synced': len(synced_paths),
+            'sync_report': {
+                'total_audio_sec': round(total_audio, 2),
+                'total_video_sec': round(total_video, 2),
+                'drift_sec': round(abs(total_video - total_audio), 3)
+            }
+        })
 
     threading.Thread(target=run, daemon=True).start()
     return jsonify({'job_id': jid})
 
-# ── DOWNLOAD OUTPUT ───────────────────────
 @app.route('/download/<filename>')
 def download(filename):
     path = os.path.join(OUTPUT_DIR, filename)
@@ -424,7 +604,6 @@ def download(filename):
         return send_file(path, as_attachment=True)
     return jsonify({'error': 'File not found'}), 404
 
-# ── STATUS ────────────────────────────────
 @app.route('/status')
 def status():
     output_files = []
@@ -438,34 +617,26 @@ def status():
             })
     return jsonify({
         'status': 'running',
-        'dirs': {
-            'uploads': UPLOAD_DIR,
-            'clips': CLIPS_DIR,
-            'audio': AUDIO_DIR,
-            'output': OUTPUT_DIR
-        },
+        'version': '2.0-sync',
+        'dirs': {'uploads': UPLOAD_DIR, 'clips': CLIPS_DIR, 'audio': AUDIO_DIR, 'output': OUTPUT_DIR, 'sync': SYNC_DIR},
         'output_files': output_files,
         'active_jobs': len([j for j in jobs.values() if j['status'] == 'running'])
     })
 
-# ── CLEANUP ───────────────────────────────
 @app.route('/cleanup', methods=['POST'])
 def cleanup():
-    import shutil
-    for d in [CLIPS_DIR, UPLOAD_DIR, AUDIO_DIR]:
-        shutil.rmtree(d, ignore_errors=True)
-        os.makedirs(d, exist_ok=True)
+    for d in [CLIPS_DIR, UPLOAD_DIR, AUDIO_DIR, SYNC_DIR]:
+        clear_dir(d)
     return jsonify({'status': 'cleaned'})
 
-# ══════════════════════════════════════════
 if __name__ == '__main__':
-    print("""
+    port = int(os.environ.get('PORT', 5000))
+    print(f"""
 ╔═══════════════════════════════════════╗
 ║     CineRecap Studio — Backend        ║
-║     Running on your Android phone     ║
+║     v2.0 with Segment Sync            ║
 ╠═══════════════════════════════════════╣
-║  API ready at: http://localhost:5000  ║
-║  Open your app and set Backend URL    ║
+║  API ready at: http://0.0.0.0:{port:<5} ║
 ╚═══════════════════════════════════════╝
     """)
-    app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
+    app.run(host='0.0.0.0', port=port, debug=False, threaded=True)

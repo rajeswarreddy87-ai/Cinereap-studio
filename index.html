@@ -491,8 +491,8 @@ input[type=range]{accent-color:var(--acc);width:100%}
     <div class="ch"><div class="ct">FFMPEG PROCESSOR</div><div class="badge" id="clip-be-badge">TERMUX</div></div>
     <div class="cb">
       <div class="ropts">
-        <div class="ro on" onclick="selRo(this,'fast')"><div class="rot">⚡ Fast</div><div class="rod">Stream copy, fastest.</div></div>
-        <div class="ro" onclick="selRo(this,'precise')"><div class="rot">🎯 Precise</div><div class="rod">Frame-perfect re-encode.</div></div>
+        <div class="ro on" onclick="selRo(this,'precise')"><div class="rot">🎯 Precise</div><div class="rod">Frame-perfect re-encode (recommended for sync).</div></div>
+        <div class="ro" onclick="selRo(this,'fast')"><div class="rot">⚡ Fast</div><div class="rod">Stream copy, fastest.</div></div>
         <div class="ro" onclick="selRo(this,'cinematic')"><div class="rot">🎬 Cinematic</div><div class="rod">Color grade + film bars.</div></div>
         <div class="ro" onclick="selRo(this,'fast')"><div class="rot">📐 Crop 16:9</div><div class="rod">Auto-crop for YouTube.</div></div>
       </div>
@@ -556,7 +556,7 @@ input[type=range]{accent-color:var(--acc);width:100%}
 <div class="panel" id="p5">
   <span class="ptag">Step 06 / 07</span>
   <h2 class="ptitle">FINAL RENDER</h2>
-  <p class="pdesc">FFMPEG on Termux composites clips + voiceover + music into one polished video.</p>
+  <p class="pdesc">FFMPEG composites each clip to match its narration segment — professional per-scene sync.</p>
   <div class="card">
     <div class="ch"><div class="ct">RENDER SETTINGS</div><div class="badge">FFMPEG + TERMUX</div></div>
     <div class="cb">
@@ -691,6 +691,7 @@ input[type=range]{accent-color:var(--acc);width:100%}
 //  STATE
 // ════════════════════════════════════════
 let stamps=[], scr='', voiceId='pNInz6obpgDQGcFmaJgB';
+let voiceSegments=[];
 let ytAccessToken=null, ytUser=null;
 let backendUrl='http://localhost:5000';
 let backendConnected=false;
@@ -902,6 +903,12 @@ async function genScript(){
   document.getElementById('stxt').value=data.script;
   document.getElementById('ccount').textContent=`${data.timestamps.length} clips`;
   stamps=data.timestamps;scr=data.script;
+  if(data.segments&&data.segments.length){
+    stamps=data.segments;
+    voiceSegments=data.segments;
+  }else{
+    voiceSegments=stamps.map(ts=>({...ts,narration:ts.narration||''}));
+  }
   const tb=document.getElementById('tsbody');tb.innerHTML='';
   const ec={Tense:'#FF5C3A',Epic:'#E8C547',Emotional:'#c4b5fd',Dramatic:'#FF5C3A',Action:'#3AE8C5',Revelation:'#E8C547',Hopeful:'#3AE8C5',Dark:'#4A5568',Climax:'#FF5C3A'};
   data.timestamps.forEach((ts,i)=>{
@@ -916,14 +923,16 @@ async function apiScript(title,genre,dur,inst,key){
   if(!key)throw 0;
   const prompt=`You are a YouTube movie recap scriptwriter. Create for "${title}" (${genre}) targeting ${dur}.${inst?`\nInstructions: ${inst}`:''}
 Return ONLY valid JSON no markdown:
-{"script":"Full voiceover...","wordCount":1200,"timestamps":[{"start":"00:04:30","end":"00:06:15","scene":"Scene description","emotion":"Tense"}]}
-8-12 timestamps. Emotions: Tense,Epic,Emotional,Dramatic,Action,Revelation,Hopeful,Dark,Climax`;
+{"script":"Full voiceover combined for display","wordCount":1200,"segments":[{"start":"00:04:30","end":"00:06:15","scene":"Scene description","emotion":"Tense","narration":"The exact spoken words for THIS scene only — 2-4 sentences"}]}
+Create 8-12 segments. Each segment MUST have its own "narration" text that matches that scene. Timestamps are source-movie times. Emotions: Tense,Epic,Emotional,Dramatic,Action,Revelation,Hopeful,Dark,Climax`;
   if(!backendConnected) throw new Error('Backend not connected');
-  const r=await fetch(backendUrl+'/anthropic',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({api_key:key,prompt,max_tokens:1000})});
+  const r=await fetch(backendUrl+'/anthropic',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({api_key:key,prompt,max_tokens:4000})});
   const d=await r.json();
   if(d.error) throw new Error(d.error);
   const txt=d.content.map(i=>i.text||'').join('');
-  return JSON.parse(txt.replace(/```json|```/g,'').trim());
+  const parsed=JSON.parse(txt.replace(/```json|```/g,'').trim());
+  if(parsed.segments) parsed.timestamps=parsed.segments;
+  return parsed;
 }
 async function apiScript_UNUSED(title,genre,dur,inst,key){
   if(!key)throw 0;
@@ -936,19 +945,18 @@ Return ONLY valid JSON no markdown:
 }
 function demoData(title){
   const t=title||'this film';
-  return{script:`Welcome back — today we're breaking down "${t}" in under 10 minutes.\n\nThe story kicks off with the world already on edge. Our protagonist faces an impossible situation from the very first frame.\n\nAs act one unfolds, every relationship is tested. The writing is precise — nothing is wasted.\n\nThe midpoint twist changes everything. What looked simple reveals itself to be far darker.\n\nAct three is relentless. The ending reframes everything you thought you'd seen.\n\n"${t}" is a masterclass. Go watch it.\n\nSmash that like, subscribe, and see you in the next one.`,
-    wordCount:121,
-    timestamps:[
-      {start:'00:03:20',end:'00:06:45',scene:'Opening — protagonist intro',emotion:'Tense'},
-      {start:'00:14:10',end:'00:17:30',scene:'First conflict, stakes set',emotion:'Dramatic'},
-      {start:'00:28:00',end:'00:31:15',scene:'Alliance formed',emotion:'Hopeful'},
-      {start:'00:41:30',end:'00:44:00',scene:'Midpoint action',emotion:'Action'},
-      {start:'00:58:45',end:'01:02:00',scene:'Major twist revealed',emotion:'Revelation'},
-      {start:'01:15:20',end:'01:18:45',scene:'Darkest moment',emotion:'Dark'},
-      {start:'01:28:00',end:'01:32:30',scene:'Final confrontation',emotion:'Epic'},
-      {start:'01:45:10',end:'01:48:00',scene:'Climax',emotion:'Climax'},
-      {start:'01:51:00',end:'01:53:30',scene:'Emotional ending',emotion:'Emotional'}
-    ]};
+  const segments=[
+      {start:'00:03:20',end:'00:06:45',scene:'Opening — protagonist intro',emotion:'Tense',narration:`Welcome back — today we're breaking down "${t}". The story kicks off with the world already on edge.`},
+      {start:'00:14:10',end:'00:17:30',scene:'First conflict, stakes set',emotion:'Dramatic',narration:'Our protagonist faces an impossible situation. Every relationship is tested from the very first act.'},
+      {start:'00:28:00',end:'00:31:15',scene:'Alliance formed',emotion:'Hopeful',narration:'A fragile alliance forms — but trust is the one thing nobody can afford to give.'},
+      {start:'00:41:30',end:'00:44:00',scene:'Midpoint action',emotion:'Action',narration:'The midpoint hits hard. What looked simple reveals itself to be far darker than anyone imagined.'},
+      {start:'00:58:45',end:'01:02:00',scene:'Major twist revealed',emotion:'Revelation',narration:'And then comes the twist that changes everything. Nothing you saw before means what you thought.'},
+      {start:'01:15:20',end:'01:18:45',scene:'Darkest moment',emotion:'Dark',narration:'Act three is relentless. The darkest moment strips away every last illusion of safety.'},
+      {start:'01:28:00',end:'01:32:30',scene:'Final confrontation',emotion:'Epic',narration:'The final confrontation is earned. Every setup pays off in a sequence that refuses to let go.'},
+      {start:'01:45:10',end:'01:48:00',scene:'Climax',emotion:'Climax',narration:'The climax reframes everything you thought you had seen. This is masterclass filmmaking.'},
+      {start:'01:51:00',end:'01:53:30',scene:'Emotional ending',emotion:'Emotional',narration:`"${t}" is a masterclass. Smash that like, subscribe, and see you in the next one.`}
+    ];
+  return{script:segments.map(s=>s.narration).join('\n\n'),wordCount:121,timestamps:segments,segments};
 }
 function cpScript(){navigator.clipboard.writeText(document.getElementById('stxt').value).then(()=>toast('Script copied','ok'))}
 
@@ -966,19 +974,21 @@ async function genVoice(){
   wf.innerHTML=Array.from({length:28},(_,i)=>`<div class="wb" style="height:${5+Math.random()*16}px;animation-delay:${i*.04}s"></div>`).join('');
 
   if(backendConnected&&scr){
-    addL('t-v','i','→ Sending to Termux for ElevenLabs processing…');
+    const segs=voiceSegments.length?voiceSegments:stamps;
+    addL('t-v','i',`→ Generating ${segs.length} per-segment voiceovers for sync…`);
     try{
       const r=await fetch(`${backendUrl}/voiceover`,{method:'POST',headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({script:scr,voice_id:voiceId,elevenlabs_key:key,stability:parseFloat(document.getElementById('stab-v').textContent)/100,similarity:parseFloat(document.getElementById('sim-v').textContent)/100})});
+        body:JSON.stringify({segments:segs,voice_id:voiceId,elevenlabs_key:key,stability:parseFloat(document.getElementById('stab-v').textContent)/100,similarity:parseFloat(document.getElementById('sim-v').textContent)/100})});
       const d=await r.json();
       if(d.job_id){
         const job=await pollJob(d.job_id,'t-v','pg-v');
         if(job.status==='done'&&job.result){
-          audioPath=job.result.audio_path;
-          document.getElementById('vmeta').textContent=`Voice ready · ${job.result.duration_fmt} · ${job.result.size_mb}MB`;
+          voiceSegments=job.result.segments||[];
+          audioPath=voiceSegments[0]?.audio_path||null;
+          document.getElementById('vmeta').textContent=`${job.result.count||voiceSegments.length} segments synced · ${job.result.duration_fmt} · per-segment TTS`;
           document.getElementById('vpc').style.display='none';
           document.getElementById('vout').style.display='block';
-          toast('✓ Voiceover generated on your phone!','ok');
+          toast('✓ Per-segment voiceovers ready for sync!','ok');
         }else{toast('Voiceover failed: '+(job.error||'unknown'),'err')}
       }
     }catch(e){toast('Backend error: '+e.message,'err')}
@@ -1000,7 +1010,7 @@ async function genVoice(){
 // ════════════════════════════════════════
 //  CLIPS
 // ════════════════════════════════════════
-let selClipMode='fast';
+let selClipMode='precise';
 function selRo(el,mode){document.querySelectorAll('.ro').forEach(r=>r.classList.remove('on'));el.classList.add('on');selClipMode=mode}
 async function runClips(){
   document.getElementById('clbtn').disabled=true;
@@ -1078,12 +1088,20 @@ async function doRender(){
   document.getElementById('rpc').style.display='block';
   document.getElementById('rout').style.display='none';
 
-  if(backendConnected&&clipsDir){
-    addL('t-r','i','→ Starting FFMPEG render on Termux…');
+  if(backendConnected&&(voiceSegments.length||clipsDir)){
+    addL('t-r','i','→ Starting SYNC render (per-segment A/V alignment)…');
     try{
       const crf=parseInt(document.getElementById('r-crf').value)||23;
-      const r=await fetch(`${backendUrl}/render`,{method:'POST',headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({clips_dir:clipsDir,audio_path:audioPath,crf,output_name:'recap_final.mp4'})});
+      const renderBody={
+        sync_mode:true,
+        movie_path:moviePath,
+        segments:voiceSegments,
+        clip_mode:selClipMode||'precise',
+        crf,
+        output_name:'recap_final.mp4',
+        music_volume:parseInt(document.getElementById('mvv')?.textContent||'15')/100
+      };
+      const r=await fetch(`${backendUrl}/render`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(renderBody)});
       const d=await r.json();
       if(d.job_id){
         const job=await pollJob(d.job_id,'t-r','pg-r');
@@ -1091,9 +1109,10 @@ async function doRender(){
           renderPath=job.result.output_path;
           document.getElementById('s-d').textContent=job.result.duration_fmt;
           document.getElementById('s-s').textContent=job.result.size_mb+'MB';
-          document.getElementById('s-c').textContent=stamps.length||9;
+          document.getElementById('s-c').textContent=job.result.segments_synced||voiceSegments.length||stamps.length||9;
           document.getElementById('rout').style.display='block';
-          toast('🎬 Render complete on your phone!','ok');
+          const drift=job.result.sync_report?.drift_sec;
+          toast(drift!==undefined?`🎬 Sync render done (drift: ${drift}s)`:'🎬 Sync render complete!','ok');
         }else{toast('Render failed: '+(job.error||'unknown'),'err')}
       }
     }catch(e){addL('t-r','e','Error: '+e.message)}
@@ -1290,7 +1309,7 @@ function toast(msg,type='info'){
 //  RESET
 // ════════════════════════════════════════
 function resetAll(){
-  stamps=[];scr='';moviePath=null;audioPath=null;clipsDir=null;renderPath=null;
+  stamps=[];scr='';moviePath=null;audioPath=null;clipsDir=null;renderPath=null;voiceSegments=[];
   document.querySelectorAll('.tab').forEach((t,i)=>{t.classList.remove('done','active');if(i===0)t.classList.add('active')});
   document.querySelectorAll('.tnum').forEach((n,i)=>n.textContent=i+1);
   document.getElementById('fpill').classList.remove('on');
