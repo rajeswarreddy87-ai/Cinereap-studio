@@ -209,3 +209,19 @@ cd /root/cinerecap-render-server && docker compose up -d --force-recreate render
 ```
 
 `GET /health` should then show `geminiVerifier: true`.
+
+
+## v2.7.4 SigLIP + Gemini activation
+
+- Gemini key inserted into VPS `.env`; `/health` now reports `geminiVerifier: true`, `geminiModel: gemini-2.5-flash`.
+- Visual sidecar upgraded from OpenCLIP ViT-B/32 to SigLIP via OpenCLIP:
+  - `VISUAL_MODEL_NAME=ViT-SO400M-14-SigLIP2`
+  - `VISUAL_MODEL_PRETRAINED=webli`
+- Dockerfile now installs `transformers`, `sentencepiece`, and `protobuf`, required by SigLIP tokenizer.
+- Container was rebuilt and recreated. Verified inside container:
+
+```json
+{"ok":true,"model":true,"modelName":"ViT-SO400M-14-SigLIP2","pretrained":"webli","jobs":0}
+```
+
+Operational note: first SigLIP startup downloaded/loaded ~5GB model cache and took several minutes; subsequent starts should be faster from `/data/models`.

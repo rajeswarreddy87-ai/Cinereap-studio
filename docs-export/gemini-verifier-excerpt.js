@@ -149,3 +149,13 @@ app.get("/health", (_req, res) => {
       "youtube",
       "cookies-upload",
       "voiceover-chunks",   // new in 1.5.0 — voiceoverFileIds[]
+      "music-mix",          // new in 1.5.0 — musicFileId
+      "subtitle-burn",      // new in 1.5.0 — subtitlesSrt
+      "transcribe",         // new in 1.6.0 — whisper-1 transcript + segment timestamps
+      "analyze-transcript", // new in 1.6.0 — /analyze accepts transcript grounding
+      "scene-detection",    // new in 2.0.0 — hybrid scene-based key frames + single story
+      "music-moods",        // new in 2.0.0 — built-in mood beds via musicMood + GET /music/:mood
+      "video-align",        // new in 2.0.0 — visuals looped to cover full voiceover
+      "music-ducking",      // new in 2.0.0 — sidechain duck under narration
+      "server-transcription", // new in 2.3.0 — server-side OpenAI key, always-on whisper
+      "auto-music",         // new in 2.3.0 — scene-adaptive music, no manual mood pick

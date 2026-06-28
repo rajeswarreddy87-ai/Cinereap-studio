@@ -224,3 +224,13 @@
           console.log(`[render ${jobId}] GEMINI: verified ${maxVerify} beats, applied ${appliedGemini} candidate choice(s)`);
         } else {
           console.log(`[render ${jobId}] GEMINI: skipped (GEMINI_API_KEY not set)`);
+        }
+        // ── END GEMINI FLASH VERIFICATION ────────────────────────────────────
+
+        // ── TEXT-TO-TEXT BEAT NOTE MATCHING (zero cost, always available) ────
+        // Uses beat notes Claude already wrote during analyze — no extra API call.
+        // Only fires for beats CLIP did not already improve, and only when the
+        // footage window is shorter than the TTS duration (LOW-SYNC risk beats).
+        {
+          const _txtResult = _textMatchBeatNotes(beats, voDurs);
+          if (_txtResult.applied > 0) {
