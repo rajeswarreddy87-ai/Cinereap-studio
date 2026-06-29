@@ -1,3 +1,5 @@
+        `[render ${jobId}] SYNC: beats normalised ${beatsBefore}→${beats.length}` +
+        ` (SKIP/intro filtered, windows expanded, unique pool=${poolSec.toFixed(0)}s)`,
       );
     }
     // ── END NORMALISATION ─────────────────────────────────────────────────
@@ -717,5 +719,3 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
           console.log(`[render ${jobId}] SYNC MODE on: ${plan.timeline.length} segs, voice=${voiceTotalPre.toFixed(1)}s`);
         }
       }
-    } catch (e) {
-      console.warn(`[render ${jobId}] sync planning failed, falling back to loop align:`, e?.message || e);

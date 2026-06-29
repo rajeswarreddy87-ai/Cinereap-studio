@@ -1,3 +1,5 @@
+              } else {
+                console.warn(`[render ${jobId}] outro clip failed (code ${code}) — skipping`);
               }
               res();
             });
@@ -207,5 +209,3 @@
         let _extPath = _beatVideoPath;
         let _extDur  = _vidDur;
 
-        // STEP 1+2: re-trim beat's own source window (same sceneIds), just longer
-        {

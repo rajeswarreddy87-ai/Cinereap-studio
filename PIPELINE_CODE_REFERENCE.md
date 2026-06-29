@@ -1,4 +1,4 @@
-# CineRecap VPS Pipeline — Code Reference (v2.8.1)
+# CineRecap VPS Pipeline — Code Reference (v2.8.2)
 
 **Server path:** `/root/cinerecap-render-server/`  
 **Live URL:** `http://109.123.241.130:4040`  
@@ -110,7 +110,7 @@ Server reports **0.3–0.6s timing drift** — not 5–10s.
 4. **Music** — default bed `-26dB` (was `-18`), stronger ducking `ratio=12`
 5. **v2.7.1 fixes retained** — analyzeJobId auto-resolve, per-beat TTS, video speed-up in mux
 
-Verify: `GET /health` → `"version": "2.8.1"`
+Verify: `GET /health` → `"version": "2.8.2"`
 
 ---
 
@@ -377,3 +377,24 @@ COPYRIGHT_SAFE_HOOK_CLIP_SEC=2.5
 This preserves hook coverage while staying copyright-safer.
 
 `GET /health` now reports `version: 2.8.1`.
+
+
+## v2.8.2 copyright-safe hoist fix
+
+Latest short render `NaY9wnFIlS` produced ~15 seconds because v2.8.1 referenced `COPYRIGHT_SAFE_MODE` before it was initialized.
+
+Logs showed:
+
+```text
+sync planning failed, falling back to loop align: Cannot access 'COPYRIGHT_SAFE_MODE' before initialization
+HOOK-V2 failed: Cannot access 'COPYRIGHT_SAFE_MODE' before initialization
+BEAT-MUX MAP: 127 sub-clips → 1 body beats
+FINAL A/V durations: video=15.40s audio=15.38s
+```
+
+Fix:
+
+- `COPYRIGHT_SAFE_MODE` and watermark text are now initialized at the top of `runRenderFromIngest()`, before sync planning and hook generation.
+- The duplicate late initialization in final encode was removed.
+
+`GET /health` now reports `version: 2.8.2`.
