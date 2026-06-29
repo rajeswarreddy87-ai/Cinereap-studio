@@ -95,7 +95,15 @@ async function verifyBeatCandidatesWithGemini({ jobId, beatIndex, narration, sou
     const resp = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${SERVER_GEMINI_MODEL}:generateContent?key=${encodeURIComponent(SERVER_GEMINI_KEY)}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ contents: [{ role: "user", parts }], generationConfig: { temperature: 0, maxOutputTokens: 120 } }),
+      body: JSON.stringify({
+        contents: [{ role: "user", parts }],
+        generationConfig: {
+          temperature: 0,
+          maxOutputTokens: 512,
+          responseMimeType: "application/json",
+          thinkingConfig: { thinkingBudget: 0 },
+        },
+      }),
       signal: AbortSignal.timeout(60_000),
     });
     if (!resp.ok) {
@@ -105,7 +113,10 @@ async function verifyBeatCandidatesWithGemini({ jobId, beatIndex, narration, sou
     const data = await resp.json();
     const txt = data?.candidates?.[0]?.content?.parts?.map(p => p.text || "").join("\n") || "";
     const m = txt.match(/\{[\s\S]*\}/);
-    if (!m) return null;
+    if (!m) {
+      console.warn(`[render ${jobId}] GEMINI beat ${beatIndex}: no JSON in response: ${txt.slice(0, 120)}`);
+      return null;
+    }
     const parsed = JSON.parse(m[0]);
     const best = Number(parsed.best) - 1;
     const conf = Number(parsed.confidence) || 0;
@@ -132,7 +143,7 @@ app.get("/health", (_req, res) => {
 
   res.json({
     ok: true,
-    version: "2.7.5",
+    version: "2.7.6",
     serverTranscription: Boolean(SERVER_OPENAI_KEY),
     serverAnalysis: Boolean(SERVER_ANTHROPIC_KEY),
     serverModel: SERVER_ANTHROPIC_MODEL || null,
@@ -169,3 +180,7 @@ app.get("/health", (_req, res) => {
       "gemini-verify",     // new in 2.7.4 — Gemini Flash verifies top candidate clips when GEMINI_API_KEY is set
       "multi-tts",          // new in 2.7.0 — ttsProvider field selects speechify|openai|elevenlabs|hume
       "storage-api",        // new in 2.7.0 — GET /system/storage, DELETE /system/clear-renders
+      "source-download",    // new in 2.7.0 — GET /uploads/:fileId/download
+    ],
+  });
+});

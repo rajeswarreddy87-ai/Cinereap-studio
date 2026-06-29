@@ -1,4 +1,4 @@
-# CineRecap VPS Pipeline — Code Reference (v2.7.5)
+# CineRecap VPS Pipeline — Code Reference (v2.7.6)
 
 **Server path:** `/root/cinerecap-render-server/`  
 **Live URL:** `http://109.123.241.130:4040`  
@@ -110,7 +110,7 @@ Server reports **0.3–0.6s timing drift** — not 5–10s.
 4. **Music** — default bed `-26dB` (was `-18`), stronger ducking `ratio=12`
 5. **v2.7.1 fixes retained** — analyzeJobId auto-resolve, per-beat TTS, video speed-up in mux
 
-Verify: `GET /health` → `"version": "2.7.5"`
+Verify: `GET /health` → `"version": "2.7.6"`
 
 ---
 
@@ -244,3 +244,24 @@ Fixes:
 - Gemini acceptance threshold configurable: `GEMINI_ACCEPT_THRESHOLD` default `0.35`.
 - Final/climax beat gap-fill Step 1 now compares against current assembled video duration, allowing longer own-scene re-trims for final beats.
 - Gap-fill Step 1 now logs successful re-trims.
+
+
+## v2.7.6 Gemini verifier reliability fix
+
+Latest live render `yown2PRCCE` showed the job UI stuck at `Voicing scene 83/83`, but logs confirmed TTS had completed and the render had moved through SigLIP/Gemini. The stale UI message was because the job progress was not updated during the verifier stage.
+
+Findings from `yown2PRCCE`:
+
+- SigLIP embedded 179 frames.
+- Gemini attempted candidate verification but failed/returned no usable choices, so it applied 0 visual changes.
+- Tail-beat gap-fill fix worked: final beats re-trimmed own scene and sync validation finished `81 PASS / 0 WARN / 0 FIX`.
+
+Fixes:
+
+- Gemini request now uses JSON mode (`responseMimeType: application/json`).
+- Gemini thinking disabled for verifier (`thinkingConfig: { thinkingBudget: 0 }`) so output tokens are not consumed by hidden reasoning.
+- Gemini max output raised to 512.
+- Logs now include `no JSON in response` snippets when parsing fails.
+- `GEMINI_VERIFY_MAX_BEATS` lowered to 35 in `.env` to avoid overload/rate instability.
+
+`GET /health` now reports `version: 2.7.6`.

@@ -1,3 +1,14 @@
+      // footage rather than the AI's original 6-second clip window.
+      if (beats.length > 0 && safeCeiling > 0) {
+        const lastB = beats[beats.length - 1];
+        if (safeCeiling > Number(lastB.startSec)) {
+          beats[beats.length - 1] = { ...lastB, endSec: Math.max(Number(lastB.endSec), safeCeiling) };
+        }
+        const poolSec = beats.reduce((s, b) => s + Math.max(0, Number(b.endSec) - Number(b.startSec)), 0);
+        const winSizes = beats.slice(0, 3).map(b => (Number(b.endSec)-Number(b.startSec)).toFixed(0));
+        console.log(`[render ${jobId}] SYNC: last beat extended to ${safeCeiling.toFixed(0)}s ceiling, pool=${poolSec.toFixed(0)}s, first3windows=${winSizes.join(',')}s`);
+      }
+      if (voiceTotalPre > 0.5) {
         // ── WINDOW ADEQUACY EXPANSION ─────────────────────────────────────────
         // After measuring exact per-beat TTS durations (voDurs), expand any beat
         // whose footage window is shorter than its narration.  Borrowing from the
@@ -191,7 +202,7 @@
         // Final multimodal verifier: Whisper candidate + local visual candidates +
         // Gemini chooses the best short clip. Runs only when GEMINI_API_KEY is set.
         if (SERVER_GEMINI_KEY) {
-          const maxVerify = Math.max(0, Math.min(scenes.length, Number(process.env.GEMINI_VERIFY_MAX_BEATS || scenes.length)));
+          const maxVerify = Math.max(0, Math.min(scenes.length, Number(process.env.GEMINI_VERIFY_MAX_BEATS || 35)));
           let attemptedGemini = 0, appliedGemini = 0, rejectedGemini = 0, skippedGemini = 0, failedGemini = 0;
           for (let i = 0; i < maxVerify; i++) {
             const cands = _dedupeCandidates([
@@ -234,3 +245,7 @@
             });
             console.log(
               `[render ${jobId}] TEXT-MATCH: re-centred ${_txtResult.applied} footage-starved beat(s) ` +
+              `using note similarity — ${_txtResult.log.slice(0, 5).join(', ')}` +
+              (_txtResult.log.length > 5 ? ` (+${_txtResult.log.length - 5} more)` : '')
+            );
+          }

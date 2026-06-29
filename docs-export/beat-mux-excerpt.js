@@ -1,3 +1,14 @@
+  let outputDurationSec = 0; // used by poster generation below
+
+  // ── BEAT-BY-BEAT MUX ─────────────────────────────────────────────────────
+  // GROUP-BY-BEAT MUX: concat each beat's sub-clips into one beat video (video-only),
+  // then mux with the beat's full TTS voice file using -shortest.
+  // This ensures narration plays CONTINUOUSLY over all visual cuts within a beat —
+  // no audio interruption at 6-second sub-clip boundaries.
+  //
+  // clipPaths layout: [sub1_b0, sub2_b0, sub3_b0, sub1_b1, ...]
+  //   Hook is NOT in clipPaths — it is muxed independently after body BEAT-MUX.
+  //   cleanClips[j].beatIndex → which beat owns sub-clip j
   //   voiceoverFileIds[beatIndex] → the beat's TTS file
 
   // Build beat groups: beatIndex → [clipPath, ...] in timeline order
@@ -183,4 +194,3 @@
         if (_target - _extDur > 0.30 && _scenesMap && Array.isArray(_beat?.sceneIds) && _beat.sceneIds.length > 0) {
           const _lastScId = _beat.sceneIds[_beat.sceneIds.length - 1];
           for (const adjId of [_lastScId + 1, _lastScId + 2]) {
-            if (_target - _extDur <= 0.30) break;
