@@ -1,8 +1,3 @@
-  //   cleanClips[j].beatIndex → which beat owns sub-clip j
-  //   voiceoverFileIds[beatIndex] → the beat's TTS file
-
-  // Build beat groups: beatIndex → [clipPath, ...] in timeline order
-  const _beatGroupMap = new Map();
   for (let _j = 0; _j < cleanClips.length; _j++) {
     const _bi = typeof cleanClips[_j].beatIndex === "number" ? cleanClips[_j].beatIndex : _j;
     if (!_beatGroupMap.has(_bi)) _beatGroupMap.set(_bi, []);
@@ -19,17 +14,35 @@
     let vDur = 0, aDur = 0;
     try { vDur = await probeDurationSec(videoPath); } catch {}
     try { aDur = await probeDurationSec(voicePath); } catch {}
-    // Audio is master. Never speed up narration or footage here; if the full MP3
-    // runs longer than the assembled video, clone the final frame so -shortest
-    // ends on the audio stream instead of cutting the last words.
-    const tailPad = (vDur > 0 && aDur > 0) ? Math.max(padSec, aDur - vDur + 0.75) : padSec;
+    // Audio is master. For mild mismatches, retime the video with setpts so the
+    // visual action spans the narration instead of drifting into the next beat.
+    //   ratio < 1.0 => video is shorter than narration -> slow video down
+    //   ratio > 1.0 => video is longer than narration  -> speed video up
+    // Keep retiming conservative; bigger mismatches are handled by gap-fill or tail pad.
+    const retimeMin = Number(process.env.VIDEO_RETIME_MIN || 0.82);
+    const retimeMax = Number(process.env.VIDEO_RETIME_MAX || 1.18);
+    let speed = 1.0;
+    let retime = false;
+    if (vDur > 0.5 && aDur > 0.5) {
+      const ratio = vDur / aDur;
+      if (ratio >= retimeMin && ratio <= retimeMax && Math.abs(ratio - 1) > 0.015) {
+        speed = ratio;
+        retime = true;
+      }
+    }
+    const videoChain = retime
+      ? `setpts=PTS/${speed.toFixed(5)},tpad=stop_mode=clone:stop_duration=${padSec.toFixed(3)}`
+      : `tpad=stop_mode=clone:stop_duration=${((vDur > 0 && aDur > 0) ? Math.max(padSec, aDur - vDur + 0.75) : padSec).toFixed(3)}`;
+    if (retime) {
+      console.log(`[render ${jobId}] BEAT-RETIME: ${path.basename(outPath)} video=${vDur.toFixed(2)}s audio=${aDur.toFixed(2)}s speed=${speed.toFixed(3)}x`);
+    }
     return new Promise((res) => {
       const ff = spawn("ffmpeg", [
         "-y", "-hide_banner", "-loglevel", "warning",
         "-i", videoPath,
         "-i", voicePath,
         "-filter_complex",
-          `[0:v]tpad=stop_mode=clone:stop_duration=${tailPad.toFixed(3)}[vpad]`,
+          `[0:v]${videoChain}[vpad]`,
         "-map", "[vpad]", "-map", "1:a",
         "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
         "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
@@ -196,11 +209,3 @@
               const ff = spawn("ffmpeg", buildTrimArgs({
                 inputPath: sourcePath, startSec: _beatStart, endSec: adjEnd,
                 outputPath: _s3Path, reencode: true,
-              }), { stdio: "ignore" });
-              const t = setTimeout(() => { try { ff.kill("SIGKILL"); } catch {} res(false); }, 90_000);
-              ff.on("close", (code) => { clearTimeout(t); res(code === 0); });
-              ff.on("error", () => { clearTimeout(t); res(false); });
-            });
-            if (_s3Ok) {
-              const _s3Dur = await probeDurationSec(_s3Path).catch(() => 0);
-              if (_s3Dur > _extDur) {

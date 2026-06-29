@@ -1,4 +1,4 @@
-# CineRecap VPS Pipeline — Code Reference (v2.7.7)
+# CineRecap VPS Pipeline — Code Reference (v2.7.8)
 
 **Server path:** `/root/cinerecap-render-server/`  
 **Live URL:** `http://109.123.241.130:4040`  
@@ -110,7 +110,7 @@ Server reports **0.3–0.6s timing drift** — not 5–10s.
 4. **Music** — default bed `-26dB` (was `-18`), stronger ducking `ratio=12`
 5. **v2.7.1 fixes retained** — analyzeJobId auto-resolve, per-beat TTS, video speed-up in mux
 
-Verify: `GET /health` → `"version": "2.7.7"`
+Verify: `GET /health` → `"version": "2.7.8"`
 
 ---
 
@@ -289,3 +289,30 @@ Fixes:
 - Post-render ffprobe validation now logs final video/audio stream durations and warns if delta >1s.
 
 `GET /health` now reports `version: 2.7.7`.
+
+
+## v2.7.8 controlled video retiming
+
+User recommendation: to avoid narration drifting into the next scene, retime video to narration where safe.
+
+Fix:
+
+- `_muxVideoWithVoice()` now compares assembled beat video duration to actual beat MP3 duration.
+- If the ratio is within safe bounds (`VIDEO_RETIME_MIN=0.82`, `VIDEO_RETIME_MAX=1.18`), video is retimed with FFmpeg `setpts=PTS/speed`.
+  - ratio < 1.0: video is slowed down to cover narration.
+  - ratio > 1.0: video is sped up to finish with narration.
+- Larger mismatches still use existing gap-fill / tpad fallback to avoid unnatural speed changes.
+- Logs show retimed beats:
+
+```text
+BEAT-RETIME: beat-muxed-... video=12.00s audio=13.00s speed=0.923x
+```
+
+Current env:
+
+```bash
+VIDEO_RETIME_MIN=0.82
+VIDEO_RETIME_MAX=1.18
+```
+
+`GET /health` now reports `version: 2.7.8`.
