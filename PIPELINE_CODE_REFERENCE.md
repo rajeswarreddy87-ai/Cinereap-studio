@@ -1,4 +1,4 @@
-# CineRecap VPS Pipeline — Code Reference (v2.7.9)
+# CineRecap VPS Pipeline — Code Reference (v2.8.0)
 
 **Server path:** `/root/cinerecap-render-server/`  
 **Live URL:** `http://109.123.241.130:4040`  
@@ -110,7 +110,7 @@ Server reports **0.3–0.6s timing drift** — not 5–10s.
 4. **Music** — default bed `-26dB` (was `-18`), stronger ducking `ratio=12`
 5. **v2.7.1 fixes retained** — analyzeJobId auto-resolve, per-beat TTS, video speed-up in mux
 
-Verify: `GET /health` → `"version": "2.7.9"`
+Verify: `GET /health` → `"version": "2.8.0"`
 
 ---
 
@@ -330,3 +330,33 @@ Fixes:
 - Render now fails early with a clear message if no beat-level narration exists: `Analysis incomplete: no beat-level narration found for this movie. Rerun Analyze before rendering.`
 
 `GET /health` now reports `version: 2.7.9`.
+
+
+## v2.8.0 copyright-safe visual mode
+
+User requested copyright-safe transformations but no captions/subtitles.
+
+Enabled by default:
+
+```bash
+COPYRIGHT_SAFE_MODE=true
+COPYRIGHT_SAFE_MAX_CLIP_SEC=3.0
+WATERMARK_TEXT=Plotline Panic
+```
+
+Render behavior:
+
+- Shorter max visual cut duration: `maxClipSec=3.0` when copyright-safe mode is enabled.
+- Final video filter applies visible transformations:
+  - 6% crop/zoom
+  - scale/crop to final canvas
+  - contrast/brightness/saturation/gamma shift
+  - subtle grain/noise
+  - black border/frame
+  - top-left watermark
+- Source audio remains muted in source clips.
+- Captions/subtitles are NOT auto-enabled.
+
+Important: this reduces Content ID risk but cannot guarantee no copyright claim/strike.
+
+`GET /health` now reports `version: 2.8.0`.

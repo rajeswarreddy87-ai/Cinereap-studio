@@ -1,3 +1,4 @@
+  }
   // ── END OUTRO SEGMENT ─────────────────────────────────────────────────────
 
   const outputPath     = path.join(OUTPUT_DIR, `recap-${jobId}.mp4`);
@@ -208,4 +209,3 @@
               }), { stdio: "ignore" });
               const t = setTimeout(() => { try { ff.kill("SIGKILL"); } catch {} res(false); }, 90_000);
               ff.on("close", (code) => { clearTimeout(t); res(code === 0); });
-              ff.on("error", () => { clearTimeout(t); res(false); });
