@@ -470,6 +470,8 @@ export function getModelMaxOutputTokens(model = "") {
   return 8000; // safe conservative default for unknown future models
 }
 
+function sleepMs(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
+
 /**
  * Call Anthropic's /v1/messages endpoint with the given messages.
  * Caller supplies the API key and model.
@@ -482,25 +484,34 @@ export async function callClaude({ apiKey, model, messages, maxTokens = 4000 }) 
   // Cap to the model's actual output limit; never exceed it or the API errors.
   const hardLimit = getModelMaxOutputTokens(model);
   const effectiveMax = Math.min(maxTokens, hardLimit);
-  const res = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: {
-      "x-api-key": apiKey,
-      "anthropic-version": "2023-06-01",
-      "content-type": "application/json",
-    },
-    body: JSON.stringify({ model, max_tokens: effectiveMax, messages }),
-  });
-  if (!res.ok) {
+  const maxAttempts = 4;
+  let lastErr = null;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const res = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ model, max_tokens: effectiveMax, messages }),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      const text = (data?.content || []).map((b) => b?.text || "").join("\n");
+      if (!text) throw new Error("Claude returned an empty text block");
+      return text;
+    }
     const body = await res.text().catch(() => "");
-    throw new Error(`Claude ${res.status}: ${body.slice(0, 300)}`);
+    lastErr = new Error(`Claude ${res.status}: ${body.slice(0, 300)}`);
+    const overloaded = res.status === 529 || /overloaded|rate.?limit|temporarily/i.test(body);
+    if (!overloaded || attempt === maxAttempts - 1) break;
+    const waitMs = [10_000, 25_000, 45_000][attempt] || 60_000;
+    console.warn(`[callClaude] overloaded (${res.status}), retry ${attempt + 1}/${maxAttempts - 1} after ${waitMs}ms`);
+    await sleepMs(waitMs);
   }
-  const data = await res.json();
-  const text = (data?.content || []).map((b) => b?.text || "").join("\n");
-  if (!text) throw new Error("Claude returned an empty text block");
-  return text;
+  throw lastErr || new Error("Claude request failed");
 }
-
 /**
  * Two-stage analysis that produces ONE coherent, transcript-grounded story
  * regardless of how many frame batches are needed.

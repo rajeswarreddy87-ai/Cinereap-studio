@@ -1,3 +1,25 @@
+    // Hoisted outside try block so the mux gap-fill loop (below) can reference them.
+    let srcDur = 0;
+    let safeCeiling = 0;
+
+    try {
+      let voDurs = await Promise.all(
+        voiceoverFileIds.map((id) => probeDurationSec(path.join(UPLOADS_DIR, id)).catch(() => 0)),
+      );
+      voiceTotalPre = voDurs.reduce((a, b) => a + (Number(b) || 0), 0);
+      console.log(`[render ${jobId}] SYNC: voiceTotalPre=${voiceTotalPre.toFixed(2)}s`);
+      try { srcDur = await probeDurationSec(sourcePath); } catch {}
+      // CREDITS-SAFE CEILING: never let the synced visuals reach the closing
+      // credits. Mirror the scene detector's guard (drop the greater of last
+      // 90s or 3.5% of runtime, capped at 8%). The sync engine clamps every
+      // produced trim to this ceiling, so credits can never appear during
+      // narration even when footage must be re-passed to cover a long voiceover.
+      safeCeiling = srcDur;
+      if (srcDur > 0) {
+        const creditsTail = Math.min(srcDur * 0.08, Math.max(90, srcDur * 0.035));
+        safeCeiling = Math.max(srcDur * 0.5, srcDur - creditsTail);
+      }
+      // Extend the last beat's window to safeCeiling so it has full movie
       // footage rather than the AI's original 6-second clip window.
       if (beats.length > 0 && safeCeiling > 0) {
         const lastB = beats[beats.length - 1];
@@ -227,25 +249,3 @@
           }
           console.log(`[render ${jobId}] GEMINI: candidates attempted=${attemptedGemini}, applied=${appliedGemini}, rejected=${rejectedGemini}, failed=${failedGemini}, skipped=${skippedGemini}`);
         } else {
-          console.log(`[render ${jobId}] GEMINI: skipped (GEMINI_API_KEY not set)`);
-        }
-        // ── END GEMINI FLASH VERIFICATION ────────────────────────────────────
-
-        // ── TEXT-TO-TEXT BEAT NOTE MATCHING (zero cost, always available) ────
-        // Uses beat notes Claude already wrote during analyze — no extra API call.
-        // Only fires for beats CLIP did not already improve, and only when the
-        // footage window is shorter than the TTS duration (LOW-SYNC risk beats).
-        {
-          const _txtResult = _textMatchBeatNotes(beats, voDurs);
-          if (_txtResult.applied > 0) {
-            scenes = scenes.map((sc, i) => {
-              if (protectedVisualBeats[i]) return sc;
-              if (sc.reason && (sc.reason.includes('[clip:') || sc.reason.includes('[gemini:'))) return sc;
-              return _txtResult.scenes[i];
-            });
-            console.log(
-              `[render ${jobId}] TEXT-MATCH: re-centred ${_txtResult.applied} footage-starved beat(s) ` +
-              `using note similarity — ${_txtResult.log.slice(0, 5).join(', ')}` +
-              (_txtResult.log.length > 5 ? ` (+${_txtResult.log.length - 5} more)` : '')
-            );
-          }

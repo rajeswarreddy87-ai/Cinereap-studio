@@ -1,4 +1,4 @@
-# CineRecap VPS Pipeline — Code Reference (v2.7.8)
+# CineRecap VPS Pipeline — Code Reference (v2.7.9)
 
 **Server path:** `/root/cinerecap-render-server/`  
 **Live URL:** `http://109.123.241.130:4040`  
@@ -110,7 +110,7 @@ Server reports **0.3–0.6s timing drift** — not 5–10s.
 4. **Music** — default bed `-26dB` (was `-18`), stronger ducking `ratio=12`
 5. **v2.7.1 fixes retained** — analyzeJobId auto-resolve, per-beat TTS, video speed-up in mux
 
-Verify: `GET /health` → `"version": "2.7.8"`
+Verify: `GET /health` → `"version": "2.7.9"`
 
 ---
 
@@ -316,3 +316,17 @@ VIDEO_RETIME_MAX=1.18
 ```
 
 `GET /health` now reports `version: 2.7.8`.
+
+
+## v2.7.9 analyze retry and no-beats fail-fast
+
+Live render `uQ_VvjDHPb` failed because analyze job `xZY3pxqB2M` fell back after Claude `529 overloaded` and produced `timestamps` but no `beats`. Render then tried to build a beat-mux with no voice files and failed at `buildConcatManifest`.
+
+Fixes:
+
+- `callClaude()` now retries overload/rate-limit/temporary failures up to 4 attempts with backoff.
+- If scene-aware analysis still fails due Claude overload, analyze fails loudly instead of falling back to timestamp-only fixed-frame mode.
+- Analyze now rejects results with no `beats`.
+- Render now fails early with a clear message if no beat-level narration exists: `Analysis incomplete: no beat-level narration found for this movie. Rerun Analyze before rendering.`
+
+`GET /health` now reports `version: 2.7.9`.
