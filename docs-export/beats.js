@@ -369,12 +369,15 @@ export function buildSyncedTimeline(scenes, beatDurations, opts = {}) {
 
       // ChatGPT pipeline: beatType (Item 6) overrides importance (Item 5) for cut timing.
       // Falls back to global maxClipSec when neither array is provided.
-      const beatMaxCut = (Array.isArray(opts.beatImportances) || Array.isArray(opts.beatTypes))
+      const computedMaxCut = (Array.isArray(opts.beatImportances) || Array.isArray(opts.beatTypes))
         ? Math.max(MIN_CUT_SEC, computeMaxClipSec(
             Array.isArray(opts.beatImportances) ? opts.beatImportances[i] : undefined,
             Array.isArray(opts.beatTypes) ? opts.beatTypes[i] : undefined
           ))
         : maxClipSec;
+      // maxClipSec is a hard cap. In copyright-safe mode the render passes 3.0s;
+      // high-importance/climax beats still get more sub-clips, not longer raw clips.
+      const beatMaxCut = Math.min(maxClipSec, computedMaxCut);
       const clipLen = Math.min(need, beatMaxCut);
       const clipEnd = Math.min(cursor + clipLen, ceiling);
       const taken = clipEnd - cursor;

@@ -1,4 +1,4 @@
-# CineRecap VPS Pipeline — Code Reference (v2.8.0)
+# CineRecap VPS Pipeline — Code Reference (v2.8.1)
 
 **Server path:** `/root/cinerecap-render-server/`  
 **Live URL:** `http://109.123.241.130:4040`  
@@ -110,7 +110,7 @@ Server reports **0.3–0.6s timing drift** — not 5–10s.
 4. **Music** — default bed `-26dB` (was `-18`), stronger ducking `ratio=12`
 5. **v2.7.1 fixes retained** — analyzeJobId auto-resolve, per-beat TTS, video speed-up in mux
 
-Verify: `GET /health` → `"version": "2.8.0"`
+Verify: `GET /health` → `"version": "2.8.1"`
 
 ---
 
@@ -360,3 +360,20 @@ Render behavior:
 Important: this reduces Content ID risk but cannot guarantee no copyright claim/strike.
 
 `GET /health` now reports `version: 2.8.0`.
+
+
+## v2.8.1 hook and climax safeguards
+
+Additional safeguards after enabling copyright-safe mode:
+
+- `maxClipSec` is now a hard cap even when importance/beatType dynamic cutting is enabled. In copyright-safe mode, high-importance and climax beats get more sub-clips, not longer clips.
+- Hook V2 now expands chosen sourceBeatIds with neighbouring beats under copyright-safe mode, producing more short hook clips instead of a few long clips.
+- Hook clip cap added:
+
+```bash
+COPYRIGHT_SAFE_HOOK_CLIP_SEC=2.5
+```
+
+This preserves hook coverage while staying copyright-safer.
+
+`GET /health` now reports `version: 2.8.1`.

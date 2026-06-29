@@ -1,3 +1,13 @@
+              }
+              res();
+            });
+            ff.on("error", (e) => { clearTimeout(t); console.warn(`[render ${jobId}] outro clip error:`, e?.message || e); res(); });
+          });
+        }
+      }
+    }
+  } catch (outroErr) {
+    console.warn(`[render ${jobId}] outro generation failed (non-fatal):`, outroErr?.message || outroErr);
   }
   // ── END OUTRO SEGMENT ─────────────────────────────────────────────────────
 
@@ -199,13 +209,3 @@
 
         // STEP 1+2: re-trim beat's own source window (same sceneIds), just longer
         {
-          const _s1End = Math.min(_beatStart + _target, _nextStart - 0.1);
-          if (_s1End > _beatStart + _extDur + 0.2 && _beatStart >= 0) {
-            const _s1Path = path.join(UPLOADS_DIR, `beat-gf1-${jobId}-${String(_bi).padStart(3,"0")}.mp4`);
-            const _s1Ok   = await new Promise((res) => {
-              const ff = spawn("ffmpeg", buildTrimArgs({
-                inputPath: sourcePath, startSec: _beatStart, endSec: _s1End,
-                outputPath: _s1Path, reencode: true,
-              }), { stdio: "ignore" });
-              const t = setTimeout(() => { try { ff.kill("SIGKILL"); } catch {} res(false); }, 90_000);
-              ff.on("close", (code) => { clearTimeout(t); res(code === 0); });
