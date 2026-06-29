@@ -1,4 +1,4 @@
-# CineRecap VPS Pipeline — Code Reference (v2.7.6)
+# CineRecap VPS Pipeline — Code Reference (v2.7.7)
 
 **Server path:** `/root/cinerecap-render-server/`  
 **Live URL:** `http://109.123.241.130:4040`  
@@ -110,7 +110,7 @@ Server reports **0.3–0.6s timing drift** — not 5–10s.
 4. **Music** — default bed `-26dB` (was `-18`), stronger ducking `ratio=12`
 5. **v2.7.1 fixes retained** — analyzeJobId auto-resolve, per-beat TTS, video speed-up in mux
 
-Verify: `GET /health` → `"version": "2.7.6"`
+Verify: `GET /health` → `"version": "2.7.7"`
 
 ---
 
@@ -265,3 +265,27 @@ Fixes:
 - `GEMINI_VERIFY_MAX_BEATS` lowered to 35 in `.env` to avoid overload/rate instability.
 
 `GET /health` now reports `version: 2.7.6`.
+
+
+## v2.7.7 stream-duration drift fix
+
+User-observed issue: climax video stream ended ~1 minute before narration; player froze on last frame while audio continued.
+
+Measured root cause on `recap-yown2PRCCE.mp4`:
+
+```text
+video stream duration: 1181.93s
+audio stream duration: 1231.33s
+delta: ~49.4s
+```
+
+Segment probe showed each `beat-muxed-*` MP4 had video about 0.28–0.31s longer than audio; across ~80 beats this accumulated and confused the final concat/encode timestamps. The final encode then produced a shorter video stream and longer audio stream.
+
+Fixes:
+
+- `_muxVideoWithVoice()` now hard-clamps each beat segment with `-t <actual MP3 duration>` so each segment's video/audio timelines stay equal.
+- Final encode video filter adds a `tpad` safety guard so the video stream cannot end before the final audio stream.
+- Final encode adds `-t outputDurationSec` to clamp the MP4 to expected concat duration.
+- Post-render ffprobe validation now logs final video/audio stream durations and warns if delta >1s.
+
+`GET /health` now reports `version: 2.7.7`.

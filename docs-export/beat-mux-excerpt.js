@@ -1,13 +1,3 @@
-  let outputDurationSec = 0; // used by poster generation below
-
-  // ── BEAT-BY-BEAT MUX ─────────────────────────────────────────────────────
-  // GROUP-BY-BEAT MUX: concat each beat's sub-clips into one beat video (video-only),
-  // then mux with the beat's full TTS voice file using -shortest.
-  // This ensures narration plays CONTINUOUSLY over all visual cuts within a beat —
-  // no audio interruption at 6-second sub-clip boundaries.
-  //
-  // clipPaths layout: [sub1_b0, sub2_b0, sub3_b0, sub1_b1, ...]
-  //   Hook is NOT in clipPaths — it is muxed independently after body BEAT-MUX.
   //   cleanClips[j].beatIndex → which beat owns sub-clip j
   //   voiceoverFileIds[beatIndex] → the beat's TTS file
 
@@ -43,7 +33,9 @@
         "-map", "[vpad]", "-map", "1:a",
         "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
         "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
-        "-shortest", outPath,
+        "-shortest",
+        ...(aDur > 0 ? ["-t", aDur.toFixed(3)] : []),
+        outPath,
       ], { stdio: "ignore" });
       const t = setTimeout(() => { try { ff.kill("SIGKILL"); } catch {} res(false); }, 180_000);
       ff.on("close", (code) => { clearTimeout(t); res(code === 0); });
@@ -194,3 +186,21 @@
         if (_target - _extDur > 0.30 && _scenesMap && Array.isArray(_beat?.sceneIds) && _beat.sceneIds.length > 0) {
           const _lastScId = _beat.sceneIds[_beat.sceneIds.length - 1];
           for (const adjId of [_lastScId + 1, _lastScId + 2]) {
+            if (_target - _extDur <= 0.30) break;
+            const adjScene = _scenesMap.get(adjId);
+            if (!adjScene) break;
+            const adjEnd = Math.min(Number(adjScene.endSec), _nextStart - 0.1);
+            if (adjEnd <= _beatStart + _extDur + 0.2) break;
+            const _s3Path = path.join(UPLOADS_DIR, `beat-gf3-${jobId}-${String(_bi).padStart(3,"0")}-s${adjId}.mp4`);
+            const _s3Ok   = await new Promise((res) => {
+              const ff = spawn("ffmpeg", buildTrimArgs({
+                inputPath: sourcePath, startSec: _beatStart, endSec: adjEnd,
+                outputPath: _s3Path, reencode: true,
+              }), { stdio: "ignore" });
+              const t = setTimeout(() => { try { ff.kill("SIGKILL"); } catch {} res(false); }, 90_000);
+              ff.on("close", (code) => { clearTimeout(t); res(code === 0); });
+              ff.on("error", () => { clearTimeout(t); res(false); });
+            });
+            if (_s3Ok) {
+              const _s3Dur = await probeDurationSec(_s3Path).catch(() => 0);
+              if (_s3Dur > _extDur) {
