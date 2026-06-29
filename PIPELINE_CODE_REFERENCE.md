@@ -1,4 +1,4 @@
-# CineRecap VPS Pipeline — Code Reference (v2.7.4)
+# CineRecap VPS Pipeline — Code Reference (v2.7.5)
 
 **Server path:** `/root/cinerecap-render-server/`  
 **Live URL:** `http://109.123.241.130:4040`  
@@ -110,7 +110,7 @@ Server reports **0.3–0.6s timing drift** — not 5–10s.
 4. **Music** — default bed `-26dB` (was `-18`), stronger ducking `ratio=12`
 5. **v2.7.1 fixes retained** — analyzeJobId auto-resolve, per-beat TTS, video speed-up in mux
 
-Verify: `GET /health` → `"version": "2.7.4"`
+Verify: `GET /health` → `"version": "2.7.5"`
 
 ---
 
@@ -225,3 +225,22 @@ cd /root/cinerecap-render-server && docker compose up -d --force-recreate render
 ```
 
 Operational note: first SigLIP startup downloaded/loaded ~5GB model cache and took several minutes; subsequent starts should be faster from `/data/models`.
+
+
+## v2.7.5 fixes after latest render review
+
+Latest reviewed render: `h8NLCAIL99` / analyze `SocpiqYc6E`. Findings:
+
+- SigLIP loaded and embedded 179 frames, but the render did not log direct visual-window application.
+- Gemini reported `verified 80 beats, applied 0`, because candidate construction was too strict/silent.
+- Final beats 80 and 81 had `SYNC-FIX` drift of `1.21s` and `8.48s`, because the gap-fill own-scene re-trim compared against expanded beat end instead of current assembled video duration.
+
+Fixes:
+
+- SigLIP best match is now always retained as a Gemini candidate, even if not directly applied.
+- Direct SigLIP application threshold lowered/configurable: `VISUAL_APPLY_THRESHOLD` default `0.16`.
+- Gemini REST video part payload changed to snake_case (`inline_data`, `mime_type`).
+- Gemini logs now report `attempted`, `applied`, `rejected`, `failed`, and `skipped` counts.
+- Gemini acceptance threshold configurable: `GEMINI_ACCEPT_THRESHOLD` default `0.35`.
+- Final/climax beat gap-fill Step 1 now compares against current assembled video duration, allowing longer own-scene re-trims for final beats.
+- Gap-fill Step 1 now logs successful re-trims.

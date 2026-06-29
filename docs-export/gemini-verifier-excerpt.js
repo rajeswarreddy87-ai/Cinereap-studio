@@ -90,7 +90,7 @@ async function verifyBeatCandidatesWithGemini({ jobId, beatIndex, narration, sou
     const parts = [{ text: prompt }];
     for (const cp of clipParts) {
       parts.push({ text: `Candidate ${cp.idx} (${cp.label})` });
-      parts.push({ inlineData: { mimeType: "video/mp4", data: cp.data } });
+      parts.push({ inline_data: { mime_type: "video/mp4", data: cp.data } });
     }
     const resp = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${SERVER_GEMINI_MODEL}:generateContent?key=${encodeURIComponent(SERVER_GEMINI_KEY)}`, {
       method: "POST",
@@ -132,7 +132,7 @@ app.get("/health", (_req, res) => {
 
   res.json({
     ok: true,
-    version: "2.7.4",
+    version: "2.7.5",
     serverTranscription: Boolean(SERVER_OPENAI_KEY),
     serverAnalysis: Boolean(SERVER_ANTHROPIC_KEY),
     serverModel: SERVER_ANTHROPIC_MODEL || null,
@@ -159,3 +159,13 @@ app.get("/health", (_req, res) => {
       "music-ducking",      // new in 2.0.0 — sidechain duck under narration
       "server-transcription", // new in 2.3.0 — server-side OpenAI key, always-on whisper
       "auto-music",         // new in 2.3.0 — scene-adaptive music, no manual mood pick
+      "poster",             // new in 2.4.0 — render generates a thumbnail JPG
+      "youtube-oauth",      // new in 2.4.0 — browser OAuth connect + upload
+      "claude-models",      // new in 2.5.0 — GET /claude-models proxies Anthropic model list
+      "ai-thumbnails",      // new in 2.6.0 — DALL-E thumbnail generation via server key
+      "translate-transcript", // new in 2.5.0 — Whisper translation endpoint for non-English films
+      "uncapped-narration", // new in 2.5.0 — full-length narration, no word-count ceiling
+      "clip-select",        // new in 2.6.0 — CLIP semantic frame matching for clip selection
+      "gemini-verify",     // new in 2.7.4 — Gemini Flash verifies top candidate clips when GEMINI_API_KEY is set
+      "multi-tts",          // new in 2.7.0 — ttsProvider field selects speechify|openai|elevenlabs|hume
+      "storage-api",        // new in 2.7.0 — GET /system/storage, DELETE /system/clear-renders

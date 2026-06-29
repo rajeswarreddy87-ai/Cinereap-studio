@@ -1,23 +1,3 @@
-      // 90s or 3.5% of runtime, capped at 8%). The sync engine clamps every
-      // produced trim to this ceiling, so credits can never appear during
-      // narration even when footage must be re-passed to cover a long voiceover.
-      safeCeiling = srcDur;
-      if (srcDur > 0) {
-        const creditsTail = Math.min(srcDur * 0.08, Math.max(90, srcDur * 0.035));
-        safeCeiling = Math.max(srcDur * 0.5, srcDur - creditsTail);
-      }
-      // Extend the last beat's window to safeCeiling so it has full movie
-      // footage rather than the AI's original 6-second clip window.
-      if (beats.length > 0 && safeCeiling > 0) {
-        const lastB = beats[beats.length - 1];
-        if (safeCeiling > Number(lastB.startSec)) {
-          beats[beats.length - 1] = { ...lastB, endSec: Math.max(Number(lastB.endSec), safeCeiling) };
-        }
-        const poolSec = beats.reduce((s, b) => s + Math.max(0, Number(b.endSec) - Number(b.startSec)), 0);
-        const winSizes = beats.slice(0, 3).map(b => (Number(b.endSec)-Number(b.startSec)).toFixed(0));
-        console.log(`[render ${jobId}] SYNC: last beat extended to ${safeCeiling.toFixed(0)}s ceiling, pool=${poolSec.toFixed(0)}s, first3windows=${winSizes.join(',')}s`);
-      }
-      if (voiceTotalPre > 0.5) {
         // ── WINDOW ADEQUACY EXPANSION ─────────────────────────────────────────
         // After measuring exact per-beat TTS durations (voDurs), expand any beat
         // whose footage window is shorter than its narration.  Borrowing from the
@@ -73,6 +53,7 @@
         const protectedVisualBeats = beats.map(isProtectedBeatForVisual);
         const originalBeatScenes = scenes.map((sc) => ({ ...sc, label: "analyze" }));
         const transcriptCandidateScenes = beatTexts.map((txt) => findTranscriptCandidateForBeat(txt, sourceTranscriptSegments, srcDur));
+        let siglipCandidateScenes = new Array(scenes.length).fill(null);
 
         // ── CLIP SEMANTIC MATCHING (best-effort, falls back to time windows) ────
         // When the CLIP sidecar has embeddings for this analyze job, replace each
@@ -160,21 +141,24 @@
 
                   if (matchRes && Array.isArray(matchRes.results) && matchRes.results.length === scenes.length) {
                     let clipApplied = 0;
+                    let clipCandidateCount = 0;
                     scenes = scenes.map((sc, i) => {
-                      if (protectedVisualBeats[i]) return sc; // funeral/death/climax beats stay on analyzed source window
                       const m = matchRes.results[i];
-                      // Only apply if score is confident enough (CLIP cosine > 0.22)
-                      // and the matched frame is within the general timeline region.
-                      if (!m || m.score < 0.22) return sc;
-                      const center = m.timeSec;
-                      // FIX: Widened window guard. The old strict check (center must be
-                      // within sc.startSec..sc.endSec) prevented CLIP from correcting
-                      // beats where Claude placed the timestamp in the wrong scene.
-                      // New guard: allow CLIP to relocate a beat's window as long as the
-                      // matched frame is within ±15% of movie duration from the beat midpoint.
-                      // This lets CLIP escape Claude's wrong timestamps (e.g. "Layla scene"
-                      // assigned to minute 30 but Layla actually appears at minute 45)
-                      // while still staying in the correct chronological region.
+                      if (m && Number.isFinite(Number(m.timeSec))) {
+                        const center = Number(m.timeSec);
+                        const winHalf = Math.max(8, (Number(sc.endSec) - Number(sc.startSec)) / 2);
+                        siglipCandidateScenes[i] = {
+                          label: "siglip",
+                          startSec: Math.max(0, center - winHalf),
+                          endSec: Math.min(srcDurClip || center + winHalf, center + winHalf),
+                          score: Number(m.score) || 0,
+                        };
+                        clipCandidateCount++;
+                      }
+                      if (protectedVisualBeats[i]) return sc; // funeral/death/climax beats stay on analyzed source window
+                      // Direct-apply only very confident SigLIP matches; otherwise Gemini verifier decides.
+                      if (!m || m.score < Number(process.env.VISUAL_APPLY_THRESHOLD || 0.16)) return sc;
+                      const center = Number(m.timeSec);
                       const _scMid = (Number(sc.startSec) + Number(sc.endSec)) / 2;
                       const _liberalRadius = srcDurClip > 0 ? srcDurClip * 0.15 : 300;
                       if (center < _scMid - _liberalRadius || center > _scMid + _liberalRadius) return sc;
@@ -184,13 +168,15 @@
                         ...sc,
                         startSec: Math.max(0, center - winHalf),
                         endSec: center + winHalf,
-                        reason: (sc.reason || "") + ` [clip:${m.score.toFixed(2)}]`,
+                        reason: (sc.reason || "") + ` [siglip:${m.score.toFixed(2)}]`,
                       };
                     });
                     console.log(
-                      `[render ${jobId}] CLIP: semantic windows applied to ${clipApplied}/${scenes.length} beats ` +
+                      `[render ${jobId}] SIGLIP: candidates=${clipCandidateCount}/${scenes.length}, direct-applied=${clipApplied}/${scenes.length} ` +
                       `(frames=${embedRes.frames}, analyzeJob=${_analyzeJobId})`
                     );
+                  } else {
+                    console.warn(`[render ${jobId}] SIGLIP: match failed or length mismatch`);
                   }
                 }
               }
@@ -206,22 +192,29 @@
         // Gemini chooses the best short clip. Runs only when GEMINI_API_KEY is set.
         if (SERVER_GEMINI_KEY) {
           const maxVerify = Math.max(0, Math.min(scenes.length, Number(process.env.GEMINI_VERIFY_MAX_BEATS || scenes.length)));
-          let appliedGemini = 0;
+          let attemptedGemini = 0, appliedGemini = 0, rejectedGemini = 0, skippedGemini = 0, failedGemini = 0;
           for (let i = 0; i < maxVerify; i++) {
             const cands = _dedupeCandidates([
               { ...originalBeatScenes[i], label: "analyze" },
-              scenes[i] ? { ...scenes[i], label: scenes[i].reason?.includes('[clip:') ? "openclip" : "current" } : null,
+              siglipCandidateScenes[i] ? { ...siglipCandidateScenes[i], label: "siglip" } : null,
+              scenes[i] ? { ...scenes[i], label: scenes[i].reason?.includes('[siglip:') ? "siglip-current" : "current" } : null,
               transcriptCandidateScenes[i] ? { ...transcriptCandidateScenes[i], label: "whisper" } : null,
             ]);
-            if (cands.length < 2) continue;
+            if (cands.length < 2) { skippedGemini++; continue; }
+            attemptedGemini++;
             const v = await verifyBeatCandidatesWithGemini({ jobId, beatIndex: i, narration: beatTexts[i], sourcePath, candidates: cands });
-            if (v && v.confidence >= 0.45) {
+            if (!v) { failedGemini++; continue; }
+            if (v.confidence >= Number(process.env.GEMINI_ACCEPT_THRESHOLD || 0.35)) {
               const chosen = cands[v.index];
+              // Never let Gemini move protected beats away unless it chooses the analyzed/protected source.
+              if (protectedVisualBeats[i] && chosen.label !== "analyze") { rejectedGemini++; continue; }
               scenes[i] = { ...scenes[i], startSec: chosen.startSec, endSec: chosen.endSec, reason: `${scenes[i]?.reason || ''} [gemini:${chosen.label}:${v.confidence.toFixed(2)}]` };
               appliedGemini++;
+            } else {
+              rejectedGemini++;
             }
           }
-          console.log(`[render ${jobId}] GEMINI: verified ${maxVerify} beats, applied ${appliedGemini} candidate choice(s)`);
+          console.log(`[render ${jobId}] GEMINI: candidates attempted=${attemptedGemini}, applied=${appliedGemini}, rejected=${rejectedGemini}, failed=${failedGemini}, skipped=${skippedGemini}`);
         } else {
           console.log(`[render ${jobId}] GEMINI: skipped (GEMINI_API_KEY not set)`);
         }
@@ -234,3 +227,10 @@
         {
           const _txtResult = _textMatchBeatNotes(beats, voDurs);
           if (_txtResult.applied > 0) {
+            scenes = scenes.map((sc, i) => {
+              if (protectedVisualBeats[i]) return sc;
+              if (sc.reason && (sc.reason.includes('[clip:') || sc.reason.includes('[gemini:'))) return sc;
+              return _txtResult.scenes[i];
+            });
+            console.log(
+              `[render ${jobId}] TEXT-MATCH: re-centred ${_txtResult.applied} footage-starved beat(s) ` +
