@@ -1,4 +1,4 @@
-# CineRecap VPS Pipeline — Code Reference (v2.8.2)
+# CineRecap VPS Pipeline — Code Reference (v2.8.3)
 
 **Server path:** `/root/cinerecap-render-server/`  
 **Live URL:** `http://109.123.241.130:4040`  
@@ -110,7 +110,7 @@ Server reports **0.3–0.6s timing drift** — not 5–10s.
 4. **Music** — default bed `-26dB` (was `-18`), stronger ducking `ratio=12`
 5. **v2.7.1 fixes retained** — analyzeJobId auto-resolve, per-beat TTS, video speed-up in mux
 
-Verify: `GET /health` → `"version": "2.8.2"`
+Verify: `GET /health` → `"version": "2.8.3"`
 
 ---
 
@@ -398,3 +398,19 @@ Fix:
 - The duplicate late initialization in final encode was removed.
 
 `GET /health` now reports `version: 2.8.2`.
+
+
+## v2.8.3 hook retention prompt upgrade
+
+Latest full render had good body A/V stream sync but hook quality was weak.
+
+Fixes:
+
+- Hook beat scoring now boosts shock/emotion/action/family-loss/revenge beats.
+- Hook beat scoring penalizes ordinary setup/business/paperwork beats.
+- Hook prompt rewritten to require a high-retention 55-75 word hook focused on surprise, shock, emotion, danger, action, betrayal, revenge, or family loss.
+- Hook prompt now explicitly disallows generic setup and asks for a concrete unanswered question.
+- Hook generation now uses the server's stronger Claude model (`claude-opus-4-5`) instead of Haiku fallback when available.
+- Hook max output increased to 700 tokens.
+
+`GET /health` now reports `version: 2.8.3`.

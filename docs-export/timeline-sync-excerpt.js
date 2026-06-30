@@ -70,8 +70,14 @@
           const emo = +(b.emotionScore  || imp);
           const sur = +(b.surpriseScore || imp);
           const start = Number(b.startSec) || 0;
+          const txt = String(b.narration || b.reason || "").toLowerCase();
           if (start < _hookIntroFloor) return { _idx: i, hookScore: -1, startSec: start };
-          return { _idx: i, hookScore: imp * 0.60 + emo * 0.30 + sur * 0.10, startSec: start };
+          let keywordBoost = 0;
+          if (/shot|blood|dies|death|killer|murder|gun|funeral|grave|hospital|crash|betray|revenge|loses|taken|custody/i.test(txt)) keywordBoost += 8;
+          if (/fight|brawl|knockout|champion|final round|low blow|uppercut|escobar|climax/i.test(txt)) keywordBoost += 5;
+          if (/wife|daughter|maureen|leila|leyla|cry|grief|love|family/i.test(txt)) keywordBoost += 4;
+          if (/deal|contract|manager|business|pool|speech|press conference|paperwork/i.test(txt)) keywordBoost -= 5;
+          return { _idx: i, hookScore: imp * 0.50 + emo * 0.25 + sur * 0.25 + keywordBoost, startSec: start };
         }).filter((x) => x.hookScore >= 0);
 
         // Step 2: top 8 by hookScore, restore chronological order.
@@ -114,17 +120,24 @@
           .join("\n");
 
         const _hv2Prompt =
-`You write YouTube movie recap hooks (max 60 words, ~20s narration time).
+`You write a high-retention YouTube movie recap hook (55-75 words, ~22-30s narration time).
 
-Selected story beats:
+Selected high-impact story beats:
 ${_hv2Lines}
 
-RULES:
+HOOK GOAL:
+Create a shocking, emotional, action-driven opening that makes viewers NEED to know what happened next.
+
+RULES — follow ALL:
 • Use ONLY the beats above. Never invent events not present here.
-• Never reveal the ending, killer identity, final twist, or who survives.
-• Immediately grab attention. Short sentences. High tension. Present tense.
-• Create curiosity and an unanswered question.
-• End with one transition line like "Let's go back to the beginning."
+• Prioritize SURPRISE, SHOCK, EMOTION, DANGER, REVENGE, FAMILY LOSS, BETRAYAL, or ACTION.
+• Start with the most dramatic situation, not ordinary setup or business context.
+• Short sentences. Present tense. Fast pacing. No generic phrases like "this movie" or "our hero".
+• Do NOT reveal the final ending, final winner, final twist, or resolution.
+• Create an unanswered question by the final third of the hook.
+• End with exactly one transition line: "To understand how it got this far, we have to go back to the beginning."
+• Pick sourceBeatIds ONLY from beats whose footage directly supports the hook visuals.
+• The visual hook should include 3-6 short clips covering the shock/action/emotion you mention.
 
 Return JSON only, no markdown:
 {"hookText":"...","sourceBeatIds":[beatId1,beatId2,...]}
@@ -137,7 +150,7 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
             method: "POST",
             headers: { "Content-Type": "application/json",
               "x-api-key": SERVER_ANTHROPIC_KEY, "anthropic-version": "2023-06-01" },
-            body: JSON.stringify({ model: SERVER_ANTHROPIC_MODEL || "claude-haiku-4-5", max_tokens: 300,
+            body: JSON.stringify({ model: SERVER_ANTHROPIC_MODEL || "claude-opus-4-5", max_tokens: 700,
               messages: [{ role: "user", content: _hv2Prompt }] }),
             signal: AbortSignal.timeout(25_000),
           });
@@ -706,16 +719,3 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
         });
         if (Array.isArray(plan.timeline) && plan.timeline.length > 0) {
           console.log(`[render ${jobId}] SYNC: plan.timeline=${plan.timeline.length}, beatDurations=${plan.beatDurations.map(d => d.toFixed(2)).join(',')}`);
-          // Sanitize synced timeline: drop zero-duration or invalid segments.
-          timestamps = plan.timeline.filter(
-            (t) => Number.isFinite(t.startSec) && Number.isFinite(t.endSec) && t.endSec - t.startSec >= 0.1
-          );
-          syncBeatDurations = plan.beatDurations;
-          syncMoods = beats.map((b) => b.mood || "dramatic");
-          syncMode = true;
-          await jobStore.update(jobId, {
-            message: `Synced timeline: ${plan.timeline.length} clips paced to ${voiceTotalPre.toFixed(0)}s narration (no looping)`,
-          });
-          console.log(`[render ${jobId}] SYNC MODE on: ${plan.timeline.length} segs, voice=${voiceTotalPre.toFixed(1)}s`);
-        }
-      }

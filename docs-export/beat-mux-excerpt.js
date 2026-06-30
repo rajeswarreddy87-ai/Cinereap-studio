@@ -1,3 +1,16 @@
+          const _oStart    = Math.max(30, _oSrcDur * 0.55);
+          const _oEnd      = Math.min(_oSrcDur - 3, _oStart + Math.max(_outroDurSec + 3, 15));
+          const _oClipPath = path.join(UPLOADS_DIR, `outro-clip-${jobId}.mp4`);
+          const _oArgs     = buildTrimArgs({ inputPath: sourcePath, startSec: _oStart, endSec: _oEnd, outputPath: _oClipPath, reencode: true });
+          await new Promise((res) => {
+            const ff = spawn("ffmpeg", _oArgs, { stdio: "ignore" });
+            const t  = setTimeout(() => { try { ff.kill("SIGKILL"); } catch {} res(); }, 90_000);
+            ff.on("close", (code) => {
+              clearTimeout(t);
+              if (code === 0) {
+                clipPaths.push(_oClipPath);
+                voiceoverFileIds.push(_outroTtsId);
+                console.log(`[render ${jobId}] OUTRO: appended clip (${_oStart.toFixed(0)}–${_oEnd.toFixed(0)}s) + TTS ${_outroTtsId}`);
               } else {
                 console.warn(`[render ${jobId}] outro clip failed (code ${code}) — skipping`);
               }
@@ -196,16 +209,3 @@
       const _voiDur = _isTailBeat ? Math.max(_contentDur, _fileDur) : _contentDur;
 
       const _gap    = _voiDur - _vidDur;  // +ve = video short, -ve = video long
-
-      if (_gap > 0.30 && _vidDur > 0) {
-        // CASE 1: video shorter than TTS by > 0.30s
-        const _beat      = beats[_bi];
-        const _nextBeat  = beats[_bi + 1];
-        const _beatStart = Number(_beat?.startSec || 0);
-        const _beatEnd   = Number(_beat?.endSec   || _beatStart + _vidDur);
-        const _nextStart = _nextBeat ? Number(_nextBeat.startSec) : _beatEnd + 120;
-        const _target    = _voiDur + 0.25;  // desired clip duration
-
-        let _extPath = _beatVideoPath;
-        let _extDur  = _vidDur;
-

@@ -1,42 +1,13 @@
-          if (bucket.length === 0) return null;
-          const best = bucket.reduce((top, beat) =>
-            +(beat.importance || 0) >= +(top.importance || 0) ? beat : top
-          );
-          if (seenRefs.has(best)) return null;
-          seenRefs.add(best);
-          return best;
-        }).filter(Boolean);
-        for (const pb of protectedBeats) {
-          if (!kept.includes(pb) && kept.length < BEATS_TARGET + 8) {
-            kept.push(pb);
-            console.log(`[render ${jobId}] BEAT-TRIM: protected key scene kept (${String(pb.narration||"").slice(0,40)}…)`);
-          }
-        }
-        kept.sort((a, b) => Number(a.startSec) - Number(b.startSec));
-
-        console.log(`[render ${jobId}] BEAT-TRIM: ${original.length}→${kept.length} beats (target=${BEATS_TARGET} for ${+targetMinutes || 20}min, stratified)`);
-        beats = kept;
-      } else {
-        console.log(`[render ${jobId}] BEAT-TRIM: ${beats.length} beats — under target (${BEATS_TARGET} for ${+targetMinutes || 20}min), keeping all`);
-      }
-    }
-    // ── END RECAP LENGTH TARGET ───────────────────────────────────────────────
-
-    // ── HOOK V2 GENERATION ─────────────────────────────────────────────────
-    // Select top emotional beats by hookScore, ask Claude to write hook text
-    // referencing those exact beat IDs. Footage will come from the same beats.
-    // Mismatch between narration and footage is structurally impossible.
-    if (HOOK_V2 && Array.isArray(beats) && beats.length >= 5 && (SERVER_ANTHROPIC_KEY || SERVER_OPENAI_KEY)) {
-      try {
-        // Step 1: score each beat
-        const _hookIntroFloor = 120; // match body intro-skip — never hook with credits/logos
-        const _hv2Scored = beats.map((b, i) => {
-          const imp = +(b.importance    || 0);
-          const emo = +(b.emotionScore  || imp);
           const sur = +(b.surpriseScore || imp);
           const start = Number(b.startSec) || 0;
+          const txt = String(b.narration || b.reason || "").toLowerCase();
           if (start < _hookIntroFloor) return { _idx: i, hookScore: -1, startSec: start };
-          return { _idx: i, hookScore: imp * 0.60 + emo * 0.30 + sur * 0.10, startSec: start };
+          let keywordBoost = 0;
+          if (/shot|blood|dies|death|killer|murder|gun|funeral|grave|hospital|crash|betray|revenge|loses|taken|custody/i.test(txt)) keywordBoost += 8;
+          if (/fight|brawl|knockout|champion|final round|low blow|uppercut|escobar|climax/i.test(txt)) keywordBoost += 5;
+          if (/wife|daughter|maureen|leila|leyla|cry|grief|love|family/i.test(txt)) keywordBoost += 4;
+          if (/deal|contract|manager|business|pool|speech|press conference|paperwork/i.test(txt)) keywordBoost -= 5;
+          return { _idx: i, hookScore: imp * 0.50 + emo * 0.25 + sur * 0.25 + keywordBoost, startSec: start };
         }).filter((x) => x.hookScore >= 0);
 
         // Step 2: top 8 by hookScore, restore chronological order.
@@ -79,17 +50,24 @@
           .join("\n");
 
         const _hv2Prompt =
-`You write YouTube movie recap hooks (max 60 words, ~20s narration time).
+`You write a high-retention YouTube movie recap hook (55-75 words, ~22-30s narration time).
 
-Selected story beats:
+Selected high-impact story beats:
 ${_hv2Lines}
 
-RULES:
+HOOK GOAL:
+Create a shocking, emotional, action-driven opening that makes viewers NEED to know what happened next.
+
+RULES — follow ALL:
 • Use ONLY the beats above. Never invent events not present here.
-• Never reveal the ending, killer identity, final twist, or who survives.
-• Immediately grab attention. Short sentences. High tension. Present tense.
-• Create curiosity and an unanswered question.
-• End with one transition line like "Let's go back to the beginning."
+• Prioritize SURPRISE, SHOCK, EMOTION, DANGER, REVENGE, FAMILY LOSS, BETRAYAL, or ACTION.
+• Start with the most dramatic situation, not ordinary setup or business context.
+• Short sentences. Present tense. Fast pacing. No generic phrases like "this movie" or "our hero".
+• Do NOT reveal the final ending, final winner, final twist, or resolution.
+• Create an unanswered question by the final third of the hook.
+• End with exactly one transition line: "To understand how it got this far, we have to go back to the beginning."
+• Pick sourceBeatIds ONLY from beats whose footage directly supports the hook visuals.
+• The visual hook should include 3-6 short clips covering the shock/action/emotion you mention.
 
 Return JSON only, no markdown:
 {"hookText":"...","sourceBeatIds":[beatId1,beatId2,...]}
@@ -99,3 +77,40 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
         let _hv2Raw = null;
         if (SERVER_ANTHROPIC_KEY) {
           const _hv2Resp = await fetch("https://api.anthropic.com/v1/messages", {
+            method: "POST",
+            headers: { "Content-Type": "application/json",
+              "x-api-key": SERVER_ANTHROPIC_KEY, "anthropic-version": "2023-06-01" },
+            body: JSON.stringify({ model: SERVER_ANTHROPIC_MODEL || "claude-opus-4-5", max_tokens: 700,
+              messages: [{ role: "user", content: _hv2Prompt }] }),
+            signal: AbortSignal.timeout(25_000),
+          });
+          const _hv2Data = await _hv2Resp.json();
+          _hv2Raw = _hv2Data?.content?.[0]?.text?.trim() || null;
+        } else {
+          const _hv2Resp = await fetch("https://api.openai.com/v1/chat/completions", {
+            method: "POST",
+            headers: { "Content-Type": "application/json", Authorization: `Bearer ${SERVER_OPENAI_KEY}` },
+            body: JSON.stringify({ model: "gpt-4o-mini", max_tokens: 300,
+              messages: [{ role: "user", content: _hv2Prompt }] }),
+            signal: AbortSignal.timeout(25_000),
+          });
+          const _hv2Data = await _hv2Resp.json();
+          _hv2Raw = _hv2Data?.choices?.[0]?.message?.content?.trim() || null;
+        }
+
+        if (_hv2Raw) {
+          let _hv2Json = null;
+          try {
+            const _hv2Match = _hv2Raw.match(/\{[\s\S]*\}/);
+            if (_hv2Match) _hv2Json = JSON.parse(_hv2Match[0]);
+          } catch {}
+          if (_hv2Json?.hookText) {
+            _hookText = String(_hv2Json.hookText).trim();
+            // Validate returned beat IDs against actual beats array bounds
+            const _rawIds = Array.isArray(_hv2Json.sourceBeatIds)
+              ? _hv2Json.sourceBeatIds.map(Number).filter(n => Number.isFinite(n) && n >= 0 && n < beats.length)
+              : [];
+            _hookV2BeatIds = _rawIds.length > 0 ? _rawIds : _hv2Top.map(x => x._idx);
+            console.log(`[render ${jobId}] HOOK-V2: "${_hookText.slice(0, 70)}..." sourceBeatIds=[${_hookV2BeatIds.join(",")}]`);
+          }
+        }
