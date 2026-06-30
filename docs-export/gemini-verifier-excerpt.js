@@ -80,7 +80,7 @@ app.get("/health", (_req, res) => {
 
   res.json({
     ok: true,
-    version: "2.8.5",
+    version: "2.8.6",
     serverTranscription: Boolean(SERVER_OPENAI_KEY),
     serverAnalysis: Boolean(SERVER_ANTHROPIC_KEY),
     serverModel: SERVER_ANTHROPIC_MODEL || null,
@@ -182,5 +182,5 @@ function aiThumbPath(jobId, style) {
 // cinematic colour grade.  Returns destPath on success, throws on failure.
 // styles: "dramatic" | "bold" | "cinematic"
 const FRAME_FILTERS = {
-  // High contrast + warm vignette — hero-in-peril drama feel
-  dramatic:  "eq=contrast=1.5:brightness=-0.05:saturation=1.1,unsharp=5:5:0.9:3:3:0.0,vignette=PI/4,scale=1280:-2",
+  // Real-movie-frame thumbnails, channel style: close/cropped, sharp face, punchy contrast.
+  dramatic:  "crop=iw*0.82:ih*0.82:(iw-iw*0.82)/2:(ih-ih*0.82)/2,scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,eq=contrast=1.65:brightness=-0.04:saturation=1.22:gamma=0.98,unsharp=7:7:1.4:5:5:0.5,vignette=PI/4,drawbox=x=0:y=0:w=iw:h=ih:color=black@0.40:t=8",

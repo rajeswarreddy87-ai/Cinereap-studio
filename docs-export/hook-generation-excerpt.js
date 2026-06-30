@@ -1,6 +1,3 @@
-            console.log(`[render ${jobId}] scene-sync: filtered ${beforeSkip - rawBeats.length} SKIP/credits beats`);
-          }
-
           // FIX B — Expand each beat window from its tight 6-second clip to the
           // FULL scene range (beat[i].startSec → beat[i+1].startSec).
           // Without this, 48×6s=288s of footage covers a 1226s narration only
@@ -119,3 +116,6 @@
 
       // ── PAIRED SORT: keep voiceoverFileIds in lockstep with beats ───────
       // When the app sends one audio file per beat (lengths match), sorting
+      // beats by startSec without reordering the audio causes a complete
+      // narration-to-video mismatch: audio plays in script order while video
+      // plays in chronological order. Fix: tag each beat with its original

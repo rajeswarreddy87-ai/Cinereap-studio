@@ -349,7 +349,7 @@ app.get("/health", (_req, res) => {
 
   res.json({
     ok: true,
-    version: "2.8.5",
+    version: "2.8.6",
     serverTranscription: Boolean(SERVER_OPENAI_KEY),
     serverAnalysis: Boolean(SERVER_ANTHROPIC_KEY),
     serverModel: SERVER_ANTHROPIC_MODEL || null,
@@ -451,12 +451,10 @@ function aiThumbPath(jobId, style) {
 // cinematic colour grade.  Returns destPath on success, throws on failure.
 // styles: "dramatic" | "bold" | "cinematic"
 const FRAME_FILTERS = {
-  // High contrast + warm vignette — hero-in-peril drama feel
-  dramatic:  "eq=contrast=1.5:brightness=-0.05:saturation=1.1,unsharp=5:5:0.9:3:3:0.0,vignette=PI/4,scale=1280:-2",
-  // Max punch: very high contrast + vivid saturation — stop-scroll energy
-  bold:      "eq=contrast=1.7:brightness=0.05:saturation=1.9,unsharp=5:5:1.3:3:3:0.0,scale=1280:-2",
-  // Hollywood orange-teal + sharpening + vignette — cinematic depth
-  cinematic: "colorchannelmixer=rr=1.12:rb=-0.06:gr=-0.05:gg=0.94:bb=0.80:br=0.12,eq=contrast=1.4:saturation=1.05,unsharp=3:3:0.6,vignette=PI/5,scale=1280:-2",
+  // Real-movie-frame thumbnails, channel style: close/cropped, sharp face, punchy contrast.
+  dramatic:  "crop=iw*0.82:ih*0.82:(iw-iw*0.82)/2:(ih-ih*0.82)/2,scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,eq=contrast=1.65:brightness=-0.04:saturation=1.22:gamma=0.98,unsharp=7:7:1.4:5:5:0.5,vignette=PI/4,drawbox=x=0:y=0:w=iw:h=ih:color=black@0.40:t=8",
+  bold:      "crop=iw*0.78:ih*0.78:(iw-iw*0.78)/2:(ih-ih*0.78)/2,scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,eq=contrast=1.85:brightness=0.04:saturation=1.85:gamma=0.95,unsharp=7:7:1.7:5:5:0.7,vibrance=intensity=0.55,drawbox=x=0:y=0:w=iw:h=ih:color=black@0.45:t=10",
+  cinematic: "crop=iw*0.88:ih*0.88:(iw-iw*0.88)/2:(ih-ih*0.88)/2,scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,colorchannelmixer=rr=1.14:rb=-0.07:gr=-0.05:gg=0.94:bb=0.78:br=0.14,eq=contrast=1.50:saturation=1.18,unsharp=5:5:1.0,vignette=PI/5,drawbox=x=0:y=0:w=iw:h=ih:color=black@0.38:t=8",
 };
 
 // Find the timestamps of dramatic scene changes in a video using ffprobe.
@@ -760,9 +758,9 @@ function buildChannelDallEPrompt(style, { youtubeTitle, storySummary, movieTitle
   );
 }
 
-/* ---------- POST /jobs/:jobId/ai-thumbnails: channel-style DALL-E primary -- */
-// Primary: DALL-E gpt-image-1 with story-aware prompts (hero-in-trouble channel style).
-// Fallback: real movie frames from the rendered recap video (scene-detection timing).
+/* ---------- POST /jobs/:jobId/ai-thumbnails: real-frame channel thumbnails -- */
+// Primary: enhanced real frames from the rendered recap video (actual movie character faces).
+// Fallback: DALL-E only if real-frame extraction fails.
 app.post("/jobs/:jobId/ai-thumbnails", requireAuth, async (req, res) => {
   const job = await jobStore.get(req.params.jobId);
   if (!job) return res.status(404).json({ error: "Not found" });
@@ -789,73 +787,72 @@ app.post("/jobs/:jobId/ai-thumbnails", requireAuth, async (req, res) => {
     }
   }
 
-  // ── PRIMARY: DALL-E with channel-style story-aware prompts ────────────────
-  if (SERVER_OPENAI_KEY) {
+  // ── PRIMARY: enhanced real movie frames from rendered recap ────────────────
+  const outputVideo = job.outputPath || path.join(OUTPUT_DIR, `recap-${req.params.jobId}.mp4`);
+  let videoOk = false;
+  try { await fs.stat(outputVideo); videoOk = true; } catch {}
+
+  if (videoOk) {
+    const duration = await new Promise((resolve) => {
+      let out = "";
+      const fp = spawn("ffprobe", [
+        "-v", "error", "-show_entries", "format=duration",
+        "-of", "default=nw=1:nk=1", outputVideo,
+      ], { stdio: ["ignore", "pipe", "ignore"] });
+      fp.stdout.on("data", (c) => { out += c; });
+      fp.on("close", () => resolve(parseFloat(out.trim()) || 60));
+      fp.on("error", () => resolve(60));
+    });
+
+    const sceneTs = await findSceneChangeTimestamps(outputVideo, duration);
+    const TARGET_REGIONS = {
+      dramatic:  { lo: 0.45, hi: 0.78, fallback: 0.62 },
+      bold:      { lo: 0.18, hi: 0.58, fallback: 0.42 },
+      cinematic: { lo: 0.55, hi: 0.90, fallback: 0.72 },
+    };
+    const pickTimestamp = (style) => {
+      const { lo, hi, fallback } = TARGET_REGIONS[style];
+      const inRegion = sceneTs.filter((t) => t >= duration * lo && t <= duration * hi);
+      if (inRegion.length > 0) {
+        const center = duration * ((lo + hi) / 2);
+        return inRegion.reduce((a, b) => Math.abs(b - center) < Math.abs(a - center) ? b : a);
+      }
+      return Math.max(1, Math.min(duration * fallback, duration - 1));
+    };
     await Promise.allSettled(
       VARIANTS.map(async (style) => {
         try {
-          const prompt = buildChannelDallEPrompt(style, storyData);
+          const timeSec = pickTimestamp(style);
           const dest = aiThumbPath(req.params.jobId, style);
-          console.log(`[ai-thumbnails ${req.params.jobId}] DALL-E ${style} prompt: ${prompt.slice(0, 120)}…`);
-          await generateDalleThumbnail(SERVER_OPENAI_KEY, prompt, dest);
+          await extractStyledFrame(outputVideo, timeSec, dest, style);
           results[style] = `/jobs/${req.params.jobId}/ai-thumbnails/${style}`;
-          console.log(`[ai-thumbnails ${req.params.jobId}] DALL-E ${style} OK`);
+          console.log(`[ai-thumbnails ${req.params.jobId}] real-frame ${style} @ ${timeSec.toFixed(1)}s OK`);
         } catch (e) {
           errors[style] = String(e?.message || e);
-          console.warn(`[ai-thumbnails ${req.params.jobId}] DALL-E ${style} failed:`, e?.message || e);
+          console.warn(`[ai-thumbnails ${req.params.jobId}] real-frame ${style} failed:`, e?.message || e);
         }
       })
     );
   }
 
-  // ── FALLBACK: real movie frames when DALL-E fails / no key ────────────────
-  const missingStyles = VARIANTS.filter((s) => !results[s]);
-  if (missingStyles.length > 0) {
-    const outputVideo = job.outputPath || path.join(OUTPUT_DIR, `recap-${req.params.jobId}.mp4`);
-    let videoOk = false;
-    try { await fs.stat(outputVideo); videoOk = true; } catch {}
-
-    if (videoOk) {
-      const duration = await new Promise((resolve) => {
-        let out = "";
-        const fp = spawn("ffprobe", [
-          "-v", "error", "-show_entries", "format=duration",
-          "-of", "default=nw=1:nk=1", outputVideo,
-        ], { stdio: ["ignore", "pipe", "ignore"] });
-        fp.stdout.on("data", (c) => { out += c; });
-        fp.on("close", () => resolve(parseFloat(out.trim()) || 60));
-        fp.on("error", () => resolve(60));
-      });
-
-      const sceneTs = await findSceneChangeTimestamps(outputVideo, duration);
-      const TARGET_REGIONS = {
-        dramatic:  { lo: 0.55, hi: 0.80, fallback: 0.68 },
-        bold:      { lo: 0.35, hi: 0.55, fallback: 0.45 },
-        cinematic: { lo: 0.15, hi: 0.35, fallback: 0.25 },
-      };
-      const pickTimestamp = (style) => {
-        const { lo, hi, fallback } = TARGET_REGIONS[style];
-        const inRegion = sceneTs.filter((t) => t >= duration * lo && t <= duration * hi);
-        if (inRegion.length > 0) {
-          const center = duration * ((lo + hi) / 2);
-          return inRegion.reduce((a, b) => Math.abs(b - center) < Math.abs(a - center) ? b : a);
+  // ── FALLBACK: DALL-E only for styles where real frame extraction failed ───
+  const missingStyles = VARIANTS.filter((style) => !results[style]);
+  if (missingStyles.length > 0 && SERVER_OPENAI_KEY) {
+    await Promise.allSettled(
+      missingStyles.map(async (style) => {
+        try {
+          const prompt = buildChannelDallEPrompt(style, storyData);
+          const dest = aiThumbPath(req.params.jobId, style);
+          console.log(`[ai-thumbnails ${req.params.jobId}] DALL-E fallback ${style} prompt: ${prompt.slice(0, 120)}…`);
+          await generateDalleThumbnail(SERVER_OPENAI_KEY, prompt, dest);
+          results[style] = `/jobs/${req.params.jobId}/ai-thumbnails/${style}`;
+          console.log(`[ai-thumbnails ${req.params.jobId}] DALL-E fallback ${style} OK`);
+        } catch (e) {
+          errors[style] = (errors[style] ? errors[style] + " | " : "") + String(e?.message || e);
+          console.warn(`[ai-thumbnails ${req.params.jobId}] DALL-E fallback ${style} failed:`, e?.message || e);
         }
-        return Math.max(1, Math.min(duration * fallback, duration - 1));
-      };
-      await Promise.allSettled(
-        missingStyles.map(async (style) => {
-          try {
-            const timeSec = pickTimestamp(style);
-            const dest = aiThumbPath(req.params.jobId, style);
-            await extractStyledFrame(outputVideo, timeSec, dest, style);
-            results[style] = `/jobs/${req.params.jobId}/ai-thumbnails/${style}`;
-            console.log(`[ai-thumbnails ${req.params.jobId}] frame-fallback ${style} @ ${timeSec.toFixed(1)}s OK`);
-          } catch (e) {
-            errors[style] = (errors[style] ? errors[style] + " | " : "") + String(e?.message || e);
-          }
-        })
-      );
-    }
+      })
+    );
   }
 
   if (Object.keys(results).length === 0) {

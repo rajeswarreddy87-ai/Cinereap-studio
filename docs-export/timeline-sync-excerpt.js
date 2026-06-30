@@ -1,6 +1,3 @@
-          if (srcDurAudio > 0) {
-            const ct = Math.min(srcDurAudio * 0.08, Math.max(90, srcDurAudio * 0.035));
-            safeCeilingAudio = Math.max(srcDurAudio * 0.5, srcDurAudio - ct);
           }
           const audioScenes = timestamps.map((t) => ({
             startSec: Number(t.startSec),
@@ -719,3 +716,6 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
           for (let i = 0; i < maxVerify; i++) {
             const cands = _dedupeCandidates([
               { ...originalBeatScenes[i], label: "analyze" },
+              siglipCandidateScenes[i] ? { ...siglipCandidateScenes[i], label: "siglip" } : null,
+              scenes[i] ? { ...scenes[i], label: scenes[i].reason?.includes('[siglip:') ? "siglip-current" : "current" } : null,
+              transcriptCandidateScenes[i] ? { ...transcriptCandidateScenes[i], label: "whisper" } : null,

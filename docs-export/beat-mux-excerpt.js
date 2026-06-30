@@ -1,6 +1,3 @@
-          }
-        }
-
         // Emergency fallback: hookSceneIds lookup produced nothing.
         // Use the first 5 story beats (past the credits region) as hook footage.
         // These are guaranteed real story content in chronological order.
@@ -209,3 +206,6 @@
   const _muxVideoWithVoice = (videoPath, voicePath, outPath, padSec = 0.25) => new Promise((res) => {
     // Video gets tpad=0.6s clone frames so there is always a visual tail after narration.
     // Audio is mapped directly (no apad filter) — apad+filter_complex+shortest caused
+    // audio corruption (stammering, silent beats) on this FFmpeg build.
+    //
+    // -shortest stops at whichever stream ends first:

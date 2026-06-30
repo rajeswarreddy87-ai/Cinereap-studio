@@ -1,4 +1,4 @@
-# CineRecap VPS Pipeline — Code Reference (v2.8.5)
+# CineRecap VPS Pipeline — Code Reference (v2.8.6)
 
 **Server path:** `/root/cinerecap-render-server/`  
 **Live URL:** `http://109.123.241.130:4040`  
@@ -30,6 +30,7 @@ Your Android app already follows this correctly (confirmed in `api.ts` + `index.
 | **Hook generation** | `src/index.js` | `docs-export/hook-generation-excerpt.js` | HOOK-V2 Claude prompt + `sourceBeatIds` |
 | **Timeline sync block** | `src/index.js` | `docs-export/timeline-sync-excerpt.js` | Whisper align, sync score, subdivide |
 | **Gemini verifier** | `src/index.js` | `docs-export/gemini-verifier-excerpt.js` | Whisper/OpenCLIP/Gemini candidate verification |
+| **Thumbnails** | `src/index.js` | `docs-export/thumbnail-excerpt.js` | Real-frame-first thumbnail generation |
 | **Render API** | `src/index.js` | `docs-export/render-route-excerpt.js` | `POST /render-from-ingest` |
 | **FFmpeg helpers** | `src/ffmpeg-args.js` | `docs-export/ffmpeg-args.js` | `buildTrimArgs()`, `buildRenderArgs()`, `setpts` slow-mo |
 | **Music ducking** | `src/music.js` + index.js | `docs-export/music.js` | Mood beds, sidechain compress |
@@ -110,7 +111,7 @@ Server reports **0.3–0.6s timing drift** — not 5–10s.
 4. **Music** — default bed `-26dB` (was `-18`), stronger ducking `ratio=12`
 5. **v2.7.1 fixes retained** — analyzeJobId auto-resolve, per-beat TTS, video speed-up in mux
 
-Verify: `GET /health` → `"version": "2.8.5"`
+Verify: `GET /health` → `"version": "2.8.6"`
 
 ---
 
@@ -443,3 +444,30 @@ Fix:
 - Verified YouTube routes and hook routes remain present.
 
 `GET /health` now reports `version: 2.8.5`.
+
+
+## v2.8.6 real-frame-first thumbnails
+
+User requested thumbnails from actual movie frames, not generic AI images.
+
+Fixes:
+
+- `/jobs/:jobId/ai-thumbnails` now uses enhanced real frames from the rendered recap as primary source.
+- DALL-E is fallback-only if real-frame extraction fails for a style.
+- Frame styling upgraded for clickable channel-style thumbnails:
+  - close crop / zoom
+  - 1280x720 upscale/crop
+  - stronger contrast/saturation/sharpening
+  - cinematic color grade
+  - vignette/border
+- Styles still supported: `dramatic`, `bold`, `cinematic`.
+
+Logs should now show:
+
+```text
+[ai-thumbnails <job>] real-frame dramatic @ ...s OK
+```
+
+instead of DALL-E-first generation.
+
+`GET /health` now reports `version: 2.8.6`.
