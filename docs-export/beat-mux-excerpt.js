@@ -1,3 +1,151 @@
+          }
+        }
+
+        // Emergency fallback: hookSceneIds lookup produced nothing.
+        // Use the first 5 story beats (past the credits region) as hook footage.
+        // These are guaranteed real story content in chronological order.
+        if (_hookSubClips.length === 0 && Array.isArray(_preTrimBeats || beats)) {
+          const _emergencySource = _preTrimBeats || beats;
+          const _emergencyBeats  = _emergencySource
+            .filter(b => Number(b.startSec) > 90 && Number(b.startSec) < _hCeil - 30)
+            .slice(0, 8);
+          for (let _ei = 0; _ei < _emergencyBeats.length && _hookSubClips.length < 5; _ei++) {
+            const eb       = _emergencyBeats[_ei];
+            const mid      = (Number(eb.startSec) + Number(eb.endSec)) / 2;
+            const clipLen  = 5;
+            const subStart = Math.max(30, mid - clipLen / 2);
+            const subEnd   = subStart + clipLen;
+            const subPath  = path.join(UPLOADS_DIR, `hook-sub-${jobId}-e${_ei}.mp4`);
+            const subArgs  = buildTrimArgs({ inputPath: sourcePath, startSec: subStart, endSec: subEnd, outputPath: subPath, reencode: true });
+            await new Promise((res) => {
+              const ff = spawn("ffmpeg", subArgs, { stdio: "ignore" });
+              const t  = setTimeout(() => { try { ff.kill("SIGKILL"); } catch {} res(); }, 60_000);
+              ff.on("close", (code) => { clearTimeout(t); if (code === 0) _hookSubClips.push(subPath); res(); });
+              ff.on("error", () => { clearTimeout(t); res(); });
+            });
+          }
+          if (_hookSubClips.length > 0) {
+            console.log(`[render ${jobId}] HOOK: emergency beat-clips: ${_hookSubClips.length} sub-clips from first story beats`);
+          }
+        }
+
+        // Last resort: single clip from most dramatic moment in first 35%.
+        // Clip duration matches the final hook TTS duration (after atempo speedup)
+        // so the hook video and audio are perfectly aligned with no drift into body.
+        if (_hookSubClips.length === 0) {
+          // Default to 15% into movie (past credits, before climax)
+          let _hDramaSec = Math.min(_hSrcDur * 0.15, _hCeil - 38);
+          if (Array.isArray(beats) && beats.length > 2) {
+            // Pick highest-importance beat that falls within the first 35% ceiling
+            const earlyBeats = beats.filter(b => {
+              const tc = (Number(b.startSec) + Number(b.endSec)) / 2;
+              return tc > 120 && tc < _hCeil - 38;
+            });
+            if (earlyBeats.length > 0) {
+              const top = earlyBeats.reduce((a, b) => (+(b.importance || 0) > +(a.importance || 0)) ? b : a, earlyBeats[0]);
+              const tc  = (Number(top.startSec) + Number(top.endSec)) / 2;
+              if (tc > 120 && tc < _hCeil - 38) _hDramaSec = tc;
+            }
+          }
+          // Use the actual TTS duration (post-atempo) so the clip matches the audio exactly
+          const _hClipDur = _hookFinalDurSec > 5 ? _hookFinalDurSec + 1 : 30;
+          const _hStart  = Math.max(120, Math.min(_hDramaSec - _hClipDur / 2, _hCeil - _hClipDur - 5));
+          const fallPath = path.join(UPLOADS_DIR, `hook-sub-${jobId}-0.mp4`);
+          const fallArgs = buildTrimArgs({ inputPath: sourcePath, startSec: _hStart, endSec: _hStart + _hClipDur, outputPath: fallPath, reencode: true });
+          await new Promise((res) => {
+            const ff = spawn("ffmpeg", fallArgs, { stdio: "ignore" });
+            const t  = setTimeout(() => { try { ff.kill("SIGKILL"); } catch {} res(); }, 60_000);
+            ff.on("close", (code) => { clearTimeout(t); if (code === 0) _hookSubClips.push(fallPath); res(); });
+            ff.on("error", () => { clearTimeout(t); res(); });
+          });
+          if (_hookSubClips.length > 0) {
+            console.log(`[render ${jobId}] HOOK: last-resort single 32 s clip (drama@${Math.round(_hDramaSec)}s)`);
+          }
+        }
+
+        if (_hookSubClips.length === 1) {
+          clipPaths.unshift(_hookSubClips[0]);
+          voiceoverFileIds.unshift(_hookTtsId);
+          console.log(`[render ${jobId}] HOOK: single sub-clip prepended + TTS ${_hookTtsId}`);
+        } else if (_hookSubClips.length > 1) {
+          // Merge sub-clips into one hook track then prepend
+          const _hManifest = path.join(UPLOADS_DIR, `hook-manifest-${jobId}.txt`);
+          await fs.writeFile(_hManifest, _hookSubClips.map((p) => `file '${p}'`).join("\n"), "utf8");
+          await new Promise((res) => {
+            const ff = spawn("ffmpeg", [
+              "-f", "concat", "-safe", "0", "-i", _hManifest,
+              "-c:v", "libx264", "-preset", "fast", "-crf", "23", "-an", "-y", _hookMergedPath,
+            ], { stdio: "ignore" });
+            const t = setTimeout(() => { try { ff.kill("SIGKILL"); } catch {} res(); }, 90_000);
+            ff.on("close", (code) => {
+              clearTimeout(t);
+              if (code === 0) {
+                clipPaths.unshift(_hookMergedPath);
+                voiceoverFileIds.unshift(_hookTtsId);
+                console.log(`[render ${jobId}] HOOK: ${_hookSubClips.length} sub-clips merged + prepended + TTS ${_hookTtsId}`);
+              } else {
+                console.warn(`[render ${jobId}] hook merge failed (code ${code}) — skipping hook`);
+              }
+              res();
+            });
+            ff.on("error", (e) => { clearTimeout(t); console.warn(`[render ${jobId}] hook merge error:`, e?.message || e); res(); });
+          });
+          for (const sc of _hookSubClips) { try { await fs.unlink(sc); } catch {} }
+          try { await fs.unlink(_hManifest); } catch {}
+        }
+      } catch (hClipErr) {
+        console.warn(`[render ${jobId}] hook clip failed (non-fatal):`, hClipErr?.message || hClipErr);
+      }
+    } // end if (_hSrcDur > 40)
+  }
+  // ── END HOOK FOOTAGE CLIP ─────────────────────────────────────────────────
+
+  // ── OUTRO SEGMENT — DISABLED ─────────────────────────────────────────────
+  // Outro removed. Video ends cleanly after last body beat.
+  if (false) try {
+    const _outroText = (typeof settings?.outroText === "string" && settings.outroText.trim())
+      ? settings.outroText.trim()
+      : "That's the complete story. If you enjoyed this breakdown, hit like and subscribe for more movie recaps every week.";
+    if (_hookTtsKey) {
+      const _outroTtsSpeed = (settings && settings.ttsSpeed) || 1.0;
+      const _outroTtsId    = `${jobId}-outro-tts-beat-000.mp3`;
+      const _outroTtsPath  = path.join(UPLOADS_DIR, _outroTtsId);
+      let _outroDurSec     = 0;
+      let _outroTtsOk      = false;
+
+      // Attempt 1: primary TTS provider (same as story beats)
+      try {
+        await _ttsOnce(_hookTtsProvider, _hookTtsKey, _hookTtsVoice, _outroTtsSpeed, _outroText, _outroTtsPath);
+        _outroDurSec = await probeDurationSec(_outroTtsPath);
+        if (_outroDurSec > 0.1) { _outroTtsOk = true; }
+      } catch (e1) {
+        console.warn(`[render ${jobId}] OUTRO TTS: primary provider failed — ${e1?.message || e1}`);
+      }
+
+      // Attempt 2: OpenAI fallback (reliable, always available)
+      if (!_outroTtsOk && SERVER_OPENAI_KEY) {
+        try {
+          await new Promise(r => setTimeout(r, 2000)); // brief pause before fallback
+          await _ttsOnce("openai", SERVER_OPENAI_KEY, "onyx", 1.0, _outroText, _outroTtsPath);
+          _outroDurSec = await probeDurationSec(_outroTtsPath);
+          if (_outroDurSec > 0.1) { _outroTtsOk = true; console.log(`[render ${jobId}] OUTRO TTS: used OpenAI fallback`); }
+        } catch (e2) {
+          console.warn(`[render ${jobId}] OUTRO TTS: OpenAI fallback also failed — ${e2?.message || e2}`);
+        }
+      }
+
+      if (!_outroTtsOk) {
+        console.warn(`[render ${jobId}] OUTRO TTS: all providers failed — outro skipped`);
+      }
+
+      if (_outroTtsOk) {
+        console.log(`[render ${jobId}] OUTRO TTS: ${_outroDurSec.toFixed(1)}s — id=${_outroTtsId}`);
+        // Use footage from 55% into the film — avoids the climax/ending region
+        // that story beats already cover (last 30%), preventing the same footage
+        // appearing in the outro that viewers just watched in beats 70-80.
+        let _oSrcDur = 0;
+        try { _oSrcDur = await probeDurationSec(sourcePath); } catch {}
+        if (_oSrcDur > 60) {
           const _oStart    = Math.max(30, _oSrcDur * 0.55);
           const _oEnd      = Math.min(_oSrcDur - 3, _oStart + Math.max(_outroDurSec + 3, 15));
           const _oClipPath = path.join(UPLOADS_DIR, `outro-clip-${jobId}.mp4`);
@@ -58,154 +206,6 @@
   // Helper: mux a video file with a voice TTS file (no audio seek needed — full beat voice)
   // padSec is dynamic — callers pass the probed TTS-video gap so the pad is exactly what's
   // needed, avoiding 2s of frozen-frame clone on beats where TTS fits the footage tightly.
-  const _muxVideoWithVoice = async (videoPath, voicePath, outPath, padSec = 0.25) => {
-    let vDur = 0, aDur = 0;
-    try { vDur = await probeDurationSec(videoPath); } catch {}
-    try { aDur = await probeDurationSec(voicePath); } catch {}
-    // Audio is master. For mild mismatches, retime the video with setpts so the
-    // visual action spans the narration instead of drifting into the next beat.
-    //   ratio < 1.0 => video is shorter than narration -> slow video down
-    //   ratio > 1.0 => video is longer than narration  -> speed video up
-    // Keep retiming conservative; bigger mismatches are handled by gap-fill or tail pad.
-    const retimeMin = Number(process.env.VIDEO_RETIME_MIN || 0.82);
-    const retimeMax = Number(process.env.VIDEO_RETIME_MAX || 1.18);
-    let speed = 1.0;
-    let retime = false;
-    if (vDur > 0.5 && aDur > 0.5) {
-      const ratio = vDur / aDur;
-      if (ratio >= retimeMin && ratio <= retimeMax && Math.abs(ratio - 1) > 0.015) {
-        speed = ratio;
-        retime = true;
-      }
-    }
-    const videoChain = retime
-      ? `setpts=PTS/${speed.toFixed(5)},tpad=stop_mode=clone:stop_duration=${padSec.toFixed(3)}`
-      : `tpad=stop_mode=clone:stop_duration=${((vDur > 0 && aDur > 0) ? Math.max(padSec, aDur - vDur + 0.75) : padSec).toFixed(3)}`;
-    if (retime) {
-      console.log(`[render ${jobId}] BEAT-RETIME: ${path.basename(outPath)} video=${vDur.toFixed(2)}s audio=${aDur.toFixed(2)}s speed=${speed.toFixed(3)}x`);
-    }
-    return new Promise((res) => {
-      const ff = spawn("ffmpeg", [
-        "-y", "-hide_banner", "-loglevel", "warning",
-        "-i", videoPath,
-        "-i", voicePath,
-        "-filter_complex",
-          `[0:v]${videoChain}[vpad]`,
-        "-map", "[vpad]", "-map", "1:a",
-        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
-        "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
-        "-shortest",
-        ...(aDur > 0 ? ["-t", aDur.toFixed(3)] : []),
-        outPath,
-      ], { stdio: "ignore" });
-      const t = setTimeout(() => { try { ff.kill("SIGKILL"); } catch {} res(false); }, 180_000);
-      ff.on("close", (code) => { clearTimeout(t); res(code === 0); });
-      ff.on("error", () => { clearTimeout(t); res(false); });
-    });
-  };
-
-  // Helper: concat multiple video-only clips into one using filter_complex (robust to VFR)
-  const _concatVideoClips = (clips, outPath) => new Promise((res) => {
-    const _inputs  = clips.flatMap((p) => ["-i", p]);
-    const _filter  = clips.map((_, k) => `[${k}:v]`).join("") +
-                     `concat=n=${clips.length}:v=1:a=0[vout]`;
-    const ff = spawn("ffmpeg", [
-      "-y", "-hide_banner", "-loglevel", "warning",
-      ..._inputs,
-      "-filter_complex", _filter,
-      "-map", "[vout]",
-      "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23", "-an",
-      outPath,
-    ], { stdio: "ignore" });
-    const t = setTimeout(() => { try { ff.kill("SIGKILL"); } catch {} res(false); }, 120_000);
-    ff.on("close", (code) => { clearTimeout(t); res(code === 0); });
-    ff.on("error", () => { clearTimeout(t); res(false); });
-  });
-
-  await jobStore.update(jobId, { progress: 45, message: "Assembling beat videos" });
-  const _muxedPaths = [];
-
-  // ── PHASE A: BUILD BEAT VIDEOS ───────────────────────────────────────────────
-  // Concat each beat's sub-clips into a single video-only file.
-  // Audio is master: TTS duration drives all footage timing decisions.
-  const _beatVideoStore = new Map(); // bi → assembled video path (no audio)
-
-  for (const _bi of _beatOrder) {
-    const _beatClips = _beatGroupMap.get(_bi) || [];
-    if (_beatClips.length === 0) continue;
-    let _beatVidPath;
-    if (_beatClips.length === 1) {
-      _beatVidPath = _beatClips[0];
-    } else {
-      _beatVidPath = path.join(UPLOADS_DIR, `beat-concat-${jobId}-${String(_bi).padStart(3, "0")}.mp4`);
-      const concatOk = await _concatVideoClips(_beatClips, _beatVidPath);
-      if (!concatOk) {
-        console.warn(`[render ${jobId}] beat-concat ${_bi} failed — using first sub-clip`);
-        _beatVidPath = _beatClips[0];
-      }
-    }
-    _beatVideoStore.set(_bi, _beatVidPath);
-  }
-  console.log(`[render ${jobId}] PHASE-A: ${_beatVideoStore.size} beat videos assembled`);
-
-  // ── PHASE B: GAP-FILL + VOICE MUX ────────────────────────────────────────────
-  // Audio is master. TTS (per-beat, measured from generated audio) drives footage timing.
-  // • TTS > video → gap-fill: borrow adjacent scene footage from source.
-  // • Video > TTS → -shortest trims to audio end; 0.3s visual tail (lead-out).
-  // • Sync validation per beat: drift ≤0.30s PASS / ≤0.75s WARN / >0.75s FIX.
-  await jobStore.update(jobId, { progress: 60, message: "Muxing beats" });
-  let _beatMuxDone = 0;
-  let _syncPass = 0, _syncWarn = 0, _syncFix = 0;
-  for (const _bi of _beatOrder) {
-    const _beatRawVidPath = _beatVideoStore.get(_bi);
-    if (!_beatRawVidPath) {
-      const _beatClips = _beatGroupMap.get(_bi) || [];
-      _muxedPaths.push(..._beatClips);
-      _beatMuxDone++;
-      continue;
-    }
-
-    // TTS: always from original per-beat voice generated during PER-BEAT TTS step
-    const _voId    = voiceoverFileIds[_bi] || null;
-    const _voPath  = _voId ? path.join(UPLOADS_DIR, _voId) : null;
-
-    if (!_voPath) {
-      console.warn(`[render ${jobId}] beat ${_bi} missing voice file — skipping silent segment`);
-      _beatMuxDone++;
-      continue;
-    }
-    let _hasVoice = false;
-    try { await fs.access(_voPath); _hasVoice = true; } catch {}
-    if (!_hasVoice) {
-      console.warn(`[render ${jobId}] beat ${_bi} voice file not found (${_voId}) — skipping silent segment`);
-      _beatMuxDone++;
-      continue;
-    }
-
-    let _beatVideoPath = _beatRawVidPath;
-
-    // ── AUDIO-MASTER SYNC ─────────────────────────────────────────────────────
-    // Spec: TTS is the master timeline. Video always adapts — never reverse.
-    // CASE 1 (video < TTS content): gap-fill via Steps 1→4.
-    // CASE 2 (video > TTS content): _muxVideoWithVoice -shortest trims at audio end.
-    const _muxPadSec = 0.25;  // spec: 0.2–0.3s visual tail
-    {
-      const _vidDur = await probeDurationSec(_beatVideoPath).catch(() => 0);
-
-      // Use NARRATION CONTENT duration, not full MP3 file duration.
-      // Speechify MP3 files contain 0.7–2.6s of trailing silence after the last
-      // spoken word. probeDurationSec(_voPath) returns the full file length, which
-      // caused gap-fill to fire on every beat trying to match silence that the mux
-      // discards anyway. Use whisperBeatDurations (content-only, from Whisper word
-      // alignment) or _perBeatTtsDurations (measured during generation) instead.
-      const _tsDurArr = Array.isArray(whisperBeatDurations) ? whisperBeatDurations
-                      : Array.isArray(_perBeatTtsDurations) ? _perBeatTtsDurations
-                      : null;
-      const _contentDur = (_tsDurArr && Number(_tsDurArr[_bi]) > 0.05)
-        ? Number(_tsDurArr[_bi])
-        : await probeDurationSec(_voPath).catch(() => 0);
-      const _fileDur = await probeDurationSec(_voPath).catch(() => _contentDur);
-      const _isTailBeat = _beatOrder.indexOf(_bi) >= Math.max(0, _beatOrder.length - 3);
-      const _voiDur = _isTailBeat ? Math.max(_contentDur, _fileDur) : _contentDur;
-
-      const _gap    = _voiDur - _vidDur;  // +ve = video short, -ve = video long
+  const _muxVideoWithVoice = (videoPath, voicePath, outPath, padSec = 0.25) => new Promise((res) => {
+    // Video gets tpad=0.6s clone frames so there is always a visual tail after narration.
+    // Audio is mapped directly (no apad filter) — apad+filter_complex+shortest caused

@@ -655,7 +655,7 @@ export function buildSceneNotesMessages({ movie, scenes, segments, isFirstBatch 
   }
   const cast = movie.cast
     ? ` Film characters (use these names in beat notes — NOT actors' real names): ${movie.cast}.`
-    : ` No cast list provided — use your knowledge of "${movie.title}"${movie.year ? ` (${movie.year})` : ""} to label characters by their FICTIONAL CHARACTER NAMES in beat notes.`;
+    : ` No cast list provided — label characters ONLY when the transcript, extracted character list, on-screen text, or unmistakable dialogue supports the name. Never use actor real names. If uncertain, use neutral labels such as "the trainer", "the manager", "the daughter", "one of the men", or "the officer" in beat notes.`;
   content.push({
     type: "text",
     text:

@@ -1,63 +1,6 @@
 
-
-const PROTECTED_SCENE_RE = /funeral|cemetery|grave|burial|mourn|casket|headstone|dies|death|killed|murder|shoots|shot|blood|betray|twist|climax|final round|knockout|hospital|crash/i;
-function isProtectedBeatForVisual(b) {
-  const t = `${b?.narration || ""} ${b?.reason || ""}`;
-  return PROTECTED_SCENE_RE.test(t);
-}
-function _tokSet(s) {
-  return new Set(String(s || "").toLowerCase().replace(/[^a-z0-9\s]/g, " ").split(/\s+/).filter(w => w.length > 2));
-}
-function _jaccard(a, b) {
-  if (!a.size || !b.size) return 0;
-  let inter = 0;
-  for (const x of a) if (b.has(x)) inter++;
-  return inter / (a.size + b.size - inter);
-}
-function findTranscriptCandidateForBeat(narration, transcriptSegments, sourceDurationSec = 0) {
-  if (!Array.isArray(transcriptSegments) || transcriptSegments.length === 0) return null;
-  const q = _tokSet(narration);
-  if (!q.size) return null;
-  let best = null;
-  for (let i = 0; i < transcriptSegments.length; i++) {
-    const st = Number(transcriptSegments[i].start ?? transcriptSegments[i].startSec ?? 0);
-    let end = st;
-    let text = "";
-    for (let j = i; j < transcriptSegments.length; j++) {
-      const sj = transcriptSegments[j];
-      const sjEnd = Number(sj.end ?? sj.endSec ?? st);
-      if (sjEnd - st > 18) break;
-      text += " " + String(sj.text || "");
-      end = Math.max(end, sjEnd);
-    }
-    const score = _jaccard(q, _tokSet(text));
-    if (!best || score > best.score) best = { startSec: st, endSec: Math.max(end, st + 6), score, label: "whisper" };
-  }
-  if (!best || best.score < 0.09) return null;
-  const dur = Math.min(14, Math.max(6, best.endSec - best.startSec + 4));
-  const mid = (best.startSec + best.endSec) / 2;
-  return {
-    label: "whisper",
-    startSec: Math.max(0, mid - dur / 2),
-    endSec: sourceDurationSec > 0 ? Math.min(sourceDurationSec, mid + dur / 2) : mid + dur / 2,
-    score: best.score,
-  };
-}
-function _dedupeCandidates(cands) {
-  const out = [];
-  for (const c of cands) {
-    if (!c || !(Number(c.endSec) > Number(c.startSec) + 0.5)) continue;
-    const mid = (Number(c.startSec) + Number(c.endSec)) / 2;
-    if (out.some(o => Math.abs(((o.startSec + o.endSec) / 2) - mid) < 2.0)) continue;
-    out.push({ ...c, startSec: Number(c.startSec), endSec: Number(c.endSec) });
-  }
-  return out.slice(0, 5);
-}
-async function _extractVerifierClip(sourcePath, cand, outPath) {
-  const mid = (Number(cand.startSec) + Number(cand.endSec)) / 2;
-  const len = Math.min(8, Math.max(4, Number(cand.endSec) - Number(cand.startSec)));
-  const startSec = Math.max(0, mid - len / 2);
-  const endSec = startSec + len;
+/* ---------- Gemini beat-verifier helpers --------------------------------- */
+async function _extractVerifierClip(sourcePath, { startSec, endSec }, outPath) {
   return new Promise((resolve) => {
     const ff = spawn("ffmpeg", [
       "-y", "-hide_banner", "-loglevel", "error",
@@ -106,17 +49,11 @@ async function verifyBeatCandidatesWithGemini({ jobId, beatIndex, narration, sou
       }),
       signal: AbortSignal.timeout(60_000),
     });
-    if (!resp.ok) {
-      console.warn(`[render ${jobId}] GEMINI beat ${beatIndex}: HTTP ${resp.status}`);
-      return null;
-    }
+    if (!resp.ok) { console.warn(`[render ${jobId}] GEMINI beat ${beatIndex}: HTTP ${resp.status}`); return null; }
     const data = await resp.json();
     const txt = data?.candidates?.[0]?.content?.parts?.map(p => p.text || "").join("\n") || "";
     const m = txt.match(/\{[\s\S]*\}/);
-    if (!m) {
-      console.warn(`[render ${jobId}] GEMINI beat ${beatIndex}: no JSON in response: ${txt.slice(0, 120)}`);
-      return null;
-    }
+    if (!m) { console.warn(`[render ${jobId}] GEMINI beat ${beatIndex}: no JSON in response: ${txt.slice(0, 120)}`); return null; }
     const parsed = JSON.parse(m[0]);
     const best = Number(parsed.best) - 1;
     const conf = Number(parsed.confidence) || 0;
@@ -143,7 +80,7 @@ app.get("/health", (_req, res) => {
 
   res.json({
     ok: true,
-    version: "2.8.4",
+    version: "2.8.5",
     serverTranscription: Boolean(SERVER_OPENAI_KEY),
     serverAnalysis: Boolean(SERVER_ANTHROPIC_KEY),
     serverModel: SERVER_ANTHROPIC_MODEL || null,
@@ -177,10 +114,73 @@ app.get("/health", (_req, res) => {
       "translate-transcript", // new in 2.5.0 — Whisper translation endpoint for non-English films
       "uncapped-narration", // new in 2.5.0 — full-length narration, no word-count ceiling
       "clip-select",        // new in 2.6.0 — CLIP semantic frame matching for clip selection
-      "gemini-verify",     // new in 2.7.4 — Gemini Flash verifies top candidate clips when GEMINI_API_KEY is set
+      "gemini-verify",      // new in 2.7.4 — Gemini Flash verifies top candidate clips when GEMINI_API_KEY is set
       "multi-tts",          // new in 2.7.0 — ttsProvider field selects speechify|openai|elevenlabs|hume
       "storage-api",        // new in 2.7.0 — GET /system/storage, DELETE /system/clear-renders
       "source-download",    // new in 2.7.0 — GET /uploads/:fileId/download
     ],
   });
 });
+
+/* ---------- /claude-models: proxy Anthropic model list with caller's key ---------- */
+// Returns the same shape as GET https://api.anthropic.com/v1/models so the app
+// can show a model picker without the user copy-pasting model IDs.
+app.get("/claude-models", requireAuth, async (req, res) => {
+  const apiKey = req.headers["x-anthropic-key"] || req.query.anthropicApiKey;
+  if (!apiKey) return res.status(400).json({ error: "Pass your Anthropic key via X-Anthropic-Key header or anthropicApiKey query param" });
+  try {
+    const upstream = await fetch("https://api.anthropic.com/v1/models?limit=100", {
+      headers: {
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+      },
+    });
+    const body = await upstream.json();
+    if (!upstream.ok) return res.status(upstream.status).json(body);
+    // Annotate each model with its max output tokens so the app can display
+    // useful info (e.g. "Opus 4 — 32k output tokens").
+    const { getModelMaxOutputTokens } = await import("./analyze.js");
+    const models = (body.data || []).map((m) => ({
+      ...m,
+      maxOutputTokens: getModelMaxOutputTokens(m.id),
+    }));
+    res.json({ models, total: models.length });
+  } catch (e) {
+    res.status(502).json({ error: String(e.message || e) });
+  }
+});
+
+/* ---------- /v1/images/generations: proxy DALL-E calls through server key ---------- */
+// Allows the app to generate thumbnails even without an on-device OpenAI key.
+// Mirrors the /transcribe pattern: uses caller key if provided, falls back to server key.
+app.post("/v1/images/generations", requireAuth, async (req, res) => {
+  let openaiApiKey = (req.body || {}).openaiApiKey || req.headers["authorization"]?.replace("Bearer ", "").trim();
+  if (!openaiApiKey && SERVER_OPENAI_KEY) openaiApiKey = SERVER_OPENAI_KEY;
+  if (!openaiApiKey) return res.status(400).json({ error: "openaiApiKey required (no server key configured)" });
+  // Strip our custom fields before forwarding
+  const { openaiApiKey: _k, ...forwardBody } = req.body || {};
+  try {
+    const upstream = await fetch("https://api.openai.com/v1/images/generations", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${openaiApiKey}` },
+      body: JSON.stringify(forwardBody),
+    });
+    const body = await upstream.json();
+    res.status(upstream.status).json(body);
+  } catch (e) {
+    res.status(502).json({ error: String(e.message || e) });
+  }
+});
+
+/* ---------- helpers for AI thumbnail storage ----------------------------- */
+const AI_THUMB_STYLES = ["dramatic", "bold", "cinematic"];
+function aiThumbPath(jobId, style) {
+  return path.join(OUTPUT_DIR, `thumb-${jobId}-${style}.jpg`);
+}
+
+// Extract a frame from a video at `timeSec` and apply a style-specific
+// cinematic colour grade.  Returns destPath on success, throws on failure.
+// styles: "dramatic" | "bold" | "cinematic"
+const FRAME_FILTERS = {
+  // High contrast + warm vignette — hero-in-peril drama feel
+  dramatic:  "eq=contrast=1.5:brightness=-0.05:saturation=1.1,unsharp=5:5:0.9:3:3:0.0,vignette=PI/4,scale=1280:-2",

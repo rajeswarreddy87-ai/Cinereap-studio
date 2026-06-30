@@ -1,3 +1,235 @@
+          if (srcDurAudio > 0) {
+            const ct = Math.min(srcDurAudio * 0.08, Math.max(90, srcDurAudio * 0.035));
+            safeCeilingAudio = Math.max(srcDurAudio * 0.5, srcDurAudio - ct);
+          }
+          const audioScenes = timestamps.map((t) => ({
+            startSec: Number(t.startSec),
+            endSec:   Number(t.endSec),
+            reason:   t.reason || '',
+          }));
+          const audioBeatDurations = timestamps.map((t) => Number(t.audioSeconds));
+          try {
+            const audioTimeline = buildSyncedTimeline(audioScenes, audioBeatDurations, {
+              sourceDurationSec: safeCeilingAudio || srcDurAudio || undefined,
+            });
+            if (audioTimeline.length > 0) {
+              timestamps = audioTimeline.filter(
+                (t) => Number.isFinite(t.startSec) && Number.isFinite(t.endSec) && t.endSec - t.startSec >= 0.1
+              );
+              console.log(`[render ${jobId}] audioSeconds sync: ${audioTimeline.length} segs from ${audioScenes.length} beats, total=${totalAudioSec.toFixed(1)}s`);
+            }
+          } catch (e) {
+            console.warn(`[render ${jobId}] audioSeconds sync failed, using redistributed timestamps:`, e?.message || e);
+          }
+        }
+      }
+    }
+  }
+
+  // ── AUTO-LOAD ANALYZE BEATS (scene-to-scene narration sync) ─────────────
+  // The app sends zero-origin timestamps ({startSec:0,endSec:0}) because it
+  // doesn't forward the scene windows from the analyze step to the render call.
+  // The analyze step already ran Claude and produced perfect per-beat data:
+  // real startSec/endSec windows + narration text for each scene.
+  // We look that up here and inject it as the beats array so the sync planner
+  // can align narration to actual movie scenes — no app change needed.
+  if ((!Array.isArray(beats) || beats.length === 0) && voiceoverFileIds.length > 0) {
+    const zeroTsCount = Array.isArray(timestamps)
+      ? timestamps.filter((t) => t.startSec === 0 && (t.endSec === 0 || t.endSec <= 1)).length
+      : 0;
+    if (zeroTsCount > (timestamps?.length ?? 0) * 0.3) {
+      try {
+        const allJobs = await jobStore.list();
+        // Find the most recent completed analyze job for this source file.
+        const analyzeJob = allJobs
+          .filter(
+            (j) =>
+              j.kind === 'analyze' &&
+              (j.sourceFileId === fileId || j.result?.sourceFileId === fileId) &&
+              j.status === 'done' &&
+              Array.isArray(j.result?.beats) &&
+              j.result.beats.length > 0,
+          )
+          .sort((a, b) => b.createdAt - a.createdAt)[0];
+        if (analyzeJob) {
+          // Sort beats chronologically (they should already be, but be safe).
+          let rawBeats = analyzeJob.result.beats
+            .slice()
+            .sort((a, b) => Number(a.startSec) - Number(b.startSec));
+
+          // FIX A — Drop beats Claude labelled as SKIP (studio logos, title cards).
+          // No hard time threshold — story content starts at different points
+          // per film and region. Trust Claude's own beat notes exclusively.
+          const beforeSkip = rawBeats.length;
+          rawBeats = rawBeats.filter((b) => {
+            const narr = String(b.narration || b.reason || "").trim();
+            if (narr.toUpperCase().startsWith("SKIP")) return false;
+            if (/\b(studio|logo|production\s*company|distributor|credit|title\s*card|opening\s*credit)\b/i.test(narr)) return false;
+            return true;
+          });
+          if (rawBeats.length < beforeSkip) {
+            console.log(`[render ${jobId}] scene-sync: filtered ${beforeSkip - rawBeats.length} SKIP/credits beats`);
+          }
+
+          // FIX B — Expand each beat window from its tight 6-second clip to the
+          // FULL scene range (beat[i].startSec → beat[i+1].startSec).
+          // Without this, 48×6s=288s of footage covers a 1226s narration only
+          // by cycling the same clips 4+ times.  With full ranges, the pool is
+          // ~5800s for a 2-hour film — far more than enough, zero re-cycling.
+          // Compute safe ceiling for last-beat window extension (avoids credits).
+          let _srcDurAL = 0;
+          try { _srcDurAL = await probeDurationSec(sourcePath); } catch {}
+          const _ceilAL = _srcDurAL > 0
+            ? Math.max(_srcDurAL * 0.5, _srcDurAL - Math.min(_srcDurAL * 0.08, Math.max(90, _srcDurAL * 0.035)))
+            : 0;
+
+          // ChatGPT pipeline: build a sceneId → timestamp map from the stored
+          // scenesList so we can resolve exact detected-scene boundaries per beat.
+          const _scenesList = analyzeJob.result.scenesList;
+          _scenesMap = Array.isArray(_scenesList) && _scenesList.length > 0
+            ? new Map(_scenesList.map((s) => [s.index, s])) : null;
+          const _sceneIdsResolved = { count: 0, fallback: 0 };
+
+          beats = rawBeats.map((b, i) => {
+            // ChatGPT pipeline: use sceneIds to resolve EXACT detected-scene window.
+            // beat.sceneIds covers [firstScene ... lastScene] from scene detection.
+            if (Array.isArray(b.sceneIds) && b.sceneIds.length > 0 && _scenesMap) {
+              const firstSc = _scenesMap.get(b.sceneIds[0]);
+              const lastSc  = _scenesMap.get(b.sceneIds[b.sceneIds.length - 1]);
+              if (firstSc && lastSc) {
+                let resolvedStart = Math.min(Number(b.startSec), firstSc.startSec);
+                let resolvedEnd = _ceilAL > 0
+                  ? Math.min(lastSc.endSec, _ceilAL) : lastSc.endSec;
+
+                // ChatGPT pipeline: confidence < 0.7 → expand window to adjacent scenes.
+                // Low confidence means Claude is uncertain the narration matches this footage;
+                // a larger pool gives buildSyncedTimeline better clip options to choose from.
+                const conf = Number.isFinite(Number(b.confidence)) ? Number(b.confidence) : 1.0;
+                if (conf < 0.7 && _scenesMap) {
+                  const lastUsedId = b.sceneIds[b.sceneIds.length - 1];
+                  const expandIds = [lastUsedId + 1, lastUsedId + 2].filter((id) => _scenesMap.has(id));
+                  for (const eid of expandIds) {
+                    const esc = _scenesMap.get(eid);
+                    if (esc) resolvedEnd = Math.max(resolvedEnd, _ceilAL > 0 ? Math.min(esc.endSec, _ceilAL) : esc.endSec);
+                  }
+                  if (expandIds.length > 0) {
+                    console.log(`[render ${jobId}] FIX-B: beat ${i} confidence=${conf.toFixed(2)} < 0.7 — expanded window +${expandIds.length} adjacent scenes`);
+                  }
+                }
+
+                _sceneIdsResolved.count++;
+                return {
+                  ...b,
+                  startSec: resolvedStart,
+                  endSec:   resolvedEnd,
+                };
+              }
+            }
+            // FIX B fallback (no sceneIds stored or scene not found in map):
+            // extend window to next beat's start — same as original FIX B.
+            _sceneIdsResolved.fallback++;
+            if (i < rawBeats.length - 1) {
+              return { ...b, endSec: Math.max(Number(b.endSec), Number(rawBeats[i + 1].startSec)) };
+            }
+            // Last beat: extend window to safe ceiling.
+            const lastEnd = _ceilAL > Number(b.startSec) ? _ceilAL : Number(b.endSec);
+            return { ...b, endSec: Math.max(Number(b.endSec), lastEnd) };
+          });
+          console.log(
+            `[render ${jobId}] FIX-B: sceneIds resolved ${_sceneIdsResolved.count} beats, ` +
+            `fallback FIX-B on ${_sceneIdsResolved.fallback} beats`,
+          );
+
+          _analyzeJobId = analyzeJob.id;
+          _hookText = typeof analyzeJob.result.hookText === "string" && analyzeJob.result.hookText.trim()
+            ? analyzeJob.result.hookText.trim() : null;
+          _hookSceneIds = Array.isArray(analyzeJob.result.hookSceneIds) && analyzeJob.result.hookSceneIds.length > 0
+            ? analyzeJob.result.hookSceneIds.map(Number).filter(Number.isFinite) : null;
+          if (_hookText) {
+            console.log(
+              `[render ${jobId}] HOOK: loaded ${_hookText.split(/\s+/).filter(Boolean).length}-word hook` +
+              (_hookSceneIds ? ` with hookSceneIds=[${_hookSceneIds.join(",")}]` : " (no hookSceneIds)")
+            );
+          }
+          console.log(
+            `[render ${jobId}] scene-sync: loaded ${beats.length} beats from ` +
+            `analyze job ${analyzeJob.id} — windows expanded to full scene ranges`,
+          );
+          await jobStore.update(jobId, {
+            message: `Scene sync: ${beats.length} scenes, windows expanded for unique footage`,
+          });
+        }
+      } catch (e) {
+        console.warn(`[render ${jobId}] could not auto-load analyze beats:`, e?.message || e);
+      }
+    }
+  }
+
+  // ---- v2.2 TRUE SYNC: if the caller sent per-beat narration windows, replace
+  // the incoming timestamps with a narration-paced timeline (no looping). We
+  // measure the voiceover length up front so each beat's on-screen duration
+  // matches how long it is spoken. `syncMode` then forces videoLoopCount=0.
+  let syncMode = false;
+  let syncBeatDurations = null;   // per-beat seconds (for music spans)
+  let syncMoods = null;           // per-beat moods (for music spans)
+  let voiceTotalPre = 0;
+  let _perBeatTtsDurations = null; // set by per-beat TTS; used for SRT + sync score
+  let whisperBeatDurations = null; // hoisted here so Phase-B gap-fill can read it
+  if (Array.isArray(beats) && beats.length > 0 &&
+      (voiceoverFileIds.length > 0 || !!(SERVER_SPEECHIFY_KEY || SERVER_OPENAI_KEY))) {
+    // ── UNIVERSAL BEAT NORMALISATION ──────────────────────────────────────
+    // Runs BEFORE anything else in the sync block so it applies whether
+    // beats came from the app request body OR were auto-loaded from the
+    // analyze job.  Previously the SKIP filter and window expansion only
+    // lived in the auto-load path, so app-sent beats (which bypass
+    // auto-load) still carried 6-second windows and SKIP entries —
+    // causing the planner to cycle the same 288s of footage 4+ times.
+    {
+      const beatsBefore = beats.length;
+
+      // ── PAIRED SORT: keep voiceoverFileIds in lockstep with beats ───────
+      // When the app sends one audio file per beat (lengths match), sorting
+      // beats by startSec without reordering the audio causes a complete
+      // narration-to-video mismatch: audio plays in script order while video
+      // plays in chronological order. Fix: tag each beat with its original
+      // index so we can reconstruct the audio order after sorting/filtering.
+      const voicePerBeat = voiceoverFileIds.length === beats.length && beats.length > 0;
+      let taggedBeats = beats.map((b, i) => ({ ...b, _origIdx: i }));
+
+      taggedBeats = taggedBeats
+        .filter((b) => {
+          // Drop only beats Claude labelled as SKIP or described as credits/logos.
+          // No hard time threshold — story content starts at different points
+          // per film and region.
+          const narr = String(b.narration || b.reason || "").trim();
+          if (narr.toUpperCase().startsWith("SKIP")) return false;
+          if (/\b(studio|logo|production\s*company|distributor|credit|title\s*card|opening\s*credit)\b/i.test(narr)) return false;
+          return true;
+        })
+        .sort((a, b) => Number(a.startSec) - Number(b.startSec))
+        .map((b, i, arr) => {
+          // Expand each window to the full scene range (next beat's startSec).
+          if (i < arr.length - 1) {
+            return { ...b, endSec: Math.max(Number(b.endSec), Number(arr[i + 1].startSec)) };
+          }
+          return b; // last beat: extended to safeCeiling below
+        });
+
+      // Reorder audio files to match the sorted beat order.
+      if (voicePerBeat && taggedBeats.length > 0) {
+        const origVoice = voiceoverFileIds.slice();
+        voiceoverFileIds = taggedBeats.map((b) => origVoice[b._origIdx]).filter(Boolean);
+        const reordered = taggedBeats.some((b, i) => b._origIdx !== i);
+        if (reordered) {
+          console.log(`[render ${jobId}] SYNC: reordered ${taggedBeats.length} voice files to match chronological beat order`);
+        }
+      }
+
+      // Strip internal tag before using beats downstream.
+      beats = taggedBeats.map(({ _origIdx, ...b }) => b);
+
+      const poolSec = beats.reduce((s, b) => s + Math.max(0, Number(b.endSec) - Number(b.startSec)), 0);
+      console.log(
         `[render ${jobId}] SYNC: beats normalised ${beatsBefore}→${beats.length}` +
         ` (SKIP/intro filtered, windows expanded, unique pool=${poolSec.toFixed(0)}s)`,
       );
@@ -8,7 +240,7 @@
     // Compute beat target from user-selected duration (passed as targetMinutes).
     // Average TTS per beat ≈ 15s empirically; clamp between 40 and 120 beats.
     // Save full beat list before trimming — hook footage lookup needs all scene indices.
-    _preTrimBeats = beats.slice();
+    const _preTrimBeats = beats.slice();
     {
       const AVG_BEAT_SEC  = 15;
       const BEATS_TARGET  = Math.max(40, Math.min(120, Math.round((+targetMinutes || 20) * 60 / AVG_BEAT_SEC)));
@@ -27,13 +259,13 @@
         //   regardless of where Claude assigned high importance scores.
         const bucketSize = original.length / BEATS_TARGET;
         const seenRefs   = new Set();
-        const _isProtectedBeat = isProtectedBeatForVisual;
-        const protectedBeats = original.filter(_isProtectedBeat);
         const kept = Array.from({ length: BEATS_TARGET }, (_, b) => {
           const start  = Math.floor(b * bucketSize);
           const end    = Math.min(Math.ceil((b + 1) * bucketSize), original.length);
           const bucket = original.slice(start, end);
           if (bucket.length === 0) return null;
+          // Within each bucket prefer the beat with the highest importance score.
+          // Falls back to the first beat in the bucket when no scores are present.
           const best = bucket.reduce((top, beat) =>
             +(beat.importance || 0) >= +(top.importance || 0) ? beat : top
           );
@@ -41,13 +273,6 @@
           seenRefs.add(best);
           return best;
         }).filter(Boolean);
-        for (const pb of protectedBeats) {
-          if (!kept.includes(pb) && kept.length < BEATS_TARGET + 8) {
-            kept.push(pb);
-            console.log(`[render ${jobId}] BEAT-TRIM: protected key scene kept (${String(pb.narration||"").slice(0,40)}…)`);
-          }
-        }
-        kept.sort((a, b) => Number(a.startSec) - Number(b.startSec));
 
         console.log(`[render ${jobId}] BEAT-TRIM: ${original.length}→${kept.length} beats (target=${BEATS_TARGET} for ${+targetMinutes || 20}min, stratified)`);
         beats = kept;
@@ -64,21 +289,12 @@
     if (HOOK_V2 && Array.isArray(beats) && beats.length >= 5 && (SERVER_ANTHROPIC_KEY || SERVER_OPENAI_KEY)) {
       try {
         // Step 1: score each beat
-        const _hookIntroFloor = 120; // match body intro-skip — never hook with credits/logos
         const _hv2Scored = beats.map((b, i) => {
           const imp = +(b.importance    || 0);
           const emo = +(b.emotionScore  || imp);
           const sur = +(b.surpriseScore || imp);
-          const start = Number(b.startSec) || 0;
-          const txt = String(b.narration || b.reason || "").toLowerCase();
-          if (start < _hookIntroFloor) return { _idx: i, hookScore: -1, startSec: start };
-          let keywordBoost = 0;
-          if (/shot|blood|dies|death|killer|murder|gun|funeral|grave|hospital|crash|betray|revenge|loses|taken|custody/i.test(txt)) keywordBoost += 8;
-          if (/fight|brawl|knockout|champion|final round|low blow|uppercut|escobar|climax/i.test(txt)) keywordBoost += 5;
-          if (/wife|daughter|maureen|leila|leyla|cry|grief|love|family/i.test(txt)) keywordBoost += 4;
-          if (/deal|contract|manager|business|pool|speech|press conference|paperwork/i.test(txt)) keywordBoost -= 5;
-          return { _idx: i, hookScore: imp * 0.50 + emo * 0.25 + sur * 0.25 + keywordBoost, startSec: start };
-        }).filter((x) => x.hookScore >= 0);
+          return { _idx: i, hookScore: imp * 0.60 + emo * 0.30 + sur * 0.10 };
+        });
 
         // Step 2: top 8 by hookScore, restore chronological order.
         // FIX: Beats sent from the app often lack importance/emotionScore/surpriseScore
@@ -120,24 +336,17 @@
           .join("\n");
 
         const _hv2Prompt =
-`You write a high-retention YouTube movie recap hook (55-75 words, ~22-30s narration time).
+`You write YouTube movie recap hooks (max 60 words, ~20s narration time).
 
-Selected high-impact story beats:
+Selected story beats:
 ${_hv2Lines}
 
-HOOK GOAL:
-Create a shocking, emotional, action-driven opening that makes viewers NEED to know what happened next.
-
-RULES — follow ALL:
+RULES:
 • Use ONLY the beats above. Never invent events not present here.
-• Prioritize SURPRISE, SHOCK, EMOTION, DANGER, REVENGE, FAMILY LOSS, BETRAYAL, or ACTION.
-• Start with the most dramatic situation, not ordinary setup or business context.
-• Short sentences. Present tense. Fast pacing. No generic phrases like "this movie" or "our hero".
-• Do NOT reveal the final ending, final winner, final twist, or resolution.
-• Create an unanswered question by the final third of the hook.
-• End with exactly one transition line: "To understand how it got this far, we have to go back to the beginning."
-• Pick sourceBeatIds ONLY from beats whose footage directly supports the hook visuals.
-• The visual hook should include 3-6 short clips covering the shock/action/emotion you mention.
+• Never reveal the ending, killer identity, final twist, or who survives.
+• Immediately grab attention. Short sentences. High tension. Present tense.
+• Create curiosity and an unanswered question.
+• End with one transition line like "Let's go back to the beginning."
 
 Return JSON only, no markdown:
 {"hookText":"...","sourceBeatIds":[beatId1,beatId2,...]}
@@ -150,7 +359,7 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
             method: "POST",
             headers: { "Content-Type": "application/json",
               "x-api-key": SERVER_ANTHROPIC_KEY, "anthropic-version": "2023-06-01" },
-            body: JSON.stringify({ model: SERVER_ANTHROPIC_MODEL || "claude-opus-4-5", max_tokens: 700,
+            body: JSON.stringify({ model: SERVER_ANTHROPIC_MODEL || "claude-haiku-4-5", max_tokens: 300,
               messages: [{ role: "user", content: _hv2Prompt }] }),
             signal: AbortSignal.timeout(25_000),
           });
@@ -210,13 +419,9 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
           ) / beats.length
         : 0;
       console.log(`[render ${jobId}] PER-BEAT TTS gate: avgWords=${_avgWords.toFixed(1)}, voiceFiles=${voiceoverFileIds.length}, beats=${beats.length}, keySet=${!!(SERVER_SPEECHIFY_KEY || SERVER_OPENAI_KEY)}`);
-      const _needsPerBeatTts = beats.length > 0 && (
-        voiceoverFileIds.length === 0 ||
-        voiceoverFileIds.length === 1 ||
-        voiceoverFileIds.length !== beats.length
-      );
       if (
-        _needsPerBeatTts &&
+        voiceoverFileIds.length !== beats.length &&
+        beats.length > 0 &&
         _avgWords >= 3 &&
         (SERVER_SPEECHIFY_KEY || SERVER_OPENAI_KEY || SERVER_ELEVENLABS_KEY || SERVER_HUME_KEY)
       ) {
@@ -243,7 +448,7 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
           _ttsProvider === "openai"     ? "onyx" :
           SERVER_SPEECHIFY_VOICE
         );
-        const _ttsSpeed = (settings && settings.ttsSpeed) || Number(process.env.TTS_SPEED || 0.95);
+        const _ttsSpeed = (settings && settings.ttsSpeed) || 1.0;
         console.log(
           `[render ${jobId}] PER-BEAT TTS: generating ${beats.length} clips ` +
           `(provider=${_ttsProvider} voice=${_ttsVoice} speed=${_ttsSpeed} avgNarrWords=${_avgWords.toFixed(1)})`
@@ -298,7 +503,7 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
     let safeCeiling = 0;
 
     try {
-      let voDurs = await Promise.all(
+      const voDurs = await Promise.all(
         voiceoverFileIds.map((id) => probeDurationSec(path.join(UPLOADS_DIR, id)).catch(() => 0)),
       );
       voiceTotalPre = voDurs.reduce((a, b) => a + (Number(b) || 0), 0);
@@ -377,11 +582,7 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
         // ── END WINDOW ADEQUACY EXPANSION ─────────────────────────────────────
 
         let scenes = beats.map((b) => ({ startSec: Number(b.startSec), endSec: Number(b.endSec), reason: b.reason || b.narration || "" }));
-        let beatTexts = beats.map((b) => (typeof b.narration === "string" ? b.narration : ""));
-        const protectedVisualBeats = beats.map(isProtectedBeatForVisual);
-        const originalBeatScenes = scenes.map((sc) => ({ ...sc, label: "analyze" }));
-        const transcriptCandidateScenes = beatTexts.map((txt) => findTranscriptCandidateForBeat(txt, sourceTranscriptSegments, srcDur));
-        let siglipCandidateScenes = new Array(scenes.length).fill(null);
+        const beatTexts = beats.map((b) => (typeof b.narration === "string" ? b.narration : ""));
 
         // ── CLIP SEMANTIC MATCHING (best-effort, falls back to time windows) ────
         // When the CLIP sidecar has embeddings for this analyze job, replace each
@@ -429,8 +630,6 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
             }
 
             if (frameFiles.length > 0) {
-              let srcDurClip = 0;
-              try { srcDurClip = await probeDurationSec(sourcePath); } catch {}
               // Use clip-metadata.json written by analyze step for correct per-scene
               // timestamps. Fallback: even-spaced reconstruction (inaccurate for the
               // scene-aware path — kept for old analyze jobs that predate the metadata).
@@ -444,6 +643,8 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
                 console.log(`[render ${jobId}] CLIP: metadata loaded — ${frames.length} frames with scene-accurate timestamps`);
               } catch {
                 // Legacy fallback: even-spaced timestamps (wrong for scene-aware extraction)
+                let srcDurClip = 0;
+                try { srcDurClip = await probeDurationSec(sourcePath); } catch {}
                 const stepSec = srcDurClip > 0 ? srcDurClip / (frameFiles.length + 1) : 0;
                 frames = frameFiles.map((f, i) => ({
                   path: path.join(framesDir, f),
@@ -469,24 +670,20 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
 
                   if (matchRes && Array.isArray(matchRes.results) && matchRes.results.length === scenes.length) {
                     let clipApplied = 0;
-                    let clipCandidateCount = 0;
                     scenes = scenes.map((sc, i) => {
                       const m = matchRes.results[i];
-                      if (m && Number.isFinite(Number(m.timeSec))) {
-                        const center = Number(m.timeSec);
-                        const winHalf = Math.max(8, (Number(sc.endSec) - Number(sc.startSec)) / 2);
-                        siglipCandidateScenes[i] = {
-                          label: "siglip",
-                          startSec: Math.max(0, center - winHalf),
-                          endSec: Math.min(srcDurClip || center + winHalf, center + winHalf),
-                          score: Number(m.score) || 0,
-                        };
-                        clipCandidateCount++;
-                      }
-                      if (protectedVisualBeats[i]) return sc; // funeral/death/climax beats stay on analyzed source window
-                      // Direct-apply only very confident SigLIP matches; otherwise Gemini verifier decides.
-                      if (!m || m.score < Number(process.env.VISUAL_APPLY_THRESHOLD || 0.16)) return sc;
-                      const center = Number(m.timeSec);
+                      // Only apply if score is confident enough (CLIP cosine > 0.22)
+                      // and the matched frame is within the general timeline region.
+                      if (!m || m.score < 0.22) return sc;
+                      const center = m.timeSec;
+                      // FIX: Widened window guard. The old strict check (center must be
+                      // within sc.startSec..sc.endSec) prevented CLIP from correcting
+                      // beats where Claude placed the timestamp in the wrong scene.
+                      // New guard: allow CLIP to relocate a beat's window as long as the
+                      // matched frame is within ±15% of movie duration from the beat midpoint.
+                      // This lets CLIP escape Claude's wrong timestamps (e.g. "Layla scene"
+                      // assigned to minute 30 but Layla actually appears at minute 45)
+                      // while still staying in the correct chronological region.
                       const _scMid = (Number(sc.startSec) + Number(sc.endSec)) / 2;
                       const _liberalRadius = srcDurClip > 0 ? srcDurClip * 0.15 : 300;
                       if (center < _scMid - _liberalRadius || center > _scMid + _liberalRadius) return sc;
@@ -496,15 +693,13 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
                         ...sc,
                         startSec: Math.max(0, center - winHalf),
                         endSec: center + winHalf,
-                        reason: (sc.reason || "") + ` [siglip:${m.score.toFixed(2)}]`,
+                        reason: (sc.reason || "") + ` [clip:${m.score.toFixed(2)}]`,
                       };
                     });
                     console.log(
-                      `[render ${jobId}] SIGLIP: candidates=${clipCandidateCount}/${scenes.length}, direct-applied=${clipApplied}/${scenes.length} ` +
+                      `[render ${jobId}] CLIP: semantic windows applied to ${clipApplied}/${scenes.length} beats ` +
                       `(frames=${embedRes.frames}, analyzeJob=${_analyzeJobId})`
                     );
-                  } else {
-                    console.warn(`[render ${jobId}] SIGLIP: match failed or length mismatch`);
                   }
                 }
               }
@@ -516,206 +711,11 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
         // ── END CLIP SEMANTIC MATCHING ────────────────────────────────────────
 
         // ── GEMINI FLASH VERIFICATION ────────────────────────────────────────
-        // Final multimodal verifier: Whisper candidate + local visual candidates +
-        // Gemini chooses the best short clip. Runs only when GEMINI_API_KEY is set.
+        // Final multimodal verifier: analyze candidate + CLIP/Whisper candidates →
+        // Gemini Flash picks the best clip. Runs only when GEMINI_API_KEY is set.
         if (SERVER_GEMINI_KEY) {
           const maxVerify = Math.max(0, Math.min(scenes.length, Number(process.env.GEMINI_VERIFY_MAX_BEATS || 35)));
           let attemptedGemini = 0, appliedGemini = 0, rejectedGemini = 0, skippedGemini = 0, failedGemini = 0;
           for (let i = 0; i < maxVerify; i++) {
             const cands = _dedupeCandidates([
               { ...originalBeatScenes[i], label: "analyze" },
-              siglipCandidateScenes[i] ? { ...siglipCandidateScenes[i], label: "siglip" } : null,
-              scenes[i] ? { ...scenes[i], label: scenes[i].reason?.includes('[siglip:') ? "siglip-current" : "current" } : null,
-              transcriptCandidateScenes[i] ? { ...transcriptCandidateScenes[i], label: "whisper" } : null,
-            ]);
-            if (cands.length < 2) { skippedGemini++; continue; }
-            attemptedGemini++;
-            const v = await verifyBeatCandidatesWithGemini({ jobId, beatIndex: i, narration: beatTexts[i], sourcePath, candidates: cands });
-            if (!v) { failedGemini++; continue; }
-            if (v.confidence >= Number(process.env.GEMINI_ACCEPT_THRESHOLD || 0.35)) {
-              const chosen = cands[v.index];
-              // Never let Gemini move protected beats away unless it chooses the analyzed/protected source.
-              if (protectedVisualBeats[i] && chosen.label !== "analyze") { rejectedGemini++; continue; }
-              scenes[i] = { ...scenes[i], startSec: chosen.startSec, endSec: chosen.endSec, reason: `${scenes[i]?.reason || ''} [gemini:${chosen.label}:${v.confidence.toFixed(2)}]` };
-              appliedGemini++;
-            } else {
-              rejectedGemini++;
-            }
-          }
-          console.log(`[render ${jobId}] GEMINI: candidates attempted=${attemptedGemini}, applied=${appliedGemini}, rejected=${rejectedGemini}, failed=${failedGemini}, skipped=${skippedGemini}`);
-        } else {
-          console.log(`[render ${jobId}] GEMINI: skipped (GEMINI_API_KEY not set)`);
-        }
-        // ── END GEMINI FLASH VERIFICATION ────────────────────────────────────
-
-        // ── TEXT-TO-TEXT BEAT NOTE MATCHING (zero cost, always available) ────
-        // Uses beat notes Claude already wrote during analyze — no extra API call.
-        // Only fires for beats CLIP did not already improve, and only when the
-        // footage window is shorter than the TTS duration (LOW-SYNC risk beats).
-        {
-          const _txtResult = _textMatchBeatNotes(beats, voDurs);
-          if (_txtResult.applied > 0) {
-            scenes = scenes.map((sc, i) => {
-              if (protectedVisualBeats[i]) return sc;
-              if (sc.reason && (sc.reason.includes('[clip:') || sc.reason.includes('[gemini:'))) return sc;
-              return _txtResult.scenes[i];
-            });
-            console.log(
-              `[render ${jobId}] TEXT-MATCH: re-centred ${_txtResult.applied} footage-starved beat(s) ` +
-              `using note similarity — ${_txtResult.log.slice(0, 5).join(', ')}` +
-              (_txtResult.log.length > 5 ? ` (+${_txtResult.log.length - 5} more)` : '')
-            );
-          }
-        }
-        // ── END TEXT-TO-TEXT BEAT NOTE MATCHING ──────────────────────────────
-
-        // Intro-safe start: the earliest second of footage that may appear
-        // on-screen. Derived from the first surviving beat so credits,
-        // production logos, and title cards are never drawable even on
-        // reset-passes when the pool is re-swept for long narrations.
-        let safeStart = scenes.length > 0
-          ? Math.max(0, scenes.reduce((mn, s) => Math.min(mn, s.startSec), Infinity))
-          : 0;
-        // Logo-safety floor for feature films: studio logos (Universal, WB, etc.)
-        // and opening title cards can run 60-120s. If the beat analysis places the
-        // first scene before 120s, bump the floor so those frames never appear.
-        // Only applies to feature-length content (>30 min) to avoid cutting real
-        // opening scenes from short films.
-        if (srcDur > 1800) {
-          // 4% of runtime, max 4 min. Southpaw and similar films run opening
-          // credits through 3-4 min; 120s cap was too low and caused credits
-          // to appear as the first body beat after the hook.
-          const logoFloor = Math.min(240, srcDur * 0.04);
-          if (safeStart < logoFloor) {
-            console.log(`[render ${jobId}] SYNC: logo-safety floor raised ${safeStart.toFixed(1)}→${logoFloor.toFixed(1)}s (feature film intro guard)`);
-            safeStart = logoFloor;
-          }
-        }
-        if (safeStart > 0) {
-          console.log(`[render ${jobId}] SYNC: intro-skip floor = ${safeStart.toFixed(1)}s (no footage before first real beat)`);
-          // Enforce the floor, not just log it. Drop pre-credit/logo beats and keep
-          // beats/voice files/durations/text in lockstep so narration cannot describe
-          // footage that we intentionally refuse to show.
-          const keepIdx = [];
-          for (let i = 0; i < scenes.length; i++) {
-            const st = Number(scenes[i].startSec) || 0;
-            const en = Number(scenes[i].endSec) || 0;
-            if (en > safeStart + 0.5) keepIdx.push(i);
-          }
-          const beforeIntro = scenes.length;
-          if (keepIdx.length > 0 && keepIdx.length < scenes.length) {
-            scenes = keepIdx.map((i) => {
-              const sc = scenes[i];
-              return Number(sc.startSec) < safeStart ? { ...sc, startSec: safeStart } : sc;
-            });
-            beats = keepIdx.map((i) => beats[i]);
-            beatTexts = keepIdx.map((i) => beatTexts[i]);
-            voDurs = keepIdx.map((i) => voDurs[i]);
-            voiceoverFileIds = keepIdx.map((i) => voiceoverFileIds[i]).filter(Boolean);
-            if (Array.isArray(_perBeatTtsDurations)) _perBeatTtsDurations = keepIdx.map((i) => _perBeatTtsDurations[i]);
-            if (Array.isArray(whisperBeatDurations)) whisperBeatDurations = keepIdx.map((i) => whisperBeatDurations[i]);
-            console.log(`[render ${jobId}] SYNC: intro filter dropped ${beforeIntro - scenes.length} pre-floor beat(s); firstStart=${Number(scenes[0]?.startSec || 0).toFixed(1)}s`);
-          } else {
-            scenes = scenes.map((sc) => Number(sc.startSec) < safeStart && Number(sc.endSec) > safeStart
-              ? { ...sc, startSec: safeStart }
-              : sc);
-          }
-        }
-        // Decide distribution mode:
-        //   per-beat-audio  → voice files count equals beats count → exact audio durations
-        //   even            → mismatch (e.g. 7 files, 44 beats) → equal slice per beat
-        //   word-count      → narration text available and lengths match → proportional
-        const voiceBeatMatch = voDurs.length === scenes.length && scenes.length > 0;
-        let useEvenDist = !voiceBeatMatch;
-        const distMode = voiceBeatMatch ? "per-beat-audio" : "even";
-        console.log(`[render ${jobId}] SYNC: distribution=${distMode} (${voDurs.length} voiceFiles, ${scenes.length} beats)`);
-
-        // Whisper word-level alignment (req #3): when voice file count ≠ beat count
-        // (even-distribution mode) AND an OpenAI key is available, run Whisper on the
-        // combined voiceover to get EXACT per-beat durations from actual speech timing.
-        // This eliminates word-count estimation drift (the cause of 15s vs 54s swings).
-        whisperBeatDurations = null; // reset each sync pass (declared at function scope above)
-        // ChatGPT pipeline: run Whisper alignment whenever an OpenAI key is available
-        // and voice files + beat texts are ready — not just on even-distribution paths.
-        // Per-beat TTS (one file per beat) gives the BEST Whisper word alignment since
-        // the word-count cursor matches exactly one narration text per audio file.
-        if (SERVER_OPENAI_KEY && voiceoverFileIds.length > 0 && beatTexts.length === scenes.length) {
-          try {
-            await jobStore.update(jobId, { message: "Aligning beat timing with Whisper word timestamps" });
-            const wDurs = await alignBeatsByWhisperWords(voiceoverFileIds, beatTexts, SERVER_OPENAI_KEY, UPLOADS_DIR);
-            if (Array.isArray(wDurs) && wDurs.length === beatTexts.length && wDurs.every((d) => d !== null && d > 0)) {
-              whisperBeatDurations = wDurs;
-              useEvenDist = false;
-              console.log(`[render ${jobId}] SYNC: Whisper word alignment succeeded → exact per-beat durations`);
-            } else {
-              console.warn(`[render ${jobId}] SYNC: Whisper alignment returned partial nulls; falling back to even dist`);
-            }
-          } catch (wErr) {
-            console.warn(`[render ${jobId}] SYNC: Whisper alignment failed (using even distribution):`, wErr?.message || wErr);
-          }
-        }
-
-        // ── Long Scene Subdivision ──────────────────────────────────────────
-        // Any scene window longer than 60s is split into ~20s sub-ranges before
-        // planSyncedRender. This prevents a single long conversation scene from
-        // filling the entire forward cursor with one static shot.
-        function subdivideScenes(sceneArr, maxSec = 60, subSec = 20) {
-          const out = [];
-          for (const sc of sceneArr) {
-            const dur = Number(sc.endSec) - Number(sc.startSec);
-            if (dur <= maxSec) { out.push(sc); continue; }
-            // Split into subSec-length chunks; last chunk absorbs the remainder.
-            let cur = Number(sc.startSec);
-            let sub = 0;
-            while (cur < Number(sc.endSec) - 0.5) {
-              const next = Math.min(cur + subSec, Number(sc.endSec));
-              out.push({ ...sc, startSec: cur, endSec: next, _subLabel: `${sc.index ?? "?"}${String.fromCharCode(65 + sub)}` });
-              cur = next;
-              sub++;
-            }
-          }
-          return out;
-        }
-        // Skip SUBDIVIDE when exact per-beat TTS durations are available.
-        // SUBDIVIDE expands scene count (e.g. 80→251) but whisperBeatDurations stays at 80.
-        // planSyncedRender requires beatDurations.length === scenes.length to use real TTS
-        // durations — a mismatch causes it to fall back to equal distribution (all clips same
-        // length → zero sync). When we have per-beat audio, subdivision is unnecessary anyway:
-        // each beat already has an exact measured duration and the forward cursor handles variety.
-        //
-        // IMPORTANT: also skip when per-beat Speechify voDurs matches scene count —
-        // previously whisperBeatDurations was always null for Speechify, causing subdivide
-        // to always run and produce a scenes/durations length mismatch → equal distribution
-        // → all clips 2.80s → 33% gap-fill → zigzag video.
-        const hasExactBeatDurs = (
-          (Array.isArray(whisperBeatDurations) && whisperBeatDurations.length === scenes.length) ||
-          (Array.isArray(voDurs) && voDurs.length === scenes.length)
-        );
-        const scenesForPlan = hasExactBeatDurs ? scenes : subdivideScenes(scenes, 60, 20);
-        if (hasExactBeatDurs) {
-          const _durSrc = Array.isArray(whisperBeatDurations) ? 'whisper' : 'speechify';
-          console.log(`[render ${jobId}] SUBDIVIDE: skipped — exact per-beat TTS durations present (${scenes.length} scenes, source=${_durSrc})`);
-        } else if (scenesForPlan.length !== scenes.length) {
-          console.log(`[render ${jobId}] SUBDIVIDE: ${scenes.length} scenes → ${scenesForPlan.length} after splitting long scenes (>60s)`);
-        }
-
-        const plan = planSyncedRender({
-          scenes: scenesForPlan,
-          voiceTotalSec: voiceTotalPre,
-          beatTexts,
-          beatDurations: whisperBeatDurations || voDurs,
-          // When voice file count does not match beat count we cannot know how
-          // narration maps to individual beats.  Even distribution (equal seconds
-          // per beat) is far more accurate than word-count of short reason labels
-          // which caused 15 s vs 54 s swings and severe audio/video drift.
-          useEvenDistribution: useEvenDist,
-          sourceDurationSec: safeCeiling || srcDur || undefined,
-          sourceStartSec: safeStart > 0 ? safeStart : undefined,
-          maxClipSec: COPYRIGHT_SAFE_MODE ? Number(process.env.COPYRIGHT_SAFE_MAX_CLIP_SEC || 3.0) : undefined,
-          // ChatGPT pipeline: pass per-beat importance scores so buildSyncedTimeline
-          // applies dynamic cut timing (2.5s for transitional, 5.0s for climax).
-          beatImportances: Array.isArray(beats) ? beats.map((b) => b.importance ?? null) : undefined,
-          beatTypes: Array.isArray(beats) ? beats.map((b) => b.beatType ?? null) : undefined,
-        });
-        if (Array.isArray(plan.timeline) && plan.timeline.length > 0) {
-          console.log(`[render ${jobId}] SYNC: plan.timeline=${plan.timeline.length}, beatDurations=${plan.beatDurations.map(d => d.toFixed(2)).join(',')}`);

@@ -268,65 +268,8 @@ async function callClipSidecar(endpoint, body, timeoutMs = 15_000) {
   }
 }
 
-
-const PROTECTED_SCENE_RE = /funeral|cemetery|grave|burial|mourn|casket|headstone|dies|death|killed|murder|shoots|shot|blood|betray|twist|climax|final round|knockout|hospital|crash/i;
-function isProtectedBeatForVisual(b) {
-  const t = `${b?.narration || ""} ${b?.reason || ""}`;
-  return PROTECTED_SCENE_RE.test(t);
-}
-function _tokSet(s) {
-  return new Set(String(s || "").toLowerCase().replace(/[^a-z0-9\s]/g, " ").split(/\s+/).filter(w => w.length > 2));
-}
-function _jaccard(a, b) {
-  if (!a.size || !b.size) return 0;
-  let inter = 0;
-  for (const x of a) if (b.has(x)) inter++;
-  return inter / (a.size + b.size - inter);
-}
-function findTranscriptCandidateForBeat(narration, transcriptSegments, sourceDurationSec = 0) {
-  if (!Array.isArray(transcriptSegments) || transcriptSegments.length === 0) return null;
-  const q = _tokSet(narration);
-  if (!q.size) return null;
-  let best = null;
-  for (let i = 0; i < transcriptSegments.length; i++) {
-    const st = Number(transcriptSegments[i].start ?? transcriptSegments[i].startSec ?? 0);
-    let end = st;
-    let text = "";
-    for (let j = i; j < transcriptSegments.length; j++) {
-      const sj = transcriptSegments[j];
-      const sjEnd = Number(sj.end ?? sj.endSec ?? st);
-      if (sjEnd - st > 18) break;
-      text += " " + String(sj.text || "");
-      end = Math.max(end, sjEnd);
-    }
-    const score = _jaccard(q, _tokSet(text));
-    if (!best || score > best.score) best = { startSec: st, endSec: Math.max(end, st + 6), score, label: "whisper" };
-  }
-  if (!best || best.score < 0.09) return null;
-  const dur = Math.min(14, Math.max(6, best.endSec - best.startSec + 4));
-  const mid = (best.startSec + best.endSec) / 2;
-  return {
-    label: "whisper",
-    startSec: Math.max(0, mid - dur / 2),
-    endSec: sourceDurationSec > 0 ? Math.min(sourceDurationSec, mid + dur / 2) : mid + dur / 2,
-    score: best.score,
-  };
-}
-function _dedupeCandidates(cands) {
-  const out = [];
-  for (const c of cands) {
-    if (!c || !(Number(c.endSec) > Number(c.startSec) + 0.5)) continue;
-    const mid = (Number(c.startSec) + Number(c.endSec)) / 2;
-    if (out.some(o => Math.abs(((o.startSec + o.endSec) / 2) - mid) < 2.0)) continue;
-    out.push({ ...c, startSec: Number(c.startSec), endSec: Number(c.endSec) });
-  }
-  return out.slice(0, 5);
-}
-async function _extractVerifierClip(sourcePath, cand, outPath) {
-  const mid = (Number(cand.startSec) + Number(cand.endSec)) / 2;
-  const len = Math.min(8, Math.max(4, Number(cand.endSec) - Number(cand.startSec)));
-  const startSec = Math.max(0, mid - len / 2);
-  const endSec = startSec + len;
+/* ---------- Gemini beat-verifier helpers --------------------------------- */
+async function _extractVerifierClip(sourcePath, { startSec, endSec }, outPath) {
   return new Promise((resolve) => {
     const ff = spawn("ffmpeg", [
       "-y", "-hide_banner", "-loglevel", "error",
@@ -375,17 +318,11 @@ async function verifyBeatCandidatesWithGemini({ jobId, beatIndex, narration, sou
       }),
       signal: AbortSignal.timeout(60_000),
     });
-    if (!resp.ok) {
-      console.warn(`[render ${jobId}] GEMINI beat ${beatIndex}: HTTP ${resp.status}`);
-      return null;
-    }
+    if (!resp.ok) { console.warn(`[render ${jobId}] GEMINI beat ${beatIndex}: HTTP ${resp.status}`); return null; }
     const data = await resp.json();
     const txt = data?.candidates?.[0]?.content?.parts?.map(p => p.text || "").join("\n") || "";
     const m = txt.match(/\{[\s\S]*\}/);
-    if (!m) {
-      console.warn(`[render ${jobId}] GEMINI beat ${beatIndex}: no JSON in response: ${txt.slice(0, 120)}`);
-      return null;
-    }
+    if (!m) { console.warn(`[render ${jobId}] GEMINI beat ${beatIndex}: no JSON in response: ${txt.slice(0, 120)}`); return null; }
     const parsed = JSON.parse(m[0]);
     const best = Number(parsed.best) - 1;
     const conf = Number(parsed.confidence) || 0;
@@ -412,7 +349,7 @@ app.get("/health", (_req, res) => {
 
   res.json({
     ok: true,
-    version: "2.8.4",
+    version: "2.8.5",
     serverTranscription: Boolean(SERVER_OPENAI_KEY),
     serverAnalysis: Boolean(SERVER_ANTHROPIC_KEY),
     serverModel: SERVER_ANTHROPIC_MODEL || null,
@@ -446,7 +383,7 @@ app.get("/health", (_req, res) => {
       "translate-transcript", // new in 2.5.0 — Whisper translation endpoint for non-English films
       "uncapped-narration", // new in 2.5.0 — full-length narration, no word-count ceiling
       "clip-select",        // new in 2.6.0 — CLIP semantic frame matching for clip selection
-      "gemini-verify",     // new in 2.7.4 — Gemini Flash verifies top candidate clips when GEMINI_API_KEY is set
+      "gemini-verify",      // new in 2.7.4 — Gemini Flash verifies top candidate clips when GEMINI_API_KEY is set
       "multi-tts",          // new in 2.7.0 — ttsProvider field selects speechify|openai|elevenlabs|hume
       "storage-api",        // new in 2.7.0 — GET /system/storage, DELETE /system/clear-renders
       "source-download",    // new in 2.7.0 — GET /uploads/:fileId/download
@@ -514,13 +451,42 @@ function aiThumbPath(jobId, style) {
 // cinematic colour grade.  Returns destPath on success, throws on failure.
 // styles: "dramatic" | "bold" | "cinematic"
 const FRAME_FILTERS = {
-  // Warm contrast, subtle vignette, light sharpening — premium drama feel
-  dramatic:  "eq=contrast=1.25:brightness=-0.03:saturation=0.95,unsharp=5:5:0.6:3:3:0.0,vignette=PI/5,scale=1280:-2",
-  // Punchy saturation + sharpening — stop-scroll energy
-  bold:      "eq=contrast=1.4:brightness=0.04:saturation=1.6,unsharp=5:5:1.0:3:3:0.0,scale=1280:-2",
-  // Hollywood orange-teal grade — cinematic depth
-  cinematic: "colorchannelmixer=rr=1.08:rb=-0.04:gr=-0.04:gg=0.96:bb=0.84:br=0.08,eq=contrast=1.2:saturation=0.85,vignette=PI/6,scale=1280:-2",
+  // High contrast + warm vignette — hero-in-peril drama feel
+  dramatic:  "eq=contrast=1.5:brightness=-0.05:saturation=1.1,unsharp=5:5:0.9:3:3:0.0,vignette=PI/4,scale=1280:-2",
+  // Max punch: very high contrast + vivid saturation — stop-scroll energy
+  bold:      "eq=contrast=1.7:brightness=0.05:saturation=1.9,unsharp=5:5:1.3:3:3:0.0,scale=1280:-2",
+  // Hollywood orange-teal + sharpening + vignette — cinematic depth
+  cinematic: "colorchannelmixer=rr=1.12:rb=-0.06:gr=-0.05:gg=0.94:bb=0.80:br=0.12,eq=contrast=1.4:saturation=1.05,unsharp=3:3:0.6,vignette=PI/5,scale=1280:-2",
 };
+
+// Find the timestamps of dramatic scene changes in a video using ffprobe.
+// Returns an array of seconds (sorted), filtered to avoid the first/last 5%.
+async function findSceneChangeTimestamps(videoPath, duration) {
+  return new Promise((resolve) => {
+    let stdout = "";
+    const proc = spawn("ffprobe", [
+      "-v", "error",
+      "-show_entries", "frame=pts_time:frame_tags=lavfi.scene_score",
+      "-of", "csv",
+      "-f", "lavfi",
+      `movie=${videoPath.replace(/\\/g, "/")},select=gt(scene\\,0.28)`,
+    ], { stdio: ["ignore", "pipe", "pipe"] });
+    proc.stdout.on("data", (d) => { stdout += d; });
+    proc.on("close", () => {
+      const minT = duration * 0.05;
+      const maxT = duration * 0.95;
+      const timestamps = [];
+      for (const line of stdout.split("\n")) {
+        const parts = line.split(",");
+        const pts = parseFloat(parts[2] || parts[1] || "");
+        if (!isNaN(pts) && pts >= minT && pts <= maxT) timestamps.push(pts);
+      }
+      resolve(timestamps.sort((a, b) => a - b));
+    });
+    proc.on("error", () => resolve([]));
+    setTimeout(() => { try { proc.kill(); } catch {} resolve([]); }, 12_000);
+  });
+}
 async function extractStyledFrame(videoPath, timeSec, destPath, style = "dramatic") {
   const vf = FRAME_FILTERS[style] || FRAME_FILTERS.dramatic;
   return new Promise((resolve, reject) => {
@@ -539,8 +505,8 @@ async function extractStyledFrame(videoPath, timeSec, destPath, style = "dramati
 }
 // Build an emotionally-driven story thumbnail prompt from beat context + style.
 // buildThumbPrompt: generates viral, highly-clickable YouTube thumbnail prompts.
-// Extracts character archetypes, setting, and emotional peak from beat narration,
-// then builds two distinct styles:
+// Extracts character archetypes, setting, emotional peak, and the core story
+// conflict from beat narration, then builds two distinct styles:
 //   bold     → extreme close-up face emotion, red/amber, MrBeast-level stop-scroll energy
 //   dramatic → cinematic wide / medium shot, Netflix/orange-teal grade, premium feel
 function buildThumbPrompt(beatContext, style) {
@@ -553,6 +519,10 @@ function buildThumbPrompt(beatContext, style) {
   const isWoman     = /\bshe\b|\bher\b|mother|woman|girl|wife|widow|daughter/i.test(ctx);
   const isChild     = /child|boy|girl|kid|son|daughter|young|little one/i.test(ctx);
   const isOfficer   = /police|officer|detective|sheriff|agent|badge|cop\b/i.test(ctx);
+  const isGangster  = /gang|mob|mafia|cartel|criminal|syndicate|kingpin|traffick/i.test(ctx);
+  const isSpy       = /spy|agent|cia|fbi|undercover|covert|assassin|hitman/i.test(ctx);
+  const isDoctor    = /doctor|surgeon|nurse|hospital|patient|medical|diagnosis/i.test(ctx);
+  const isLawyer    = /lawyer|attorney|counsel|case|defend|prosecut|court\b/i.test(ctx);
 
   /* ── 2. SETTING DETECTION ────────────────────────────────────────────── */
   const isDesert    = /desert|arizona|border|ranch|sand|mesa|scrub|sun-baked|arid/i.test(ctx);
@@ -560,6 +530,9 @@ function buildThumbPrompt(beatContext, style) {
   const isCity      = /city|urban|street|alley|downtown|neighborhood|apartment/i.test(ctx);
   const isCourt     = /court|trial|judge|jury|lawsuit|verdict|hearing/i.test(ctx);
   const isPrison    = /prison|jail|cell|bars|inmate|locked up|arrest/i.test(ctx);
+  const isWar       = /battlefield|warzone|frontline|bunker|trenches|explosion|troops/i.test(ctx);
+  const isOcean     = /ocean|sea|boat|ship|island|coast|storm|wave|sailor/i.test(ctx);
+  const isMountain  = /mountain|summit|cliff|peak|altitude|avalanche|trek|hiking/i.test(ctx);
 
   /* ── 3. CONFLICT / ARC DETECTION ────────────────────────────────────── */
   const isBully     = /bully|humiliat|mock|ridicul|torment|abuse|harass|degrad|attack/i.test(ctx);
@@ -570,83 +543,125 @@ function buildThumbPrompt(beatContext, style) {
   const isTriumph   = /triumph|justice|won|freed|survived|overcame|vindicated|walk.?free/i.test(ctx);
   const isInjustice = /innocent|wrongly|unjust|unfair|frame|corrupt|crooked|rigged/i.test(ctx);
   const isProtect   = /protect|defend|shield|save|rescue|guard|stood up/i.test(ctx);
+  const isEscape    = /escape|run|flee|chase|hunted|pursued|hiding|on the run/i.test(ctx);
+  const isSacrifice = /sacrifice|gave.?up|give.?up|everything to|for the sake of|choice/i.test(ctx);
 
-  /* ── 4. BUILD CHARACTER DESCRIPTION ─────────────────────────────────── */
+  /* ── 4. EXTRACT CORE STORY CONFLICT ─────────────────────────────────── */
+  // Pull the most emotionally charged sentence from the beat context
+  // to anchor the image to the actual story premise.
+  let coreConflict = "";
+  const sentences = ctx.split(/[.!?]+/).map(s => s.trim()).filter(Boolean);
+  // Score sentences by conflict weight
+  const conflictWords = /betray|frame|kill|murder|destroys|ruins|loses|threaten|arrested|corrupt|innocent|dying|trapped|left him|left her|abandoned|discover|reveal|truth/i;
+  const scored = sentences.map(s => ({ s, score: (s.match(conflictWords) || []).length }));
+  scored.sort((a, b) => b.score - a.score);
+  if (scored[0]?.score > 0) coreConflict = scored[0].s.trim().slice(0, 200);
+
+  /* ── 5. BUILD CHARACTER DESCRIPTION ─────────────────────────────────── */
   let hero = "a lone man";
-  if (isVeteran && isRancher) hero = "a weathered Vietnam veteran and rancher in his 60s, sun-beaten face, steel-grey stubble, eyes hardened by decades of hardship";
-  else if (isVeteran)         hero = "a battle-hardened military veteran, jaw set like stone, eyes that have seen too much — fierce, unbreakable, righteous";
-  else if (isRancher)         hero = "a rugged rancher with calloused hands and a weathered face, quiet fury in his eyes";
-  else if (isOldMan)          hero = "an elderly man, seemingly frail but with a burning defiance in his eyes that stops people cold";
-  else if (isWoman && isChild) hero = "a desperate mother clutching her young child, eyes wide with fear and fierce maternal protectiveness";
-  else if (isWoman)           hero = "a woman standing her ground, hands trembling but eyes blazing with righteous fury";
+  if (isVeteran && isRancher) hero = "a weathered Vietnam veteran and rancher in his 60s, sun-beaten face, steel-grey stubble, eyes hardened by decades of loss and hardship, the face of a man who fought for his country and is now fighting for his land";
+  else if (isVeteran && isOfficer) hero = "a decorated combat veteran turned law enforcement officer, jaw set like iron, uniform bearing the weight of both battlefield trauma and civic duty, eyes that have seen the worst of humanity";
+  else if (isVeteran)         hero = "a battle-hardened military veteran in his prime, jaw set like stone, eyes that have seen too much — fierce, unbreakable, with the quiet righteous fury of a man who has been pushed to his absolute limit";
+  else if (isRancher)         hero = "a rugged rancher with calloused, scarred hands and a deeply weathered face, standing on the land his family bled for, quiet fury smoldering in his eyes";
+  else if (isOldMan && isInjustice) hero = "an elderly man with the bearing of someone who has lived righteously his whole life, now confronting a profound injustice — seemingly frail but with a burning, unquenchable defiance in his eyes";
+  else if (isOldMan)          hero = "an elderly man, seemingly frail but with a burning defiance in his eyes that stops people cold — the look of someone who has survived everything and refuses to be broken now";
+  else if (isWoman && isChild) hero = "a desperate mother clutching her young child close, body shielding the child from an unseen threat — eyes wide with primal fear, jaw set with the ferocious protectiveness only a parent knows";
+  else if (isWoman && isBetrayal) hero = "a woman who trusted the wrong person — standing at the edge of devastating discovery, her expression a devastating mix of heartbreak and simmering fury, someone who will not go quietly";
+  else if (isWoman)           hero = "a woman standing her ground against an overwhelming threat, hands trembling but eyes blazing with the righteous fury of someone who has been underestimated for the last time";
+  else if (isChild && isInjustice) hero = "a young child caught in a storm of adult injustice — tear-streaked face turned upward, small and vulnerable yet refusing to break, with the heartbreaking dignity of a kid who shouldn't have to be this strong";
   else if (isChild)           hero = "a terrified child, tear-streaked face looking up at an overwhelming threat, small but refusing to cower";
+  else if (isOfficer && isInjustice) hero = "a lone detective or officer who uncovered corruption from within — standing isolated in a system that wants him silenced, badge heavy with the weight of what he knows";
+  else if (isGangster)        hero = "a man caught between worlds — the criminal empire he was born into and the sliver of conscience that remains, face bearing the scars of a life lived in shadow";
+  else if (isSpy)             hero = "a covert operative whose cover has been blown — alone, hunted, but razor-focused, the calm of a trained professional masking a storm of urgency beneath";
+  else if (isDoctor)          hero = "a doctor who knows a devastating truth that no one will believe — expression torn between clinical composure and desperate urgency, white coat now feeling like a prison";
+  else if (isLawyer)          hero = "a lawyer who took the case everyone said was unwinnable — standing in the courthouse shadow, briefcase in hand, eyes carrying the weight of an innocent person's fate";
 
-  /* ── 5. SETTING BACKDROP ─────────────────────────────────────────────── */
-  let backdrop = "a dramatic dark background";
-  if (isDesert)   backdrop = "a scorching Arizona desert at golden hour, dust haze, border fence visible in the distance, oppressive heat shimmer";
-  else if (isForest) backdrop = "a dense threatening forest, shafts of harsh light cutting through dark canopy";
-  else if (isCourt) backdrop = "a stark courtroom, cold fluorescent light, the weight of injustice in every shadow";
-  else if (isPrison) backdrop = "cold concrete and iron bars, a single harsh overhead light casting deep shadows";
-  else if (isCity)  backdrop = "a rain-slicked urban street at night, red and blue lights reflecting on wet asphalt";
+  /* ── 6. SETTING BACKDROP ─────────────────────────────────────────────── */
+  let backdrop = "a dramatically lit dark background suggesting isolation and danger";
+  if (isDesert)    backdrop = "a scorching Arizona desert at golden hour, dust haze on the horizon, oppressive heat shimmer, the vast emptiness of land fought over and bled for";
+  else if (isWar)  backdrop = "a war-torn landscape, smoke and fire in the distance, bombed-out structures silhouetted against a blood-red sky, the absolute chaos of conflict";
+  else if (isForest) backdrop = "a dense, threatening forest where every shadow hides something sinister, shafts of harsh late-afternoon light cutting through the dark canopy";
+  else if (isCourt) backdrop = "the brutal geometry of a courtroom — cold marble pillars, harsh fluorescent light, the crushing institutional weight of a justice system being tested";
+  else if (isPrison) backdrop = "cold concrete and iron bars, a single harsh overhead light casting deep cell-block shadows, the suffocating walls of wrongful confinement";
+  else if (isCity)  backdrop = "a rain-slicked urban street at night, police lights strobing red and blue on wet asphalt, the anonymous cruelty of a city that doesn't care";
+  else if (isOcean) backdrop = "a storm-lashed coastline at dusk, enormous waves crashing, the sea indifferent and merciless as the horizon disappears into dark clouds";
+  else if (isMountain) backdrop = "a brutal mountain summit wreathed in cloud, biting wind visible in every detail, the sublime indifference of nature to human survival";
 
-  /* ── 6. EMOTIONAL PEAK MOMENT ────────────────────────────────────────── */
-  let peakMoment = "standing defiantly";
-  let facialExpr = "jaw clenched, eyes burning with quiet fury";
+  /* ── 7. EMOTIONAL PEAK MOMENT + EXPRESSION ───────────────────────────── */
+  let peakMoment = "standing defiantly at the point of no return";
+  let facialExpr = "jaw clenched, eyes burning with quiet fury and absolute resolve";
+  let storyDetail = coreConflict ? `The story behind this image: ${coreConflict}.` : "";
+
   if (isRevenge && isBully) {
-    peakMoment = "rising from his knees after being knocked down, pointing a trembling finger directly at his tormentors, the worm finally turning";
-    facialExpr = "face flushed with rage, tears of anger streaming down, nostrils flaring — pure righteous fury";
+    peakMoment = "rising from where they were knocked down — pointing a trembling finger directly at their tormentors, the moment the worm finally turns";
+    facialExpr = "face flushed with rage, tears of anger streaming down cheeks, nostrils flaring — pure righteous fury that has been building for the entire film";
+  } else if (isRevenge && isBetrayal) {
+    peakMoment = "confronting the person who destroyed them — the betrayer frozen in sudden terror as the reckoning they thought they'd escaped arrives";
+    facialExpr = "ice-cold fury beneath a mask of composure — the terrifying calm of someone who planned this moment for a very long time";
   } else if (isRevenge) {
-    peakMoment = "stepping forward into confrontation, shoulders squared, the moment the oppressor finally realizes they went too far";
-    facialExpr = "cold, composed fury — the terrifying calm of someone who has nothing left to lose";
+    peakMoment = "stepping forward into the final confrontation, shoulders squared, the moment the oppressor realizes with absolute certainty they went too far";
+    facialExpr = "cold, composed fury — the terrifying calm of someone who has nothing left to lose and everything to gain";
+  } else if (isEscape) {
+    peakMoment = "frozen mid-flight — caught between the only two options left: run or turn and fight";
+    facialExpr = "raw survival panic barely controlled, adrenaline cracking through every muscle, but a core of steel refusing to let fear win";
   } else if (isBetrayal) {
-    peakMoment = "frozen in the instant of devastating betrayal — staring at someone they trusted, world collapsing";
-    facialExpr = "expression crumpling from disbelief into volcanic rage, eyes glassy with shock";
+    peakMoment = "frozen in the gut-punch instant of devastating betrayal — staring at the person they trusted with everything, their entire world collapsing in real time";
+    facialExpr = "expression shattering from disbelief into volcanic rage — eyes glassy with shock, fists clenching as the grief turns to fury";
+  } else if (isLoss && isSacrifice) {
+    peakMoment = "bearing the unbearable weight of a sacrifice — what they gave up etched into every line of their face, but no regret, only grief";
+    facialExpr = "grief-ravaged face, cheeks streaked with dried tears, the hollow look of someone who paid a price no one should have to pay";
   } else if (isLoss) {
-    peakMoment = "head bowed over a loss that changed everything, fists clenched at their sides in silent anguish";
-    facialExpr = "grief-ravaged face, streaked with tears, yet an ember of defiant resolve underneath";
+    peakMoment = "head bowed over a loss that irrevocably changed everything, fists clenched at their sides in silent, shaking anguish";
+    facialExpr = "grief-ravaged face streaked with tears, yet an ember of defiant resolve glowing underneath the devastation";
   } else if (isStruggle && (isVeteran || isRancher)) {
-    peakMoment = "standing between his land and the men who want to take it, rifle across chest, not moving an inch";
-    facialExpr = "calm, immovable, eyes like flint — a man who has survived worse and will not be moved";
+    peakMoment = "planting his feet on the land between him and the men who came to take it — arms at his sides, not moving an inch, a human immovable object";
+    facialExpr = "eyes like flint, jaw set in absolute refusal — a man who has survived war and hardship and will not be moved by smaller men";
+  } else if (isInjustice && isOfficer) {
+    peakMoment = "holding the evidence that could destroy careers — alone in the spotlight of the truth he uncovered, knowing what it will cost him";
+    facialExpr = "determined beyond fear, eyes clear with moral certainty even as everything closes in around him";
   } else if (isTriumph) {
-    peakMoment = "the moment of vindication — head raised, chest out, the injustice finally exposed";
-    facialExpr = "eyes red-rimmed from the long fight, tears of relief and triumph mixed with fierce pride";
+    peakMoment = "the shattering moment of vindication — head raised, chest forward, years of unjust suffering suddenly behind them and the world finally seeing the truth";
+    facialExpr = "eyes red-rimmed from the long unbearable fight, tears of relief and fierce pride mixed together — the face of someone who refused to stop";
   } else if (isProtect) {
-    peakMoment = "stepping in front of the vulnerable to face the threat, arms spread wide in protection";
-    facialExpr = "face set with fierce protective resolve, fear overridden by love and duty";
+    peakMoment = "stepping between the vulnerable and the threat — arms spread wide, body a shield, choosing this moment without hesitation";
+    facialExpr = "face set with fierce protective resolve, love and duty overriding every instinct for self-preservation";
   }
 
-  /* ── 7. STYLE-SPECIFIC PROMPT ────────────────────────────────────────── */
+  /* ── 8. STYLE-SPECIFIC PROMPT ────────────────────────────────────────── */
   let prompt;
 
   if (style === "bold") {
-    // BOLD: Extreme close-up face, viral YouTube drama energy, red/amber palette
-    // Modeled after highest-CTR YouTube drama/story thumbnails
+    // BOLD: Extreme close-up face, viral YouTube drama energy, red/amber palette.
+    // The hero's face IS the story — every micro-expression carries the core conflict.
     prompt = [
-      `Hyper-realistic cinematic photograph, extreme close-up portrait of ${hero},`,
-      `${peakMoment}.`,
+      `Hyper-realistic cinematic photograph. Extreme close-up portrait of ${hero}.`,
+      `The single most emotionally devastating moment of their story: ${peakMoment}.`,
       `Expression: ${facialExpr}.`,
-      `Shot at eye level with a 50mm lens, shallow depth of field, background softly blurred.`,
-      `Color grade: crushing warm amber-red shadows, fiery highlights, blown-out rim light on one side creating a glowing edge — the look of a viral true-crime or drama YouTube channel thumbnail.`,
-      `Lighting: three-point setup with a hard key light from below-right (like a campfire or interrogation bulb), cool blue fill from the opposite side creating split-face drama, and a blazing rim light.`,
-      `The image should feel like someone pressed PAUSE at the single most jaw-dropping second of a film.`,
-      `Ultra-sharp eyes, micro-details in skin texture, hyperrealistic photography quality, 8K.`,
+      storyDetail,
+      `The face fills 80% of the frame. Shot at eye level with a 50mm lens, razor-thin depth of field — eyes in perfect focus, everything behind falling into painterly blur.`,
+      `Lighting: hard key light from below-right (campfire or bare interrogation bulb), cool blue fill from the opposite side creating split-face drama, blazing rim light outlining the jaw like fire.`,
+      `Color grade: crushing warm amber-red shadows, fiery orange highlights scorching one side of the face, blown-out rim light creating a glowing edge — the unmistakable look of the highest-CTR YouTube drama channels.`,
+      `The viewer should feel like they pressed PAUSE at the single most jaw-dropping second of the film.`,
+      `Ultra-sharp eyes, visible tears or sweat on skin, micro-details in pores and stubble, hyperrealistic photography quality, 8K.`,
       `No text, no captions, no logos, no watermarks. 16:9 aspect ratio.`
-    ].join(" ");
+    ].filter(Boolean).join(" ");
 
   } else {
-    // DRAMATIC: Cinematic wide/medium, Netflix/Prime poster quality, orange-teal grade
+    // DRAMATIC: Cinematic wide/medium, the hero in their story world.
+    // The setting and story context are as important as the face.
     prompt = [
-      `Award-winning cinematic still photograph, ${hero}`,
-      `${peakMoment},`,
+      `Award-winning cinematic still photograph. ${hero} at ${peakMoment},`,
       `set against ${backdrop}.`,
       `Expression: ${facialExpr}.`,
-      `Composed using rule of thirds — the figure is positioned left of center, with negative space on the right conveying isolation and enormity of what they face.`,
-      `Color grade: iconic Hollywood orange-and-teal — warm skin tones glowing against a cold steel-blue environment, creating maximum visual contrast and cinematic depth.`,
-      `Lighting: practical source lighting (harsh desert sun, a single bare bulb, or headlights) with dramatic shadows that carve the subject's face.`,
-      `Shot on an ARRI Alexa at golden hour or magic hour; volumetric light rays, atmospheric dust or mist, film grain.`,
-      `The composition should feel like the defining key art still from a Netflix or Prime Video original film — premium, emotionally devastating, impossible to scroll past.`,
+      storyDetail,
+      `Composition: the hero is positioned using rule of thirds — left of center, with the weight of the world visible in the negative space to their right, conveying the isolation and enormity of what they face.`,
+      `Every visual element reinforces the core story: the environment itself reflects their emotional state — hostile, charged, and impossible to escape.`,
+      `Color grade: iconic Hollywood orange-and-teal — warm skin tones glowing against a cold steel-blue environment, maximum visual contrast and cinematic depth.`,
+      `Lighting: practical source (harsh desert sun, bare bulb, or car headlights) with dramatic shadows carving the subject's face into something unforgettable.`,
+      `Shot on ARRI Alexa at golden hour or magic hour; volumetric light rays, atmospheric dust or mist, subtle film grain.`,
+      `This should feel like the defining key art still from a Netflix or Prime Video original — premium, emotionally devastating, and absolutely impossible to scroll past.`,
       `No text, no captions, no logos. 16:9 aspect ratio, ultra-detailed, photorealistic.`
-    ].join(" ");
+    ].filter(Boolean).join(" ");
   }
 
   return prompt;
@@ -700,60 +715,151 @@ async function generateDalleThumbnail(apiKey, prompt, destPath) {
   return destPath;
 }
 
-/* ---------- POST /jobs/:jobId/ai-thumbnails: extract real movie frame variants */
-// Extracts 3 frames from the rendered recap at different dramatic moments
-// (climax ~65%, midpoint ~45%, early hook ~25%) and applies style-specific
-// cinematic colour grades.  No DALL-E — these are always real movie frames.
+// Build a channel-style DALL-E prompt from the story data.
+// The goal: hyperrealistic YouTube thumbnail showing hero in danger — matching
+// the "Super Short Summary" channel aesthetic (close-up face, tabloid drama).
+function buildChannelDallEPrompt(style, { youtubeTitle, storySummary, movieTitle }) {
+  const title = (youtubeTitle || movieTitle || "a dramatic movie scene").replace(/['"]/g, "");
+  const summary = (storySummary || "").slice(0, 220).replace(/['"]/g, "");
+  const storyCtx = summary
+    ? `Story context: "${summary}". `
+    : "";
+
+  if (style === "dramatic") {
+    return (
+      `${storyCtx}` +
+      `YouTube movie recap thumbnail — tabloid drama style, title: "${title}". ` +
+      `Hyperrealistic cinematic close-up: the PROTAGONIST (the victim or hero from this story) fills most of the frame. ` +
+      `Their face shows raw fear, desperation, or pain — wide eyes, tense jaw, sweat. ` +
+      `A threatening figure or dark force looms behind them or is partially visible at the edge. ` +
+      `Dramatic chiaroscuro: face lit from one side by a harsh amber/orange practical light, ` +
+      `deep black background with cool blue shadows. Shallow depth of field, film grain, ` +
+      `sharp on the eyes. No text. No watermarks. No subtitles. 16:9 aspect ratio.`
+    );
+  }
+  if (style === "bold") {
+    return (
+      `${storyCtx}` +
+      `YouTube thumbnail — high-voltage confrontation scene for: "${title}". ` +
+      `Hyperrealistic film still: the hero faces the antagonist or threat head-on. ` +
+      `Both figures tense, aggressive body language, intense eye contact or a physical clash. ` +
+      `Extreme high-contrast lighting — vivid warm orange side-light on hero, ` +
+      `cold blue/green on the antagonist. Punchy oversaturated colors. ` +
+      `Camera slightly low-angle to emphasise power struggle. No text. No watermarks. 16:9.`
+    );
+  }
+  // cinematic
+  return (
+    `${storyCtx}` +
+    `Widescreen cinematic YouTube thumbnail for: "${title}". ` +
+    `The protagonist stands small against an imposing, dangerous environment or crowd. ` +
+    `Atmospheric: moody blue-grey haze, orange-amber practical lights in background, ` +
+    `Hollywood orange-teal colour grade, heavy film grain, epic scale. ` +
+    `The hero's body language conveys vulnerability or defiance. ` +
+    `Netflix key-art quality. No text. No watermarks. 16:9 aspect ratio.`
+  );
+}
+
+/* ---------- POST /jobs/:jobId/ai-thumbnails: channel-style DALL-E primary -- */
+// Primary: DALL-E gpt-image-1 with story-aware prompts (hero-in-trouble channel style).
+// Fallback: real movie frames from the rendered recap video (scene-detection timing).
 app.post("/jobs/:jobId/ai-thumbnails", requireAuth, async (req, res) => {
   const job = await jobStore.get(req.params.jobId);
   if (!job) return res.status(404).json({ error: "Not found" });
 
-  // Require the rendered output video.
-  const outputVideo = job.outputPath || path.join(OUTPUT_DIR, `recap-${req.params.jobId}.mp4`);
-  try { await fs.stat(outputVideo); } catch {
-    return res.status(404).json({
-      error: "Rendered video not found — complete a server render first, then generate thumbnails.",
-    });
-  }
+  const { analyzeJobId, movieTitle } = req.body || {};
 
-  // Probe video duration so we can pick absolute timestamps.
-  const duration = await new Promise((resolve) => {
-    let out = "";
-    const fp = spawn("ffprobe", [
-      "-v", "error", "-show_entries", "format=duration",
-      "-of", "default=nw=1:nk=1", outputVideo,
-    ], { stdio: ["ignore", "pipe", "ignore"] });
-    fp.stdout.on("data", (c) => { out += c; });
-    fp.on("close", () => resolve(parseFloat(out.trim()) || 60));
-    fp.on("error", () => resolve(60));
-  });
-
-  // Three variants at different narrative moments with distinct grades.
-  const VARIANTS = [
-    { style: "dramatic",  pct: 0.65, label: "Dramatic" },   // climax / Act 3 peak
-    { style: "bold",      pct: 0.45, label: "Bold" },        // midpoint / Act 2 turn
-    { style: "cinematic", pct: 0.25, label: "Cinematic" },   // early hook / inciting incident
-  ];
-
+  const VARIANTS = ["dramatic", "bold", "cinematic"];
   const results = {};
   const errors  = {};
-  await Promise.allSettled(
-    VARIANTS.map(async ({ style, pct }) => {
-      try {
-        const timeSec = Math.max(1, Math.min(duration * pct, duration - 1));
-        const dest = aiThumbPath(req.params.jobId, style);
-        await extractStyledFrame(outputVideo, timeSec, dest, style);
-        results[style] = `/jobs/${req.params.jobId}/ai-thumbnails/${style}`;
-        console.log(`[ai-thumbnails ${req.params.jobId}] ${style} @ ${timeSec.toFixed(1)}s OK`);
-      } catch (e) {
-        errors[style] = String(e?.message || e);
-        console.warn(`[ai-thumbnails ${req.params.jobId}] ${style} failed:`, e?.message || e);
-      }
-    })
-  );
+
+  // ── Resolve story data from the analyze job ───────────────────────────────
+  let storyData = {
+    youtubeTitle: null,
+    storySummary: null,
+    movieTitle: (typeof movieTitle === "string" && movieTitle.trim()) ? movieTitle.trim() : null,
+  };
+  const analyzeJobId_ = analyzeJobId || job.analyzeJobId;
+  if (analyzeJobId_) {
+    const analyzeJob = await jobStore.get(analyzeJobId_).catch(() => null);
+    if (analyzeJob?.result) {
+      storyData.youtubeTitle = analyzeJob.result.youtubeTitle || null;
+      storyData.storySummary = analyzeJob.result.storySummary || null;
+      storyData.movieTitle   = storyData.movieTitle || analyzeJob.result.movieTitle || analyzeJob.result.youtubeTitle || null;
+    }
+  }
+
+  // ── PRIMARY: DALL-E with channel-style story-aware prompts ────────────────
+  if (SERVER_OPENAI_KEY) {
+    await Promise.allSettled(
+      VARIANTS.map(async (style) => {
+        try {
+          const prompt = buildChannelDallEPrompt(style, storyData);
+          const dest = aiThumbPath(req.params.jobId, style);
+          console.log(`[ai-thumbnails ${req.params.jobId}] DALL-E ${style} prompt: ${prompt.slice(0, 120)}…`);
+          await generateDalleThumbnail(SERVER_OPENAI_KEY, prompt, dest);
+          results[style] = `/jobs/${req.params.jobId}/ai-thumbnails/${style}`;
+          console.log(`[ai-thumbnails ${req.params.jobId}] DALL-E ${style} OK`);
+        } catch (e) {
+          errors[style] = String(e?.message || e);
+          console.warn(`[ai-thumbnails ${req.params.jobId}] DALL-E ${style} failed:`, e?.message || e);
+        }
+      })
+    );
+  }
+
+  // ── FALLBACK: real movie frames when DALL-E fails / no key ────────────────
+  const missingStyles = VARIANTS.filter((s) => !results[s]);
+  if (missingStyles.length > 0) {
+    const outputVideo = job.outputPath || path.join(OUTPUT_DIR, `recap-${req.params.jobId}.mp4`);
+    let videoOk = false;
+    try { await fs.stat(outputVideo); videoOk = true; } catch {}
+
+    if (videoOk) {
+      const duration = await new Promise((resolve) => {
+        let out = "";
+        const fp = spawn("ffprobe", [
+          "-v", "error", "-show_entries", "format=duration",
+          "-of", "default=nw=1:nk=1", outputVideo,
+        ], { stdio: ["ignore", "pipe", "ignore"] });
+        fp.stdout.on("data", (c) => { out += c; });
+        fp.on("close", () => resolve(parseFloat(out.trim()) || 60));
+        fp.on("error", () => resolve(60));
+      });
+
+      const sceneTs = await findSceneChangeTimestamps(outputVideo, duration);
+      const TARGET_REGIONS = {
+        dramatic:  { lo: 0.55, hi: 0.80, fallback: 0.68 },
+        bold:      { lo: 0.35, hi: 0.55, fallback: 0.45 },
+        cinematic: { lo: 0.15, hi: 0.35, fallback: 0.25 },
+      };
+      const pickTimestamp = (style) => {
+        const { lo, hi, fallback } = TARGET_REGIONS[style];
+        const inRegion = sceneTs.filter((t) => t >= duration * lo && t <= duration * hi);
+        if (inRegion.length > 0) {
+          const center = duration * ((lo + hi) / 2);
+          return inRegion.reduce((a, b) => Math.abs(b - center) < Math.abs(a - center) ? b : a);
+        }
+        return Math.max(1, Math.min(duration * fallback, duration - 1));
+      };
+      await Promise.allSettled(
+        missingStyles.map(async (style) => {
+          try {
+            const timeSec = pickTimestamp(style);
+            const dest = aiThumbPath(req.params.jobId, style);
+            await extractStyledFrame(outputVideo, timeSec, dest, style);
+            results[style] = `/jobs/${req.params.jobId}/ai-thumbnails/${style}`;
+            console.log(`[ai-thumbnails ${req.params.jobId}] frame-fallback ${style} @ ${timeSec.toFixed(1)}s OK`);
+          } catch (e) {
+            errors[style] = (errors[style] ? errors[style] + " | " : "") + String(e?.message || e);
+          }
+        })
+      );
+    }
+  }
 
   if (Object.keys(results).length === 0) {
-    return res.status(502).json({ error: "All frame extractions failed", details: errors });
+    return res.status(502).json({ error: "All thumbnail variants failed", details: errors });
   }
   const thumbPaths = {};
   for (const [style] of Object.entries(results)) {
@@ -772,6 +878,129 @@ app.get("/jobs/:jobId/ai-thumbnails/:style", requireAuth, async (req, res) => {
   res.setHeader("Content-Type", "image/jpeg");
   res.setHeader("Cache-Control", "private, max-age=86400");
   createReadStream(thumbPath).pipe(res);
+});
+
+/* ---------- helper: assemble SuperShortSummary description template ------- */
+/* ---------- Fixed channel tags sent on every upload ----------------------- */
+const MASTER_TAGS = [
+  "Story Summary", "Film Summary", "movie recap", "movie recaps", "movie summary",
+  "movie recapped", "recapped", "minute movies", "full movie", "motivational movies",
+  "storytime", "story time", "film explained", "movie explained",
+  "TheCutFrame", "mrrecapfromyoutube", "mr recap from youtube",
+  "story recapped", "film recaps", "flick out", "movies in short", "mr recapp",
+  "movies in minutes", "recap junction",
+];
+
+function buildSSSDescription({ movieTitle, storySummary, cast, directorWriter, chapters }) {
+  const castLines = Array.isArray(cast) && cast.length
+    ? cast.map(String).join("\n")
+    : "[Cast]";
+  const chapterLines = Array.isArray(chapters) && chapters.length
+    ? chapters.map(String).join("\n")
+    : "0:00 Opening";
+  const dirLine = typeof directorWriter === "string" && directorWriter.trim()
+    ? directorWriter.trim()
+    : "[Director]";
+  const titleLine = typeof movieTitle === "string" && movieTitle.trim()
+    ? movieTitle.trim()
+    : "[Movie Title]";
+  const summaryText = typeof storySummary === "string" && storySummary.trim()
+    ? storySummary.trim()
+    : "";
+
+  return [
+    `Hey there! I'm SuperShortSummary! Today, I'm gonna recap the movie, ${titleLine}.`,
+    "",
+    "Become a channel supporter and unlock exclusive bonuses. Read more: /@SuperShortSummary",
+    "",
+    summaryText,
+    "",
+    "Hey! Welcome to my channel SuperShortSummary, where you'll find fast-paced, carefully written recaps of the most intense and gripping films. I'm a fellow movie fan, and I bring you top picks in short, thrilling summaries.",
+    "",
+    "Cast:",
+    castLines,
+    "",
+    "Director & Writer:",
+    dirLine,
+    "",
+    "📍 Chapters",
+    chapterLines,
+    "",
+    "___________________________",
+    "",
+    "Here you can find: movie recaps, story recaps, thriller recaps, action movie summaries, film explained, movie highlights, story recap, movie summary, movie on, mrrecapfromyoutube, Mr recapp. TheCutFrame, Movies in short",
+    "",
+    "#movierecap\n#storyrecapped\n#movierecaps",
+  ].join("\n");
+}
+
+/* ---------- POST /jobs/:jobId/regenerate-youtube-meta -------------------- */
+// Re-calls Claude Haiku with the stored beats to produce a fresh title/description/tags.
+app.post("/jobs/:jobId/regenerate-youtube-meta", requireAuth, async (req, res) => {
+  const job = await jobStore.get(req.params.jobId);
+  if (!job) return res.status(404).json({ error: "Not found" });
+  const beats = job.result?.beats || [];
+  if (beats.length < 3) return res.status(409).json({ error: "Not enough story beats — run analysis first" });
+  if (!SERVER_ANTHROPIC_KEY) return res.status(400).json({ error: "No Claude API key on server" });
+  try {
+    const beatSummary = beats
+      .slice(0, 30)
+      .map((b, i) => `${i + 1}. ${String(b.narration || b.reason || "").trim().slice(0, 120)}`)
+      .join("\n");
+    const _beatCount = Math.min(beats.length, 30);
+    const _estMins = Math.max(4, Math.round(_beatCount * 0.5));
+    const ytPrompt =
+`You generate YouTube metadata for the channel "SuperShortSummary". Use ONLY the story beats below — do NOT add invented information.
+
+Story beats (${_beatCount} total, estimated video length: ${_estMins}–${_estMins + 2} minutes):
+${beatSummary}
+
+Return valid JSON ONLY — no prose, no markdown fences:
+{
+  "youtubeTitle": "<max 60 chars — TABLOID SHOCK HOOK. Two patterns: (A) VILLAIN/THREAT + brutal verb + innocent victim — e.g. 'Thugs Brutally Kill an Ordinary Clerk\\'s Son', 'Gang Forces an Innocent Girl to Choose Death', 'Racist Bullies Target the Wrong Quiet Old Man', 'Corrupt Cops Frame a Helpless Man for Murder'. (B) ALL-CAPS flaw/emotion + person + self-destructive action — e.g. 'OBSESSED Man Ruins His Body and Family', 'DESPERATE Father Crosses Every Line to Save His Son'. STRONG VERBS: Kill, Murder, Destroy, Betray, Hunt, Ruin, Beat, Force, Crush, Frame, Torture. VICTIM ADJECTIVES: Ordinary, Innocent, Helpless, Quiet, Simple, Poor. NEVER use: recap, review, analysis, breakdown, explained. NEVER reveal who wins or the ending.>",
+  "movieTitle": "<full movie name and year, e.g. Magazine Dreams (2023). Infer from the story content. If unknown write 'Unknown Movie'>",
+  "storySummary": "<2–3 sentences. Introduce the hero and their world, the conflict that shatters it, and the impossible stakes. Storytelling voice — NOT a review. Do NOT mention 'this video' or 'this recap'.>",
+  "cast": ["<Actor Name (as Character Name)>", "<Actor Name>"],
+  "directorWriter": "<Director full name>",
+  "chapters": ["0:00 <Chapter 1 title>", "<M:SS> <Chapter 2 title>", "<M:SS> <Chapter 3 title>", "<M:SS> <Chapter 4 title>", "<M:SS> <Chapter 5 title>", "<M:SS> <Chapter 6 title>"],
+  "movieTags": ["<6–10 movie-specific tags only — actor names, character names, director name, movie title words, genre, mood. Examples: 'Jonathan Majors', 'Killian Maddox', 'bodybuilding', 'Elijah Bynum', 'Magazine Dreams'. Lowercase. No # prefix.>"]
+}
+
+For cast and directorWriter: use your training knowledge of the movie. If unknown, write an empty array / empty string.
+Timestamps in chapters must be evenly spaced across the ${_estMins}-minute estimated duration.`;
+    const ytRes = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-api-key": SERVER_ANTHROPIC_KEY, "anthropic-version": "2023-06-01" },
+      body: JSON.stringify({ model: "claude-haiku-4-5", max_tokens: 1400, messages: [{ role: "user", content: ytPrompt }] }),
+      signal: AbortSignal.timeout(25_000),
+    });
+    const ytData = await ytRes.json();
+    const ytRaw = ytData?.content?.[0]?.text?.trim() || null;
+    if (!ytRaw) throw new Error("Empty response from Claude");
+    const fence = ytRaw.match(/```(?:json)?\s*([\s\S]+?)```/);
+    const src = fence ? fence[1].trim() : ytRaw;
+    const yt = JSON.parse(src);
+    const assembledDescription = buildSSSDescription({
+      movieTitle: yt.movieTitle,
+      storySummary: yt.storySummary,
+      cast: yt.cast,
+      directorWriter: yt.directorWriter,
+      chapters: yt.chapters,
+    });
+    const movieTags = Array.isArray(yt.movieTags) ? yt.movieTags.map(String).slice(0, 15) : [];
+    const result = {
+      youtubeTitle: typeof yt.youtubeTitle === "string" ? yt.youtubeTitle.trim().slice(0, 100) : undefined,
+      youtubeDescription: assembledDescription,
+      masterTags: MASTER_TAGS,
+      movieTags,
+      youtubeTags: [...MASTER_TAGS, ...movieTags],
+    };
+    console.log(`[regen-yt-meta ${req.params.jobId}] "${result.youtubeTitle}" | movie: ${yt.movieTitle} | movieTags: ${movieTags.length}`);
+    res.json(result);
+  } catch (err) {
+    console.error(`[regen-yt-meta ${req.params.jobId}]`, err?.message || err);
+    res.status(502).json({ error: String(err?.message || err) });
+  }
 });
 
 /* ---------- /music/:mood.mp3: stream a built-in royalty-free mood bed ---------- */
@@ -1548,7 +1777,7 @@ app.post("/analyze", requireAuth, async (req, res) => {
           const allJobs = await jobStore.list();
           const prev = allJobs
             .filter((j) => j.id !== jobId && j.kind === "analyze" && j.status === "done" &&
-              (j.sourceFileId === sourceFileId || j.result?.sourceFileId === sourceFileId) &&
+              (j.sourceFileId === fileId || j.result?.sourceFileId === fileId) &&
               j.result?.beats?.length > 0)
             .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0))[0];
           if (prev) {
@@ -1685,7 +1914,7 @@ app.post("/analyze", requireAuth, async (req, res) => {
           apiKey: claudeApiKey,
           model: claudeModel,
           movie: { ...movie, durationSec: effectiveDuration },
-          channelName: channelName || process.env.DEFAULT_CHANNEL_NAME || "Super Short Summary",
+          channelName: channelName || "Plotline Panic",
           scenes: scenesB64,
           segments: transcriptSegments,
           transcriptBlock,
@@ -1694,11 +1923,6 @@ app.post("/analyze", requireAuth, async (req, res) => {
         });
         await jobStore.update(jobId, { progress: 90, message: `Scene analysis complete (${scenes.length} scenes, ${parsed.characters?.length || 0} characters)` });
       } catch (sceneErr) {
-        const sceneErrMsg = String(sceneErr?.message || sceneErr);
-        if (/Claude\s+529|overloaded|rate.?limit|temporarily/i.test(sceneErrMsg)) {
-          console.error(`[analyze ${jobId}] scene analysis failed after retries — refusing weak fallback:`, sceneErr);
-          throw new Error(`Claude overloaded during scene-aware analysis after retries. Please rerun Analyze; render requires beats.`);
-        }
         console.error(`[analyze ${jobId}] scene analysis failed, falling back to fixed frames:`, sceneErr);
         await jobStore.update(jobId, { progress: 50, message: `Scene mode unavailable (${String(sceneErr.message || sceneErr).slice(0, 60)}); using frames` });
         const targetFrames = Math.max(8, Math.min(140, Number(frameBudget) || 60));
@@ -1711,17 +1935,13 @@ app.post("/analyze", requireAuth, async (req, res) => {
           model: claudeModel,
           frames: withBase64,
           movie: { ...movie, durationSec: duration },
-          channelName: channelName || process.env.DEFAULT_CHANNEL_NAME || "Super Short Summary",
+          channelName: channelName || "Plotline Panic",
           maxClipSeconds: maxClipSeconds,
           targetClipCount: effectiveTargetClipCount,
           transcriptBlock,
         });
         await jobStore.update(jobId, { progress: 90, message: "Parsing response" });
       }
-      if (!Array.isArray(parsed?.beats) || parsed.beats.length === 0) {
-        throw new Error("Analysis incomplete: no beat-level narration was generated. Please rerun Analyze; render requires beats.");
-      }
-
       // Defensive clamp: enforce max clip duration even if Claude ignored it.
       if (Number.isFinite(maxClipSeconds) && maxClipSeconds > 0) {
         const before = parsed.timestamps.length;
@@ -1798,7 +2018,7 @@ No prose, no markdown, no other keys.`;
             const _hr = await fetch("https://api.openai.com/v1/chat/completions", {
               method: "POST",
               headers: { "Content-Type": "application/json", Authorization: `Bearer ${openaiApiKey}` },
-              body: JSON.stringify({ model: "gpt-4o-mini", max_tokens: 700,
+              body: JSON.stringify({ model: "gpt-4o-mini", max_tokens: 300,
                 messages: [{ role: "user", content: _hookPrompt }] }),
               signal: AbortSignal.timeout(25_000),
             });
@@ -1844,6 +2064,79 @@ No prose, no markdown, no other keys.`;
       }
       // ── END HOOK GENERATION ──────────────────────────────────────────────────
 
+      // ── YOUTUBE METADATA GENERATION ─────────────────────────────────────────
+      // Claude Haiku generates story-based title, description, and tags.
+      // Title style: tabloid/narrative hook — "A Bullied Boy's Brutal Revenge"
+      // NOT "Movie Recap" or the film's own title.
+      let _ytTitle = null, _ytDescription = null, _ytTags = null, _ytMovieTitle = null;
+      if (_hookBeats.length >= 3 && claudeApiKey) {
+        try {
+          const _beatSummary = _hookBeats
+            .slice(0, 30)
+            .map((b, i) => `${i + 1}. ${String(b.narration || b.reason || "").trim().slice(0, 120)}`)
+            .join("\n");
+          const _beatCount2 = Math.min(_hookBeats.length, 30);
+          const _estMins2 = Math.max(4, Math.round(_beatCount2 * 0.5));
+
+          const _ytPrompt =
+`You generate YouTube metadata for the channel "SuperShortSummary". Use ONLY the story beats below — do NOT add invented information.
+
+Story beats (${_beatCount2} total, estimated video length: ${_estMins2}–${_estMins2 + 2} minutes):
+${_beatSummary}
+
+Return valid JSON ONLY — no prose, no markdown fences:
+{
+  "youtubeTitle": "<max 60 chars — TABLOID SHOCK HOOK. Two patterns: (A) VILLAIN/THREAT + brutal verb + innocent victim — e.g. 'Thugs Brutally Kill an Ordinary Clerk\\'s Son', 'Gang Forces an Innocent Girl to Choose Death', 'Racist Bullies Target the Wrong Quiet Old Man', 'Corrupt Cops Frame a Helpless Man for Murder'. (B) ALL-CAPS flaw/emotion + person + self-destructive action — e.g. 'OBSESSED Man Ruins His Body and Family', 'DESPERATE Father Crosses Every Line to Save His Son'. STRONG VERBS: Kill, Murder, Destroy, Betray, Hunt, Ruin, Beat, Force, Crush, Frame, Torture. VICTIM ADJECTIVES: Ordinary, Innocent, Helpless, Quiet, Simple, Poor. NEVER use: recap, review, analysis, breakdown, explained. NEVER reveal who wins or the ending.>",
+  "movieTitle": "<full movie name and year, e.g. Magazine Dreams (2023). Infer from the story content. If unknown write 'Unknown Movie'>",
+  "storySummary": "<2–3 sentences. Introduce the hero and their world, the conflict that shatters it, and the impossible stakes. Storytelling voice — NOT a review. Do NOT mention 'this video' or 'this recap'.>",
+  "cast": ["<Actor Name (as Character Name)>", "<Actor Name>"],
+  "directorWriter": "<Director full name>",
+  "chapters": ["0:00 <Chapter 1 title>", "<M:SS> <Chapter 2 title>", "<M:SS> <Chapter 3 title>", "<M:SS> <Chapter 4 title>", "<M:SS> <Chapter 5 title>", "<M:SS> <Chapter 6 title>"],
+  "movieTags": ["<6–10 movie-specific tags only — actor names, character names, director name, movie title words, genre, mood. Lowercase. No # prefix.>"]
+}
+
+For cast and directorWriter: use your training knowledge of the movie. If unknown, write an empty array / empty string.
+Timestamps in chapters must be evenly spaced across the ${_estMins2}-minute estimated duration.`;
+
+          const _ytRes = await fetch("https://api.anthropic.com/v1/messages", {
+            method: "POST",
+            headers: { "Content-Type": "application/json",
+              "x-api-key": claudeApiKey, "anthropic-version": "2023-06-01" },
+            body: JSON.stringify({ model: "claude-haiku-4-5", max_tokens: 1400,
+              messages: [{ role: "user", content: _ytPrompt }] }),
+            signal: AbortSignal.timeout(25_000),
+          });
+          const _ytData = await _ytRes.json();
+          const _ytRaw = _ytData?.content?.[0]?.text?.trim() || null;
+          if (_ytRaw) {
+            const _fence = _ytRaw.match(/```(?:json)?\s*([\s\S]+?)```/);
+            const _src = _fence ? _fence[1].trim() : _ytRaw;
+            const _yt = JSON.parse(_src);
+            if (typeof _yt?.youtubeTitle === "string" && _yt.youtubeTitle.trim()) {
+              _ytTitle = _yt.youtubeTitle.trim().slice(0, 100);
+            }
+            if (typeof _yt?.movieTitle === "string" && _yt.movieTitle.trim()) {
+              _ytMovieTitle = _yt.movieTitle.trim();
+            }
+            _ytDescription = buildSSSDescription({
+              movieTitle: _yt.movieTitle,
+              storySummary: _yt.storySummary,
+              cast: _yt.cast,
+              directorWriter: _yt.directorWriter,
+              chapters: _yt.chapters,
+            });
+            const _movieTags = Array.isArray(_yt?.movieTags) ? _yt.movieTags.map(String).slice(0, 15) : [];
+            _ytTags = [...MASTER_TAGS, ..._movieTags];
+          }
+          if (_ytTitle) {
+            console.log(`[analyze ${jobId}] YT metadata: "${_ytTitle}" | ${(_ytTags || []).length} tags`);
+          }
+        } catch (ytErr) {
+          console.warn(`[analyze ${jobId}] YouTube metadata skipped (non-fatal):`, ytErr?.message || ytErr);
+        }
+      }
+      // ── END YOUTUBE METADATA GENERATION ─────────────────────────────────────
+
       await jobStore.update(jobId, {
         status: "done",
         progress: 100,
@@ -1852,6 +2145,10 @@ No prose, no markdown, no other keys.`;
           duration, sourceFileId: fileId, ...parsed,
           ...(_hookText ? { hookText: _hookText } : {}),
           ...(_hookSceneIds && _hookSceneIds.length > 0 ? { hookSceneIds: _hookSceneIds } : {}),
+          ...(_ytTitle ? { youtubeTitle: _ytTitle } : {}),
+          ...(_ytMovieTitle ? { movieTitle: _ytMovieTitle } : {}),
+          ...(_ytDescription ? { youtubeDescription: _ytDescription } : {}),
+          ...(_ytTags && _ytTags.length > 0 ? { youtubeTags: _ytTags } : {}),
         },
       });
     } catch (err) {
@@ -1877,7 +2174,6 @@ app.post("/render-from-ingest", requireAuth, async (req, res) => {
     beats,               // v2.2 — Option B: [{ startSec, endSec, narration, mood }] in narration order
     sceneAdaptiveMusic,  // v2.2 — when true + beats present, switch music mood per scene span
     analyzeJobId,        // v2.7 — ID of the analyze job whose frames CLIP should search
-    targetMinutes,       // user-selected recap length (minutes)
     settings,
   } = req.body || {};
   if (!fileId) return res.status(400).json({ error: "fileId required" });
@@ -1936,7 +2232,6 @@ app.post("/render-from-ingest", requireAuth, async (req, res) => {
     beats: Array.isArray(beats) ? beats : null,
     sceneAdaptiveMusic: sceneAdaptiveMusic !== false, // default ON when beats present
     analyzeJobId: typeof analyzeJobId === "string" && analyzeJobId.trim() ? analyzeJobId.trim() : null,
-    targetMinutes: Number(targetMinutes) || Number(normalised?.targetMinutes) || 20,
     settings: normalised,
   })).catch(() => {});
 
@@ -2094,20 +2389,9 @@ app.post("/upload/movie/:uploadId/complete", requireAuth, async (req, res) => {
 });
 
 app.post("/render", requireAuth, async (req, res) => {
-  const { clipFileIds, voiceoverFileId, fileId, timestamps } = req.body || {};
-
-  if (fileId && Array.isArray(timestamps) && timestamps.length > 0) {
-    return res.status(400).json({
-      error: "Use POST /render-from-ingest for synced renders (fileId + timestamps detected in /render body).",
-      useEndpoint: "/render-from-ingest",
-    });
-  }
-
+  const { clipFileIds, voiceoverFileId, settings } = req.body || {};
   if (!Array.isArray(clipFileIds) || clipFileIds.length === 0) {
-    return res.status(400).json({
-      error: "clipFileIds is required. Legacy /render cannot per-segment sync — use POST /render-from-ingest with analyze beats.",
-      syncRequired: true,
-    });
+    return res.status(400).json({ error: "clipFileIds is required" });
   }
   // Validate that each file actually exists in uploads/
   for (const id of clipFileIds) {
@@ -3461,14 +3745,7 @@ async function runRenderFromIngest(jobId, {
   settings,
 }) {
   await jobStore.update(jobId, { status: "running", progress: 5, message: "Preparing timeline" });
-  const sourceFileId = path.basename(sourcePath);
-  let sourceTranscriptSegments = [];
-  try {
-    const tr = JSON.parse(await fs.readFile(path.join(UPLOADS_DIR, `transcript-${sourceFileId}.json`), "utf8"));
-    sourceTranscriptSegments = Array.isArray(tr?.segments) ? tr.segments : [];
-    if (sourceTranscriptSegments.length) console.log(`[render ${jobId}] WHISPER: loaded ${sourceTranscriptSegments.length} source transcript segments`);
-  } catch {}
-  let _analyzeJobId = passedAnalyzeJobId || null; // set when beats are auto-loaded; used for CLIP matching
+  let _analyzeJobId = null; // set when beats are auto-loaded; used for CLIP matching
   const HOOK_V2 = true;            // Hook V2: beat-based hook, no scene-detector dependency
   let subtitlesPath    = null;     // path of written .srt file — cleared if subtitle burn runs
   let _hookText        = null;     // hook narration text
@@ -3481,9 +3758,6 @@ async function runRenderFromIngest(jobId, {
   let _scenesMap    = null;
   let _hookTtsId       = null;
   let _hookFinalDurSec = 0;
-  let _preTrimBeats    = [];      // full post-normalisation beat list; hook uses this after body trim
-  const COPYRIGHT_SAFE_MODE = String(process.env.COPYRIGHT_SAFE_MODE || "true").toLowerCase() !== "false";
-  const _watermarkText = String(process.env.WATERMARK_TEXT || process.env.DEFAULT_CHANNEL_NAME || "Super Short Summary").replace(/'/g, "\\'").slice(0, 40);
 
   // When the app sends beats directly (bypass path) AND tells us which analyze job
   // produced them, prime CLIP matching now so semantic frame search can run.
@@ -3491,35 +3765,6 @@ async function runRenderFromIngest(jobId, {
   if (passedAnalyzeJobId && Array.isArray(beats) && beats.length > 0) {
     _analyzeJobId = passedAnalyzeJobId;
     console.log(`[render ${jobId}] CLIP primed from app-supplied analyzeJobId: ${passedAnalyzeJobId}`);
-  }
-
-  // Auto-resolve analyzeJobId for CLIP + beat auto-load when the app omits it.
-  if (!_analyzeJobId) {
-    try {
-      const allJobsForAnalyze = await jobStore.list();
-      const latestAnalyze = allJobsForAnalyze
-        .filter((j) => j.kind === "analyze" && j.status === "done" &&
-          (j.sourceFileId === sourceFileId || j.result?.sourceFileId === sourceFileId) &&
-          Array.isArray(j.result?.beats) && j.result.beats.length > 0)
-        .sort((a, b) => (b.completedAt || b.createdAt || 0) - (a.completedAt || a.createdAt || 0))[0];
-      if (latestAnalyze) {
-        _analyzeJobId = latestAnalyze.id;
-        console.log(`[render ${jobId}] analyzeJobId auto-resolved: ${_analyzeJobId}`);
-      }
-    } catch (e) {
-      console.warn(`[render ${jobId}] analyzeJobId auto-resolve failed:`, e?.message || e);
-    }
-  }
-
-  // When beats missing but analyze exists, preload beats before corrupt-timestamp logic.
-  if ((!Array.isArray(beats) || beats.length === 0) && _analyzeJobId) {
-    try {
-      const aj = await jobStore.get(_analyzeJobId);
-      if (aj?.result?.beats?.length) {
-        beats = aj.result.beats;
-        console.log(`[render ${jobId}] preloaded ${beats.length} beats from analyzeJobId ${_analyzeJobId}`);
-      }
-    } catch {}
   }
 
   // ── CORRUPT TIMESTAMP DETECTION: if the app sends timestamps where >50% are
@@ -3590,19 +3835,6 @@ async function runRenderFromIngest(jobId, {
         message: `Scene lookup failed: ${String(autoErr?.message || autoErr).slice(0, 80)}`,
       });
     }
-  }
-
-  if ((!Array.isArray(beats) || beats.length === 0) && voiceoverFileIds.length === 0) {
-    const msg = "Analysis incomplete: no beat-level narration found for this movie. Rerun Analyze before rendering.";
-    console.error(`[render ${jobId}] ${msg}`);
-    await jobStore.update(jobId, {
-      status: "failed",
-      progress: 100,
-      message: msg,
-      error: msg,
-      completedAt: Date.now(),
-    });
-    return;
   }
 
   // ── PRE-SYNC: redistribute zero-origin timestamps and activate audioSeconds
@@ -3907,7 +4139,7 @@ async function runRenderFromIngest(jobId, {
     // Compute beat target from user-selected duration (passed as targetMinutes).
     // Average TTS per beat ≈ 15s empirically; clamp between 40 and 120 beats.
     // Save full beat list before trimming — hook footage lookup needs all scene indices.
-    _preTrimBeats = beats.slice();
+    const _preTrimBeats = beats.slice();
     {
       const AVG_BEAT_SEC  = 15;
       const BEATS_TARGET  = Math.max(40, Math.min(120, Math.round((+targetMinutes || 20) * 60 / AVG_BEAT_SEC)));
@@ -3926,13 +4158,13 @@ async function runRenderFromIngest(jobId, {
         //   regardless of where Claude assigned high importance scores.
         const bucketSize = original.length / BEATS_TARGET;
         const seenRefs   = new Set();
-        const _isProtectedBeat = isProtectedBeatForVisual;
-        const protectedBeats = original.filter(_isProtectedBeat);
         const kept = Array.from({ length: BEATS_TARGET }, (_, b) => {
           const start  = Math.floor(b * bucketSize);
           const end    = Math.min(Math.ceil((b + 1) * bucketSize), original.length);
           const bucket = original.slice(start, end);
           if (bucket.length === 0) return null;
+          // Within each bucket prefer the beat with the highest importance score.
+          // Falls back to the first beat in the bucket when no scores are present.
           const best = bucket.reduce((top, beat) =>
             +(beat.importance || 0) >= +(top.importance || 0) ? beat : top
           );
@@ -3940,13 +4172,6 @@ async function runRenderFromIngest(jobId, {
           seenRefs.add(best);
           return best;
         }).filter(Boolean);
-        for (const pb of protectedBeats) {
-          if (!kept.includes(pb) && kept.length < BEATS_TARGET + 8) {
-            kept.push(pb);
-            console.log(`[render ${jobId}] BEAT-TRIM: protected key scene kept (${String(pb.narration||"").slice(0,40)}…)`);
-          }
-        }
-        kept.sort((a, b) => Number(a.startSec) - Number(b.startSec));
 
         console.log(`[render ${jobId}] BEAT-TRIM: ${original.length}→${kept.length} beats (target=${BEATS_TARGET} for ${+targetMinutes || 20}min, stratified)`);
         beats = kept;
@@ -3963,21 +4188,12 @@ async function runRenderFromIngest(jobId, {
     if (HOOK_V2 && Array.isArray(beats) && beats.length >= 5 && (SERVER_ANTHROPIC_KEY || SERVER_OPENAI_KEY)) {
       try {
         // Step 1: score each beat
-        const _hookIntroFloor = 120; // match body intro-skip — never hook with credits/logos
         const _hv2Scored = beats.map((b, i) => {
           const imp = +(b.importance    || 0);
           const emo = +(b.emotionScore  || imp);
           const sur = +(b.surpriseScore || imp);
-          const start = Number(b.startSec) || 0;
-          const txt = String(b.narration || b.reason || "").toLowerCase();
-          if (start < _hookIntroFloor) return { _idx: i, hookScore: -1, startSec: start };
-          let keywordBoost = 0;
-          if (/shot|blood|dies|death|killer|murder|gun|funeral|grave|hospital|crash|betray|revenge|loses|taken|custody/i.test(txt)) keywordBoost += 8;
-          if (/fight|brawl|knockout|champion|final round|low blow|uppercut|escobar|climax/i.test(txt)) keywordBoost += 5;
-          if (/wife|daughter|maureen|leila|leyla|cry|grief|love|family/i.test(txt)) keywordBoost += 4;
-          if (/deal|contract|manager|business|pool|speech|press conference|paperwork/i.test(txt)) keywordBoost -= 5;
-          return { _idx: i, hookScore: imp * 0.50 + emo * 0.25 + sur * 0.25 + keywordBoost, startSec: start };
-        }).filter((x) => x.hookScore >= 0);
+          return { _idx: i, hookScore: imp * 0.60 + emo * 0.30 + sur * 0.10 };
+        });
 
         // Step 2: top 8 by hookScore, restore chronological order.
         // FIX: Beats sent from the app often lack importance/emotionScore/surpriseScore
@@ -4019,24 +4235,17 @@ async function runRenderFromIngest(jobId, {
           .join("\n");
 
         const _hv2Prompt =
-`You write a high-retention YouTube movie recap hook (55-75 words, ~22-30s narration time).
+`You write YouTube movie recap hooks (max 60 words, ~20s narration time).
 
-Selected high-impact story beats:
+Selected story beats:
 ${_hv2Lines}
 
-HOOK GOAL:
-Create a shocking, emotional, action-driven opening that makes viewers NEED to know what happened next.
-
-RULES — follow ALL:
+RULES:
 • Use ONLY the beats above. Never invent events not present here.
-• Prioritize SURPRISE, SHOCK, EMOTION, DANGER, REVENGE, FAMILY LOSS, BETRAYAL, or ACTION.
-• Start with the most dramatic situation, not ordinary setup or business context.
-• Short sentences. Present tense. Fast pacing. No generic phrases like "this movie" or "our hero".
-• Do NOT reveal the final ending, final winner, final twist, or resolution.
-• Create an unanswered question by the final third of the hook.
-• End with exactly one transition line: "To understand how it got this far, we have to go back to the beginning."
-• Pick sourceBeatIds ONLY from beats whose footage directly supports the hook visuals.
-• The visual hook should include 3-6 short clips covering the shock/action/emotion you mention.
+• Never reveal the ending, killer identity, final twist, or who survives.
+• Immediately grab attention. Short sentences. High tension. Present tense.
+• Create curiosity and an unanswered question.
+• End with one transition line like "Let's go back to the beginning."
 
 Return JSON only, no markdown:
 {"hookText":"...","sourceBeatIds":[beatId1,beatId2,...]}
@@ -4049,7 +4258,7 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
             method: "POST",
             headers: { "Content-Type": "application/json",
               "x-api-key": SERVER_ANTHROPIC_KEY, "anthropic-version": "2023-06-01" },
-            body: JSON.stringify({ model: SERVER_ANTHROPIC_MODEL || "claude-opus-4-5", max_tokens: 700,
+            body: JSON.stringify({ model: SERVER_ANTHROPIC_MODEL || "claude-haiku-4-5", max_tokens: 300,
               messages: [{ role: "user", content: _hv2Prompt }] }),
             signal: AbortSignal.timeout(25_000),
           });
@@ -4109,13 +4318,9 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
           ) / beats.length
         : 0;
       console.log(`[render ${jobId}] PER-BEAT TTS gate: avgWords=${_avgWords.toFixed(1)}, voiceFiles=${voiceoverFileIds.length}, beats=${beats.length}, keySet=${!!(SERVER_SPEECHIFY_KEY || SERVER_OPENAI_KEY)}`);
-      const _needsPerBeatTts = beats.length > 0 && (
-        voiceoverFileIds.length === 0 ||
-        voiceoverFileIds.length === 1 ||
-        voiceoverFileIds.length !== beats.length
-      );
       if (
-        _needsPerBeatTts &&
+        voiceoverFileIds.length !== beats.length &&
+        beats.length > 0 &&
         _avgWords >= 3 &&
         (SERVER_SPEECHIFY_KEY || SERVER_OPENAI_KEY || SERVER_ELEVENLABS_KEY || SERVER_HUME_KEY)
       ) {
@@ -4142,7 +4347,7 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
           _ttsProvider === "openai"     ? "onyx" :
           SERVER_SPEECHIFY_VOICE
         );
-        const _ttsSpeed = (settings && settings.ttsSpeed) || Number(process.env.TTS_SPEED || 0.95);
+        const _ttsSpeed = (settings && settings.ttsSpeed) || 1.0;
         console.log(
           `[render ${jobId}] PER-BEAT TTS: generating ${beats.length} clips ` +
           `(provider=${_ttsProvider} voice=${_ttsVoice} speed=${_ttsSpeed} avgNarrWords=${_avgWords.toFixed(1)})`
@@ -4197,7 +4402,7 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
     let safeCeiling = 0;
 
     try {
-      let voDurs = await Promise.all(
+      const voDurs = await Promise.all(
         voiceoverFileIds.map((id) => probeDurationSec(path.join(UPLOADS_DIR, id)).catch(() => 0)),
       );
       voiceTotalPre = voDurs.reduce((a, b) => a + (Number(b) || 0), 0);
@@ -4276,11 +4481,7 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
         // ── END WINDOW ADEQUACY EXPANSION ─────────────────────────────────────
 
         let scenes = beats.map((b) => ({ startSec: Number(b.startSec), endSec: Number(b.endSec), reason: b.reason || b.narration || "" }));
-        let beatTexts = beats.map((b) => (typeof b.narration === "string" ? b.narration : ""));
-        const protectedVisualBeats = beats.map(isProtectedBeatForVisual);
-        const originalBeatScenes = scenes.map((sc) => ({ ...sc, label: "analyze" }));
-        const transcriptCandidateScenes = beatTexts.map((txt) => findTranscriptCandidateForBeat(txt, sourceTranscriptSegments, srcDur));
-        let siglipCandidateScenes = new Array(scenes.length).fill(null);
+        const beatTexts = beats.map((b) => (typeof b.narration === "string" ? b.narration : ""));
 
         // ── CLIP SEMANTIC MATCHING (best-effort, falls back to time windows) ────
         // When the CLIP sidecar has embeddings for this analyze job, replace each
@@ -4328,8 +4529,6 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
             }
 
             if (frameFiles.length > 0) {
-              let srcDurClip = 0;
-              try { srcDurClip = await probeDurationSec(sourcePath); } catch {}
               // Use clip-metadata.json written by analyze step for correct per-scene
               // timestamps. Fallback: even-spaced reconstruction (inaccurate for the
               // scene-aware path — kept for old analyze jobs that predate the metadata).
@@ -4343,6 +4542,8 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
                 console.log(`[render ${jobId}] CLIP: metadata loaded — ${frames.length} frames with scene-accurate timestamps`);
               } catch {
                 // Legacy fallback: even-spaced timestamps (wrong for scene-aware extraction)
+                let srcDurClip = 0;
+                try { srcDurClip = await probeDurationSec(sourcePath); } catch {}
                 const stepSec = srcDurClip > 0 ? srcDurClip / (frameFiles.length + 1) : 0;
                 frames = frameFiles.map((f, i) => ({
                   path: path.join(framesDir, f),
@@ -4368,24 +4569,20 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
 
                   if (matchRes && Array.isArray(matchRes.results) && matchRes.results.length === scenes.length) {
                     let clipApplied = 0;
-                    let clipCandidateCount = 0;
                     scenes = scenes.map((sc, i) => {
                       const m = matchRes.results[i];
-                      if (m && Number.isFinite(Number(m.timeSec))) {
-                        const center = Number(m.timeSec);
-                        const winHalf = Math.max(8, (Number(sc.endSec) - Number(sc.startSec)) / 2);
-                        siglipCandidateScenes[i] = {
-                          label: "siglip",
-                          startSec: Math.max(0, center - winHalf),
-                          endSec: Math.min(srcDurClip || center + winHalf, center + winHalf),
-                          score: Number(m.score) || 0,
-                        };
-                        clipCandidateCount++;
-                      }
-                      if (protectedVisualBeats[i]) return sc; // funeral/death/climax beats stay on analyzed source window
-                      // Direct-apply only very confident SigLIP matches; otherwise Gemini verifier decides.
-                      if (!m || m.score < Number(process.env.VISUAL_APPLY_THRESHOLD || 0.16)) return sc;
-                      const center = Number(m.timeSec);
+                      // Only apply if score is confident enough (CLIP cosine > 0.22)
+                      // and the matched frame is within the general timeline region.
+                      if (!m || m.score < 0.22) return sc;
+                      const center = m.timeSec;
+                      // FIX: Widened window guard. The old strict check (center must be
+                      // within sc.startSec..sc.endSec) prevented CLIP from correcting
+                      // beats where Claude placed the timestamp in the wrong scene.
+                      // New guard: allow CLIP to relocate a beat's window as long as the
+                      // matched frame is within ±15% of movie duration from the beat midpoint.
+                      // This lets CLIP escape Claude's wrong timestamps (e.g. "Layla scene"
+                      // assigned to minute 30 but Layla actually appears at minute 45)
+                      // while still staying in the correct chronological region.
                       const _scMid = (Number(sc.startSec) + Number(sc.endSec)) / 2;
                       const _liberalRadius = srcDurClip > 0 ? srcDurClip * 0.15 : 300;
                       if (center < _scMid - _liberalRadius || center > _scMid + _liberalRadius) return sc;
@@ -4395,15 +4592,13 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
                         ...sc,
                         startSec: Math.max(0, center - winHalf),
                         endSec: center + winHalf,
-                        reason: (sc.reason || "") + ` [siglip:${m.score.toFixed(2)}]`,
+                        reason: (sc.reason || "") + ` [clip:${m.score.toFixed(2)}]`,
                       };
                     });
                     console.log(
-                      `[render ${jobId}] SIGLIP: candidates=${clipCandidateCount}/${scenes.length}, direct-applied=${clipApplied}/${scenes.length} ` +
+                      `[render ${jobId}] CLIP: semantic windows applied to ${clipApplied}/${scenes.length} beats ` +
                       `(frames=${embedRes.frames}, analyzeJob=${_analyzeJobId})`
                     );
-                  } else {
-                    console.warn(`[render ${jobId}] SIGLIP: match failed or length mismatch`);
                   }
                 }
               }
@@ -4415,8 +4610,8 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
         // ── END CLIP SEMANTIC MATCHING ────────────────────────────────────────
 
         // ── GEMINI FLASH VERIFICATION ────────────────────────────────────────
-        // Final multimodal verifier: Whisper candidate + local visual candidates +
-        // Gemini chooses the best short clip. Runs only when GEMINI_API_KEY is set.
+        // Final multimodal verifier: analyze candidate + CLIP/Whisper candidates →
+        // Gemini Flash picks the best clip. Runs only when GEMINI_API_KEY is set.
         if (SERVER_GEMINI_KEY) {
           const maxVerify = Math.max(0, Math.min(scenes.length, Number(process.env.GEMINI_VERIFY_MAX_BEATS || 35)));
           let attemptedGemini = 0, appliedGemini = 0, rejectedGemini = 0, skippedGemini = 0, failedGemini = 0;
@@ -4433,7 +4628,6 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
             if (!v) { failedGemini++; continue; }
             if (v.confidence >= Number(process.env.GEMINI_ACCEPT_THRESHOLD || 0.35)) {
               const chosen = cands[v.index];
-              // Never let Gemini move protected beats away unless it chooses the analyzed/protected source.
               if (protectedVisualBeats[i] && chosen.label !== "analyze") { rejectedGemini++; continue; }
               scenes[i] = { ...scenes[i], startSec: chosen.startSec, endSec: chosen.endSec, reason: `${scenes[i]?.reason || ''} [gemini:${chosen.label}:${v.confidence.toFixed(2)}]` };
               appliedGemini++;
@@ -4455,8 +4649,7 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
           const _txtResult = _textMatchBeatNotes(beats, voDurs);
           if (_txtResult.applied > 0) {
             scenes = scenes.map((sc, i) => {
-              if (protectedVisualBeats[i]) return sc;
-              if (sc.reason && (sc.reason.includes('[clip:') || sc.reason.includes('[gemini:'))) return sc;
+              if (sc.reason && sc.reason.includes('[clip:')) return sc; // CLIP already handled
               return _txtResult.scenes[i];
             });
             console.log(
@@ -4492,33 +4685,6 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
         }
         if (safeStart > 0) {
           console.log(`[render ${jobId}] SYNC: intro-skip floor = ${safeStart.toFixed(1)}s (no footage before first real beat)`);
-          // Enforce the floor, not just log it. Drop pre-credit/logo beats and keep
-          // beats/voice files/durations/text in lockstep so narration cannot describe
-          // footage that we intentionally refuse to show.
-          const keepIdx = [];
-          for (let i = 0; i < scenes.length; i++) {
-            const st = Number(scenes[i].startSec) || 0;
-            const en = Number(scenes[i].endSec) || 0;
-            if (en > safeStart + 0.5) keepIdx.push(i);
-          }
-          const beforeIntro = scenes.length;
-          if (keepIdx.length > 0 && keepIdx.length < scenes.length) {
-            scenes = keepIdx.map((i) => {
-              const sc = scenes[i];
-              return Number(sc.startSec) < safeStart ? { ...sc, startSec: safeStart } : sc;
-            });
-            beats = keepIdx.map((i) => beats[i]);
-            beatTexts = keepIdx.map((i) => beatTexts[i]);
-            voDurs = keepIdx.map((i) => voDurs[i]);
-            voiceoverFileIds = keepIdx.map((i) => voiceoverFileIds[i]).filter(Boolean);
-            if (Array.isArray(_perBeatTtsDurations)) _perBeatTtsDurations = keepIdx.map((i) => _perBeatTtsDurations[i]);
-            if (Array.isArray(whisperBeatDurations)) whisperBeatDurations = keepIdx.map((i) => whisperBeatDurations[i]);
-            console.log(`[render ${jobId}] SYNC: intro filter dropped ${beforeIntro - scenes.length} pre-floor beat(s); firstStart=${Number(scenes[0]?.startSec || 0).toFixed(1)}s`);
-          } else {
-            scenes = scenes.map((sc) => Number(sc.startSec) < safeStart && Number(sc.endSec) > safeStart
-              ? { ...sc, startSec: safeStart }
-              : sc);
-          }
         }
         // Decide distribution mode:
         //   per-beat-audio  → voice files count equals beats count → exact audio durations
@@ -4610,7 +4776,6 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
           useEvenDistribution: useEvenDist,
           sourceDurationSec: safeCeiling || srcDur || undefined,
           sourceStartSec: safeStart > 0 ? safeStart : undefined,
-          maxClipSec: COPYRIGHT_SAFE_MODE ? Number(process.env.COPYRIGHT_SAFE_MAX_CLIP_SEC || 3.0) : undefined,
           // ChatGPT pipeline: pass per-beat importance scores so buildSyncedTimeline
           // applies dynamic cut timing (2.5s for transitional, 5.0s for climax).
           beatImportances: Array.isArray(beats) ? beats.map((b) => b.importance ?? null) : undefined,
@@ -4817,7 +4982,7 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
         _hv2TtsProvider === "hume"       ? (SERVER_HUME_VOICE || "Kora") :
         _hv2TtsProvider === "openai"     ? "onyx" : SERVER_SPEECHIFY_VOICE
       );
-      const _hv2TtsSpeed = (settings && settings.ttsSpeed) || Number(process.env.TTS_SPEED || 0.95);
+      const _hv2TtsSpeed = (settings && settings.ttsSpeed) || 1.0;
 
       // Generate TTS for hook narration
       const _hv2TtsRes = await generatePerBeatTTS(
@@ -4833,36 +4998,19 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
       const _hv2VoiceDur  = await probeDurationSec(_hv2TtsPath);
       console.log(`[render ${jobId}] HOOK-V2 TTS: ${_hv2VoiceDur.toFixed(2)}s — id=${_hv2TtsFileId}`);
 
-      // Trim short, multiple clips for hook. In copyright-safe mode, expand the
-      // selected beat ids with neighbours so a 20-30s hook is covered by many
-      // transformed micro-clips instead of a few longer raw movie clips.
+      // Trim one clip per sourceBeatId (chronological order preserved by selectHookBeats)
       const _hv2ClipPaths = [];
       const _hv2ClipDurs  = [];
-      const _hv2SourceIds = (() => {
-        if (!COPYRIGHT_SAFE_MODE) return _hookV2BeatIds;
-        const ids = [];
-        for (const id of _hookV2BeatIds) {
-          for (const n of [id - 1, id, id + 1]) {
-            if (n >= 0 && n < beats.length && !ids.includes(n)) ids.push(n);
-          }
-        }
-        return ids.slice(0, Math.max(_hookV2BeatIds.length, 10));
-      })();
-      const _hv2PerClipMax = COPYRIGHT_SAFE_MODE
-        ? Number(process.env.COPYRIGHT_SAFE_HOOK_CLIP_SEC || 2.5)
-        : Math.max(2.0, _hv2VoiceDur / _hookV2BeatIds.length);
-      for (let _ci = 0; _ci < _hv2SourceIds.length; _ci++) {
-        const beatIdx = _hv2SourceIds[_ci];
-        // sourceBeatIds are generated from the POST-TRIM beat list in the HOOK-V2 prompt.
-        // Use the same post-trim beat array for footage, otherwise hook narration and
-        // visuals point at different story moments.
-        const hBeat   = beats[beatIdx] || ((Array.isArray(_preTrimBeats) && _preTrimBeats[beatIdx]) ? _preTrimBeats[beatIdx] : null);
+      // Each clip gets an equal share of the voice duration so all clips are
+      // visible in the final hook. Without this cap, expanded beat windows
+      // (30-40s each) make the merged hook video far longer than the TTS;
+      // the downstream muxer only shows the first clip's worth of footage.
+      const _hv2PerClipMax = Math.max(2.0, _hv2VoiceDur / _hookV2BeatIds.length);
+      for (let _ci = 0; _ci < _hookV2BeatIds.length; _ci++) {
+        const beatIdx = _hookV2BeatIds[_ci];
+        const hBeat   = beats[beatIdx];
         if (!hBeat) { console.warn(`[render ${jobId}] HOOK-V2 beat #${beatIdx} not found — skipping`); continue; }
         const hStart = Number(hBeat.startSec || 0);
-        if (hStart < 120) {
-          console.warn(`[render ${jobId}] HOOK-V2 beat #${beatIdx} at ${hStart.toFixed(0)}s < intro floor — skipping credits`);
-          continue;
-        }
         const hEnd   = Math.min(Number(hBeat.endSec || 0), hStart + _hv2PerClipMax);
         if (hEnd - hStart < 0.5) { console.warn(`[render ${jobId}] HOOK-V2 beat #${beatIdx} too short — skipping`); continue; }
         const hClipPath = path.join(UPLOADS_DIR, `hookv2-clip-${jobId}-${_ci}.mp4`);
@@ -4885,7 +5033,7 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
       const _hv2FootageDurRaw = _hv2ClipDurs.reduce((a, b) => a + b, 0);
       const _hv2Diff = _hv2VoiceDur - _hv2FootageDurRaw;
       if (Math.abs(_hv2Diff) > 0.25) {
-        const lastBeatIdx = _hv2SourceIds[_hv2SourceIds.length - 1];
+        const lastBeatIdx = _hookV2BeatIds[_hookV2BeatIds.length - 1];
         const lastBeat    = beats[lastBeatIdx];
         const lastClipPath = _hv2ClipPaths[_hv2ClipPaths.length - 1];
         if (lastBeat) {
@@ -4998,7 +5146,7 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
       console.log(`[render ${jobId}] HOOK-V2 READY ✓`);
       console.log(`  text: "${_hookText.slice(0, 80)}..."`);
       console.log(`  sourceBeatIds: [${_hookV2BeatIds.join(",")}]`);
-      console.log(`  footage: ${(_hv2SourceIds || _hookV2BeatIds).map((idx) => { const b = beats[idx]; return b ? `${idx}→${Math.round(b.startSec)}-${Math.round(b.endSec)}s` : `${idx}→?`; }).join(", ")}`);
+      console.log(`  footage: ${_hookV2BeatIds.map((idx) => { const b = beats[idx]; return b ? `${idx}→${Math.round(b.startSec)}-${Math.round(b.endSec)}s` : `${idx}→?`; }).join(", ")}`);
       console.log(`  narration=${_hv2VoiceDur.toFixed(2)}s footage=${_hv2FinalDur.toFixed(2)}s diff=${Math.abs(_hv2VoiceDur - _hv2FinalDur).toFixed(2)}s ${Math.abs(_hv2VoiceDur - _hv2FinalDur) <= 0.25 ? "PASS" : "WARN"}`);
     } catch (hv2Err) {
       console.warn(`[render ${jobId}] HOOK-V2 failed (non-fatal, video continues without hook):`, hv2Err?.message || hv2Err);
@@ -5422,51 +5570,34 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
   // Helper: mux a video file with a voice TTS file (no audio seek needed — full beat voice)
   // padSec is dynamic — callers pass the probed TTS-video gap so the pad is exactly what's
   // needed, avoiding 2s of frozen-frame clone on beats where TTS fits the footage tightly.
-  const _muxVideoWithVoice = async (videoPath, voicePath, outPath, padSec = 0.25) => {
-    let vDur = 0, aDur = 0;
-    try { vDur = await probeDurationSec(videoPath); } catch {}
-    try { aDur = await probeDurationSec(voicePath); } catch {}
-    // Audio is master. For mild mismatches, retime the video with setpts so the
-    // visual action spans the narration instead of drifting into the next beat.
-    //   ratio < 1.0 => video is shorter than narration -> slow video down
-    //   ratio > 1.0 => video is longer than narration  -> speed video up
-    // Keep retiming conservative; bigger mismatches are handled by gap-fill or tail pad.
-    const retimeMin = Number(process.env.VIDEO_RETIME_MIN || 0.82);
-    const retimeMax = Number(process.env.VIDEO_RETIME_MAX || 1.18);
-    let speed = 1.0;
-    let retime = false;
-    if (vDur > 0.5 && aDur > 0.5) {
-      const ratio = vDur / aDur;
-      if (ratio >= retimeMin && ratio <= retimeMax && Math.abs(ratio - 1) > 0.015) {
-        speed = ratio;
-        retime = true;
-      }
-    }
-    const videoChain = retime
-      ? `setpts=PTS/${speed.toFixed(5)},tpad=stop_mode=clone:stop_duration=${padSec.toFixed(3)}`
-      : `tpad=stop_mode=clone:stop_duration=${((vDur > 0 && aDur > 0) ? Math.max(padSec, aDur - vDur + 0.75) : padSec).toFixed(3)}`;
-    if (retime) {
-      console.log(`[render ${jobId}] BEAT-RETIME: ${path.basename(outPath)} video=${vDur.toFixed(2)}s audio=${aDur.toFixed(2)}s speed=${speed.toFixed(3)}x`);
-    }
-    return new Promise((res) => {
-      const ff = spawn("ffmpeg", [
-        "-y", "-hide_banner", "-loglevel", "warning",
-        "-i", videoPath,
-        "-i", voicePath,
-        "-filter_complex",
-          `[0:v]${videoChain}[vpad]`,
-        "-map", "[vpad]", "-map", "1:a",
-        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
-        "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
-        "-shortest",
-        ...(aDur > 0 ? ["-t", aDur.toFixed(3)] : []),
-        outPath,
-      ], { stdio: "ignore" });
-      const t = setTimeout(() => { try { ff.kill("SIGKILL"); } catch {} res(false); }, 180_000);
-      ff.on("close", (code) => { clearTimeout(t); res(code === 0); });
-      ff.on("error", () => { clearTimeout(t); res(false); });
-    });
-  };
+  const _muxVideoWithVoice = (videoPath, voicePath, outPath, padSec = 0.25) => new Promise((res) => {
+    // Video gets tpad=0.6s clone frames so there is always a visual tail after narration.
+    // Audio is mapped directly (no apad filter) — apad+filter_complex+shortest caused
+    // audio corruption (stammering, silent beats) on this FFmpeg build.
+    //
+    // -shortest stops at whichever stream ends first:
+    //   • Speechify MP3 files carry 0.7–2.6s trailing silence after last word.
+    //   • video(phase-A ≈ contentDur) + tpad(0.6s) < audio(contentDur + silence)
+    //     → video wins → output = contentDur + 0.6s visual tail  ✓
+    //   • If silence < 0.6s: audio wins → output = contentDur + silence  ✓
+    //
+    // CASE 1 (video ≈ TTS content):  output = contentDur + 0.6s tail   ✓
+    // CASE 2 (video > TTS content):  output = audio file duration       ✓
+    const ff = spawn("ffmpeg", [
+      "-y", "-hide_banner", "-loglevel", "warning",
+      "-i", videoPath,
+      "-i", voicePath,
+      "-filter_complex",
+        `[0:v]tpad=stop_mode=clone:stop_duration=0.600[vpad]`,
+      "-map", "[vpad]", "-map", "1:a",
+      "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+      "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
+      "-shortest", outPath,
+    ], { stdio: "ignore" });
+    const t = setTimeout(() => { try { ff.kill("SIGKILL"); } catch {} res(false); }, 180_000);
+    ff.on("close", (code) => { clearTimeout(t); res(code === 0); });
+    ff.on("error", () => { clearTimeout(t); res(false); });
+  });
 
   // Helper: concat multiple video-only clips into one using filter_complex (robust to VFR)
   const _concatVideoClips = (clips, outPath) => new Promise((res) => {
@@ -5534,14 +5665,14 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
     const _voPath  = _voId ? path.join(UPLOADS_DIR, _voId) : null;
 
     if (!_voPath) {
-      console.warn(`[render ${jobId}] beat ${_bi} missing voice file — skipping silent segment`);
+      _muxedPaths.push(_beatRawVidPath);
       _beatMuxDone++;
       continue;
     }
     let _hasVoice = false;
     try { await fs.access(_voPath); _hasVoice = true; } catch {}
     if (!_hasVoice) {
-      console.warn(`[render ${jobId}] beat ${_bi} voice file not found (${_voId}) — skipping silent segment`);
+      _muxedPaths.push(_beatRawVidPath);
       _beatMuxDone++;
       continue;
     }
@@ -5565,12 +5696,9 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
       const _tsDurArr = Array.isArray(whisperBeatDurations) ? whisperBeatDurations
                       : Array.isArray(_perBeatTtsDurations) ? _perBeatTtsDurations
                       : null;
-      const _contentDur = (_tsDurArr && Number(_tsDurArr[_bi]) > 0.05)
+      const _voiDur = (_tsDurArr && Number(_tsDurArr[_bi]) > 0.05)
         ? Number(_tsDurArr[_bi])
         : await probeDurationSec(_voPath).catch(() => 0);
-      const _fileDur = await probeDurationSec(_voPath).catch(() => _contentDur);
-      const _isTailBeat = _beatOrder.indexOf(_bi) >= Math.max(0, _beatOrder.length - 3);
-      const _voiDur = _isTailBeat ? Math.max(_contentDur, _fileDur) : _contentDur;
 
       const _gap    = _voiDur - _vidDur;  // +ve = video short, -ve = video long
 
@@ -5589,7 +5717,7 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
         // STEP 1+2: re-trim beat's own source window (same sceneIds), just longer
         {
           const _s1End = Math.min(_beatStart + _target, _nextStart - 0.1);
-          if (_s1End > _beatStart + _extDur + 0.2 && _beatStart >= 0) {
+          if (_s1End > _beatEnd + 0.2 && _beatStart >= 0) {
             const _s1Path = path.join(UPLOADS_DIR, `beat-gf1-${jobId}-${String(_bi).padStart(3,"0")}.mp4`);
             const _s1Ok   = await new Promise((res) => {
               const ff = spawn("ffmpeg", buildTrimArgs({
@@ -5602,7 +5730,7 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
             });
             if (_s1Ok) {
               const _s1Dur = await probeDurationSec(_s1Path).catch(() => 0);
-              if (_s1Dur > _extDur) { _extPath = _s1Path; _extDur = _s1Dur; console.log(`[render ${jobId}] GAP-FILL beat ${_bi}: Step1 own scene → ${_extDur.toFixed(1)}s`); }
+              if (_s1Dur > _extDur) { _extPath = _s1Path; _extDur = _s1Dur; }
             }
           }
         }
@@ -5760,36 +5888,17 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
 
   // Build final encode filter: scale/pad/fps + optional music bed
   const _finalS  = normaliseRenderSettings(settings);
-  const _safeVf = COPYRIGHT_SAFE_MODE ? [
-    // Transform the source footage enough to reduce raw-content fingerprinting:
-    // slight crop/zoom, subtle motion, color shift, watermark, border, and grain.
-    `crop=iw*0.94:ih*0.94:(iw-iw*0.94)/2:(ih-ih*0.94)/2`,
-    `scale=${_finalS.width}:${_finalS.height}:force_original_aspect_ratio=increase`,
-    `crop=${_finalS.width}:${_finalS.height}:(iw-${_finalS.width})/2:(ih-${_finalS.height})/2`,
-    `eq=contrast=1.08:brightness=0.015:saturation=0.92:gamma=1.02`,
-    `noise=alls=6:allf=t+u`,
-    `drawbox=x=0:y=0:w=iw:h=ih:color=black@0.55:t=12`,
-    `drawtext=text='${_watermarkText}':x=24:y=24:fontsize=28:fontcolor=white@0.55:box=1:boxcolor=black@0.25:boxborderw=8`,
-  ] : [
+  const _finalVf = [
     `scale=${_finalS.width}:${_finalS.height}:force_original_aspect_ratio=decrease`,
     `pad=${_finalS.width}:${_finalS.height}:(ow-iw)/2:(oh-ih)/2:black`,
-  ];
-  const _finalVf = [
-    ..._safeVf,
     `fps=${_finalS.fps}`,
-    // Safety: if concat demuxer/video PTS ends before the audio timeline, keep
-    // the video stream alive so the final MP4 never has audio continuing after
-    // the video stream ends. Per-beat mux now clamps to audio duration, so this
-    // should rarely be used except as a final guard.
-    `tpad=stop_mode=clone:stop_duration=120`,
   ].join(",");
-  if (COPYRIGHT_SAFE_MODE) console.log(`[render ${jobId}] COPYRIGHT_SAFE_MODE: watermark/transform enabled, captions disabled`);
 
   const _hasFinalMusic = !!musicPath;
   // Music volume: default -18 dB (was -14 — felt too loud vs narration).
   // Sidechaincompress ducks it further (~20:1) whenever narration is audible,
   // so music is practically inaudible during speech and rises in pauses.
-  const _musicVol = Number.isFinite(Number(musicVolumeDb)) ? Number(musicVolumeDb) : -26;
+  const _musicVol = Number.isFinite(Number(musicVolumeDb)) ? Number(musicVolumeDb) : -18;
   const _finalFilter = _hasFinalMusic
     ? `[0:v]${_finalVf}[vout];` +
       // aresample=async=1 → absorbs accumulated AAC encoder-delay drift from
@@ -5803,8 +5912,8 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
       // sidechaincompress: threshold=0.02 (voice above 2% amplitude triggers ducking),
       // ratio=20:1 (heavy compression so music is nearly inaudible during speech),
       // attack=100ms (smooth onset), release=800ms (music fades back in gradually).
-      `[music_raw][voice_sc]sidechaincompress=threshold=0.015:ratio=12:` +
-      `attack=50:release=400:level_sc=0.8[music_ducked];` +
+      `[music_raw][voice_sc]sidechaincompress=threshold=0.02:ratio=20:` +
+      `attack=100:release=800:level_sc=0.8[music_ducked];` +
       `[voice_out][music_ducked]amix=inputs=2:duration=first:normalize=0[aout]`
     : `[0:v]${_finalVf}[vout];` +
       `[0:a]aresample=async=1,aformat=sample_fmts=fltp:channel_layouts=stereo[aout]`;
@@ -5818,7 +5927,6 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
     "-map", "[vout]", "-map", "[aout]",
     "-c:v", _finalS.codec, "-crf", String(_finalS.crf), "-preset", _encPreset, "-pix_fmt", "yuv420p",
     "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
-    ...(outputDurationSec > 0 ? ["-t", outputDurationSec.toFixed(3)] : []),
     "-movflags", "+faststart",
     outputPath,
   ];
@@ -5879,25 +5987,6 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
       finish(new Error(`ffmpeg encode failed (code ${code}): ${tail || "see server logs"}`));
     });
   });
-
-  // Validate final A/V stream lengths. A large delta means player-visible frozen
-  // frames or silent tail; log it explicitly so it cannot hide behind syncScore.
-  try {
-    const _probe = await new Promise((resolve) => {
-      let out = "";
-      const fp = spawn("ffprobe", ["-v", "error", "-show_entries", "stream=codec_type,duration", "-of", "json", outputPath], { stdio: ["ignore", "pipe", "ignore"] });
-      fp.stdout.on("data", (c) => { out += c.toString(); });
-      fp.on("close", () => { try { resolve(JSON.parse(out)); } catch { resolve(null); } });
-      fp.on("error", () => resolve(null));
-    });
-    const _vd = (_probe?.streams || []).find(s => s.codec_type === "video")?.duration;
-    const _ad = (_probe?.streams || []).find(s => s.codec_type === "audio")?.duration;
-    if (_vd && _ad) {
-      const _delta = Math.abs(Number(_vd) - Number(_ad));
-      console.log(`[render ${jobId}] FINAL A/V durations: video=${Number(_vd).toFixed(2)}s audio=${Number(_ad).toFixed(2)}s delta=${_delta.toFixed(2)}s`);
-      if (_delta > 1.0) console.warn(`[render ${jobId}] FINAL A/V WARNING: stream duration delta >1s`);
-    }
-  } catch {}
 
   // Generate a poster/thumbnail JPG from the finished recap (best-effort, never
   // fails the job). Grab a frame ~10% in (avoids the very first dark frame).
@@ -6016,11 +6105,6 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
       .catch((e) => console.warn(`[render ${jobId}] cinematic pre-gen failed:`, e?.message || e));
   }
 
-  let finalDurationSec = 0;
-  let finalSizeMb = 0;
-  try { finalDurationSec = await probeDurationSec(outputPath); } catch {}
-  try { finalSizeMb = Math.round(((await fs.stat(outputPath)).size / 1e6) * 10) / 10; } catch {}
-
   await jobStore.update(jobId, {
     status: "done",
     progress: 100,
@@ -6029,18 +6113,6 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
     posterPath: posterPath || undefined,
     completedAt: Date.now(),
     syncScore: _finalSyncScore != null ? _finalSyncScore : undefined,
-    result: {
-      outputPath,
-      outputName: path.basename(outputPath),
-      downloadUrl: `/jobs/${jobId}/download`,
-      posterPath: posterPath || null,
-      durationSec: finalDurationSec || outputDurationSec || 0,
-      duration: finalDurationSec || outputDurationSec || 0,
-      sizeMb: finalSizeMb,
-      syncScore: _finalSyncScore != null ? _finalSyncScore : null,
-      hookIncluded: Boolean(_hv2ReadyPath && _hv2ReadyTtsId),
-      beatsRendered: _muxedPaths.length,
-    },
   });
 
   // Best-effort cleanup of intermediate clip files + manifest + subs (keep the source).

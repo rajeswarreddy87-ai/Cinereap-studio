@@ -1,121 +1,121 @@
-          const sur = +(b.surpriseScore || imp);
-          const start = Number(b.startSec) || 0;
-          const txt = String(b.narration || b.reason || "").toLowerCase();
-          if (start < _hookIntroFloor) return { _idx: i, hookScore: -1, startSec: start };
-          let keywordBoost = 0;
-          if (/shot|blood|dies|death|killer|murder|gun|funeral|grave|hospital|crash|betray|revenge|loses|taken|custody/i.test(txt)) keywordBoost += 8;
-          if (/fight|brawl|knockout|champion|final round|low blow|uppercut|escobar|climax/i.test(txt)) keywordBoost += 5;
-          if (/wife|daughter|maureen|leila|leyla|cry|grief|love|family/i.test(txt)) keywordBoost += 4;
-          if (/deal|contract|manager|business|pool|speech|press conference|paperwork/i.test(txt)) keywordBoost -= 5;
-          return { _idx: i, hookScore: imp * 0.50 + emo * 0.25 + sur * 0.25 + keywordBoost, startSec: start };
-        }).filter((x) => x.hookScore >= 0);
-
-        // Step 2: top 8 by hookScore, restore chronological order.
-        // FIX: Beats sent from the app often lack importance/emotionScore/surpriseScore
-        // fields, causing all hookScores to be 0. When that happens, the old code
-        // silently fell back to the first 8 chronological beats (opening scenes) which
-        // are dull and non-dramatic. Instead, when all scores are 0, sample from the
-        // climax region (40–80% through the story) which contains the peak drama.
-        const _allZeroHookScores = _hv2Scored.every(s => s.hookScore === 0);
-        let _hv2Top;
-        if (_allZeroHookScores) {
-          const n = beats.length;
-          const _climaxCandidates = _hv2Scored.filter(({ _idx }) => {
-            const frac = _idx / Math.max(1, n - 1);
-            return frac >= 0.40 && frac <= 0.80;
-          });
-          // Use climax region if it has at least 4 beats; otherwise use all beats
-          const _hv2Pool = _climaxCandidates.length >= 4 ? _climaxCandidates : _hv2Scored;
-          // Evenly sample 8 beats from the pool to get good coverage
-          const _stride = Math.max(1, Math.floor(_hv2Pool.length / 8));
-          _hv2Top = _hv2Pool
-            .filter((_, k) => k % _stride === 0)
-            .slice(0, 8)
-            .sort((a, b) => a._idx - b._idx);
-          console.log(`[render ${jobId}] HOOK-V2: no importance scores — sampling ${_hv2Top.length} beats from climax region (beats ${_hv2Top.map(x => x._idx).join(",")})`);
-        } else {
-          _hv2Top = _hv2Scored
-            .slice()
-            .sort((a, b) => b.hookScore - a.hookScore)
-            .slice(0, 8)
-            .sort((a, b) => a._idx - b._idx);
-        }
-
-        // Step 3: build prompt with stable beat IDs (array index)
-        const _hv2Lines = _hv2Top
-          .map(({ _idx }) => {
-            const b = beats[_idx];
-            return `Beat #${_idx} (${Math.round(b.startSec || 0)}s–${Math.round(b.endSec || 0)}s): ${String(b.narration || b.reason || "").trim().slice(0, 120)}`;
-          })
-          .join("\n");
-
-        const _hv2Prompt =
-`You write a high-retention YouTube movie recap hook (55-75 words, ~22-30s narration time).
-
-Selected high-impact story beats:
-${_hv2Lines}
-
-HOOK GOAL:
-Create a shocking, emotional, action-driven opening that makes viewers NEED to know what happened next.
-
-RULES — follow ALL:
-• Use ONLY the beats above. Never invent events not present here.
-• Prioritize SURPRISE, SHOCK, EMOTION, DANGER, REVENGE, FAMILY LOSS, BETRAYAL, or ACTION.
-• Start with the most dramatic situation, not ordinary setup or business context.
-• Short sentences. Present tense. Fast pacing. No generic phrases like "this movie" or "our hero".
-• Do NOT reveal the final ending, final winner, final twist, or resolution.
-• Create an unanswered question by the final third of the hook.
-• End with exactly one transition line: "To understand how it got this far, we have to go back to the beginning."
-• Pick sourceBeatIds ONLY from beats whose footage directly supports the hook visuals.
-• The visual hook should include 3-6 short clips covering the shock/action/emotion you mention.
-
-Return JSON only, no markdown:
-{"hookText":"...","sourceBeatIds":[beatId1,beatId2,...]}
-
-sourceBeatIds must be the Beat # numbers from the beats you actually referenced.`;
-
-        let _hv2Raw = null;
-        if (SERVER_ANTHROPIC_KEY) {
-          const _hv2Resp = await fetch("https://api.anthropic.com/v1/messages", {
-            method: "POST",
-            headers: { "Content-Type": "application/json",
-              "x-api-key": SERVER_ANTHROPIC_KEY, "anthropic-version": "2023-06-01" },
-            body: JSON.stringify({ model: SERVER_ANTHROPIC_MODEL || "claude-opus-4-5", max_tokens: 700,
-              messages: [{ role: "user", content: _hv2Prompt }] }),
-            signal: AbortSignal.timeout(25_000),
-          });
-          const _hv2Data = await _hv2Resp.json();
-          _hv2Raw = _hv2Data?.content?.[0]?.text?.trim() || null;
-        } else {
-          const _hv2Resp = await fetch("https://api.openai.com/v1/chat/completions", {
-            method: "POST",
-            headers: { "Content-Type": "application/json", Authorization: `Bearer ${SERVER_OPENAI_KEY}` },
-            body: JSON.stringify({ model: "gpt-4o-mini", max_tokens: 300,
-              messages: [{ role: "user", content: _hv2Prompt }] }),
-            signal: AbortSignal.timeout(25_000),
-          });
-          const _hv2Data = await _hv2Resp.json();
-          _hv2Raw = _hv2Data?.choices?.[0]?.message?.content?.trim() || null;
-        }
-
-        if (_hv2Raw) {
-          let _hv2Json = null;
-          try {
-            const _hv2Match = _hv2Raw.match(/\{[\s\S]*\}/);
-            if (_hv2Match) _hv2Json = JSON.parse(_hv2Match[0]);
-          } catch {}
-          if (_hv2Json?.hookText) {
-            _hookText = String(_hv2Json.hookText).trim();
-            // Validate returned beat IDs against actual beats array bounds
-            const _rawIds = Array.isArray(_hv2Json.sourceBeatIds)
-              ? _hv2Json.sourceBeatIds.map(Number).filter(n => Number.isFinite(n) && n >= 0 && n < beats.length)
-              : [];
-            _hookV2BeatIds = _rawIds.length > 0 ? _rawIds : _hv2Top.map(x => x._idx);
-            console.log(`[render ${jobId}] HOOK-V2: "${_hookText.slice(0, 70)}..." sourceBeatIds=[${_hookV2BeatIds.join(",")}]`);
+            console.log(`[render ${jobId}] scene-sync: filtered ${beforeSkip - rawBeats.length} SKIP/credits beats`);
           }
+
+          // FIX B — Expand each beat window from its tight 6-second clip to the
+          // FULL scene range (beat[i].startSec → beat[i+1].startSec).
+          // Without this, 48×6s=288s of footage covers a 1226s narration only
+          // by cycling the same clips 4+ times.  With full ranges, the pool is
+          // ~5800s for a 2-hour film — far more than enough, zero re-cycling.
+          // Compute safe ceiling for last-beat window extension (avoids credits).
+          let _srcDurAL = 0;
+          try { _srcDurAL = await probeDurationSec(sourcePath); } catch {}
+          const _ceilAL = _srcDurAL > 0
+            ? Math.max(_srcDurAL * 0.5, _srcDurAL - Math.min(_srcDurAL * 0.08, Math.max(90, _srcDurAL * 0.035)))
+            : 0;
+
+          // ChatGPT pipeline: build a sceneId → timestamp map from the stored
+          // scenesList so we can resolve exact detected-scene boundaries per beat.
+          const _scenesList = analyzeJob.result.scenesList;
+          _scenesMap = Array.isArray(_scenesList) && _scenesList.length > 0
+            ? new Map(_scenesList.map((s) => [s.index, s])) : null;
+          const _sceneIdsResolved = { count: 0, fallback: 0 };
+
+          beats = rawBeats.map((b, i) => {
+            // ChatGPT pipeline: use sceneIds to resolve EXACT detected-scene window.
+            // beat.sceneIds covers [firstScene ... lastScene] from scene detection.
+            if (Array.isArray(b.sceneIds) && b.sceneIds.length > 0 && _scenesMap) {
+              const firstSc = _scenesMap.get(b.sceneIds[0]);
+              const lastSc  = _scenesMap.get(b.sceneIds[b.sceneIds.length - 1]);
+              if (firstSc && lastSc) {
+                let resolvedStart = Math.min(Number(b.startSec), firstSc.startSec);
+                let resolvedEnd = _ceilAL > 0
+                  ? Math.min(lastSc.endSec, _ceilAL) : lastSc.endSec;
+
+                // ChatGPT pipeline: confidence < 0.7 → expand window to adjacent scenes.
+                // Low confidence means Claude is uncertain the narration matches this footage;
+                // a larger pool gives buildSyncedTimeline better clip options to choose from.
+                const conf = Number.isFinite(Number(b.confidence)) ? Number(b.confidence) : 1.0;
+                if (conf < 0.7 && _scenesMap) {
+                  const lastUsedId = b.sceneIds[b.sceneIds.length - 1];
+                  const expandIds = [lastUsedId + 1, lastUsedId + 2].filter((id) => _scenesMap.has(id));
+                  for (const eid of expandIds) {
+                    const esc = _scenesMap.get(eid);
+                    if (esc) resolvedEnd = Math.max(resolvedEnd, _ceilAL > 0 ? Math.min(esc.endSec, _ceilAL) : esc.endSec);
+                  }
+                  if (expandIds.length > 0) {
+                    console.log(`[render ${jobId}] FIX-B: beat ${i} confidence=${conf.toFixed(2)} < 0.7 — expanded window +${expandIds.length} adjacent scenes`);
+                  }
+                }
+
+                _sceneIdsResolved.count++;
+                return {
+                  ...b,
+                  startSec: resolvedStart,
+                  endSec:   resolvedEnd,
+                };
+              }
+            }
+            // FIX B fallback (no sceneIds stored or scene not found in map):
+            // extend window to next beat's start — same as original FIX B.
+            _sceneIdsResolved.fallback++;
+            if (i < rawBeats.length - 1) {
+              return { ...b, endSec: Math.max(Number(b.endSec), Number(rawBeats[i + 1].startSec)) };
+            }
+            // Last beat: extend window to safe ceiling.
+            const lastEnd = _ceilAL > Number(b.startSec) ? _ceilAL : Number(b.endSec);
+            return { ...b, endSec: Math.max(Number(b.endSec), lastEnd) };
+          });
+          console.log(
+            `[render ${jobId}] FIX-B: sceneIds resolved ${_sceneIdsResolved.count} beats, ` +
+            `fallback FIX-B on ${_sceneIdsResolved.fallback} beats`,
+          );
+
+          _analyzeJobId = analyzeJob.id;
+          _hookText = typeof analyzeJob.result.hookText === "string" && analyzeJob.result.hookText.trim()
+            ? analyzeJob.result.hookText.trim() : null;
+          _hookSceneIds = Array.isArray(analyzeJob.result.hookSceneIds) && analyzeJob.result.hookSceneIds.length > 0
+            ? analyzeJob.result.hookSceneIds.map(Number).filter(Number.isFinite) : null;
+          if (_hookText) {
+            console.log(
+              `[render ${jobId}] HOOK: loaded ${_hookText.split(/\s+/).filter(Boolean).length}-word hook` +
+              (_hookSceneIds ? ` with hookSceneIds=[${_hookSceneIds.join(",")}]` : " (no hookSceneIds)")
+            );
+          }
+          console.log(
+            `[render ${jobId}] scene-sync: loaded ${beats.length} beats from ` +
+            `analyze job ${analyzeJob.id} — windows expanded to full scene ranges`,
+          );
+          await jobStore.update(jobId, {
+            message: `Scene sync: ${beats.length} scenes, windows expanded for unique footage`,
+          });
         }
-      } catch (hv2GenErr) {
-        console.warn(`[render ${jobId}] HOOK-V2 generation skipped (non-fatal):`, hv2GenErr?.message || hv2GenErr);
+      } catch (e) {
+        console.warn(`[render ${jobId}] could not auto-load analyze beats:`, e?.message || e);
       }
     }
-    // ── END HOOK V2 GENERATION ─────────────────────────────────────────────
+  }
+
+  // ---- v2.2 TRUE SYNC: if the caller sent per-beat narration windows, replace
+  // the incoming timestamps with a narration-paced timeline (no looping). We
+  // measure the voiceover length up front so each beat's on-screen duration
+  // matches how long it is spoken. `syncMode` then forces videoLoopCount=0.
+  let syncMode = false;
+  let syncBeatDurations = null;   // per-beat seconds (for music spans)
+  let syncMoods = null;           // per-beat moods (for music spans)
+  let voiceTotalPre = 0;
+  let _perBeatTtsDurations = null; // set by per-beat TTS; used for SRT + sync score
+  let whisperBeatDurations = null; // hoisted here so Phase-B gap-fill can read it
+  if (Array.isArray(beats) && beats.length > 0 &&
+      (voiceoverFileIds.length > 0 || !!(SERVER_SPEECHIFY_KEY || SERVER_OPENAI_KEY))) {
+    // ── UNIVERSAL BEAT NORMALISATION ──────────────────────────────────────
+    // Runs BEFORE anything else in the sync block so it applies whether
+    // beats came from the app request body OR were auto-loaded from the
+    // analyze job.  Previously the SKIP filter and window expansion only
+    // lived in the auto-load path, so app-sent beats (which bypass
+    // auto-load) still carried 6-second windows and SKIP entries —
+    // causing the planner to cycle the same 288s of footage 4+ times.
+    {
+      const beatsBefore = beats.length;
+
+      // ── PAIRED SORT: keep voiceoverFileIds in lockstep with beats ───────
+      // When the app sends one audio file per beat (lengths match), sorting

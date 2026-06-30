@@ -1,4 +1,4 @@
-# CineRecap VPS Pipeline — Code Reference (v2.8.4)
+# CineRecap VPS Pipeline — Code Reference (v2.8.5)
 
 **Server path:** `/root/cinerecap-render-server/`  
 **Live URL:** `http://109.123.241.130:4040`  
@@ -110,7 +110,7 @@ Server reports **0.3–0.6s timing drift** — not 5–10s.
 4. **Music** — default bed `-26dB` (was `-18`), stronger ducking `ratio=12`
 5. **v2.7.1 fixes retained** — analyzeJobId auto-resolve, per-beat TTS, video speed-up in mux
 
-Verify: `GET /health` → `"version": "2.8.4"`
+Verify: `GET /health` → `"version": "2.8.5"`
 
 ---
 
@@ -430,3 +430,16 @@ Fixes:
 - Added explicit `NAME SAFETY` rule in narration quality section.
 
 `GET /health` now reports `version: 2.8.4`.
+
+
+## v2.8.5 body-only prompt restoration after app-side overwrite
+
+After app-side YouTube/upload/thumbnail changes, the live server still had most body safeguards, but one Stage-A beat-note prompt still allowed `use your knowledge` for character names when no cast list was provided.
+
+Fix:
+
+- Replaced the remaining permissive beat-note fallback with strict transcript/evidence-based naming.
+- Hook generation and YouTube upload/metadata/thumbnail code were not modified.
+- Verified YouTube routes and hook routes remain present.
+
+`GET /health` now reports `version: 2.8.5`.
