@@ -1,3 +1,35 @@
+          if (j.status !== "done") continue;
+          if ((j.result?.sourceFileId || j.sourceFileId) !== sourceFileId) continue;
+          const t = j.completedAt || j.updatedAt || 0;
+          if (t > bestTime && Array.isArray(j.result?.beats) && j.result.beats.length > 0) {
+            bestTime = t;
+            bestJob = j;
+          }
+        } catch {}
+      }
+      if (bestJob) {
+        beats = bestJob.result.beats;
+        console.log(`[render ${jobId}] AUTO-LOAD: ${beats.length} beats from analyze job (${sourceFileId})`);
+        await jobStore.update(jobId, {
+          progress: 6,
+          message: `Loaded ${beats.length} scenes from analysis — generating narration audio…`,
+        });
+      } else {
+        console.warn(`[render ${jobId}] AUTO-LOAD: no analyze job with beats found for ${sourceFileId}`);
+        await jobStore.update(jobId, {
+          message: `No scene analysis found for this clip — video will render without narration`,
+        });
+      }
+    } catch (autoErr) {
+      console.warn(`[render ${jobId}] AUTO-LOAD: failed:`, autoErr?.message || autoErr);
+      await jobStore.update(jobId, {
+        message: `Scene lookup failed: ${String(autoErr?.message || autoErr).slice(0, 80)}`,
+      });
+    }
+  }
+
+  // ── PRE-SYNC: redistribute zero-origin timestamps and activate audioSeconds
+  // sync when the app sent per-beat audioSeconds but no real scene windows.
   //
   // The app always sends an `audioSeconds` field on each timestamp recording
   // exactly how long that beat's narration runs. When the AI script step
@@ -687,35 +719,3 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
               }
             }
 
-            if (frameFiles.length > 0) {
-              // Use clip-metadata.json written by analyze step for correct per-scene
-              // timestamps. Fallback: even-spaced reconstruction (inaccurate for the
-              // scene-aware path — kept for old analyze jobs that predate the metadata).
-              let frames;
-              const _metaPath = path.join(framesDir, 'clip-metadata.json');
-              try {
-                const _metaItems = JSON.parse(await fs.readFile(_metaPath, 'utf8'));
-                frames = _metaItems
-                  .filter(m => m.file && m.timeSec > 0)
-                  .map(m => ({ path: path.join(framesDir, m.file), timeSec: m.timeSec }));
-                console.log(`[render ${jobId}] CLIP: metadata loaded — ${frames.length} frames with scene-accurate timestamps`);
-              } catch {
-                // Legacy fallback: even-spaced timestamps (wrong for scene-aware extraction)
-                let srcDurClip = 0;
-                try { srcDurClip = await probeDurationSec(sourcePath); } catch {}
-                const stepSec = srcDurClip > 0 ? srcDurClip / (frameFiles.length + 1) : 0;
-                frames = frameFiles.map((f, i) => ({
-                  path: path.join(framesDir, f),
-                  timeSec: stepSec > 0 ? stepSec * (i + 1) : 0,
-                })).filter(f => f.timeSec > 0);
-                console.log(`[render ${jobId}] CLIP: no metadata — using legacy even-spaced timestamps (${frames.length} frames)`);
-              }
-
-              if (frames.length > 0) {
-                // 1. Ensure embeddings are stored in the sidecar (idempotent)
-                const embedRes = await callClipSidecar("/embed-job", {
-                  jobId: _analyzeJobId,
-                  frames,
-                }, 300_000); // 5 min — CPU embedding of ~178 scene frames takes 2-4 min
-
-                if (embedRes && embedRes.frames > 0) {

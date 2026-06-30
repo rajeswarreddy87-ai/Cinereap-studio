@@ -349,7 +349,7 @@ app.get("/health", (_req, res) => {
 
   res.json({
     ok: true,
-    version: "2.8.7",
+    version: "2.8.8",
     serverTranscription: Boolean(SERVER_OPENAI_KEY),
     serverAnalysis: Boolean(SERVER_ANTHROPIC_KEY),
     serverModel: SERVER_ANTHROPIC_MODEL || null,
@@ -499,6 +499,21 @@ async function extractStyledFrame(videoPath, timeSec, destPath, style = "dramati
     ], { stdio: "ignore" });
     ff.on("close", (code) => code === 0 ? resolve(destPath) : reject(new Error(`ffmpeg frame extract exit ${code}`)));
     ff.on("error", reject);
+  });
+}
+async function measureImageBrightness(imagePath) {
+  return new Promise((resolve) => {
+    let out = "";
+    const fp = spawn("ffprobe", [
+      "-v", "error", "-select_streams", "v:0",
+      "-show_entries", "frame_tags=lavfi.signalstats.YAVG",
+      "-f", "lavfi", `movie=${imagePath},signalstats`,
+      "-of", "default=nw=1:nk=1",
+    ], { stdio: ["ignore", "pipe", "ignore"] });
+    fp.stdout.on("data", (c) => { out += c.toString(); });
+    fp.on("close", () => resolve(parseFloat(out.trim()) || 0));
+    fp.on("error", () => resolve(0));
+    setTimeout(() => { try { fp.kill(); } catch {}; resolve(0); }, 5000);
   });
 }
 // Build an emotionally-driven story thumbnail prompt from beat context + style.
@@ -831,27 +846,44 @@ app.post("/jobs/:jobId/ai-thumbnails", requireAuth, async (req, res) => {
   };
 
   if (sourceOk && storyData.beats.length > 0) {
-    await Promise.allSettled(
-      VARIANTS.map(async (style) => {
-        const dest = aiThumbPath(req.params.jobId, style);
-        const candidates = pickBeatCandidates(style);
-        let ok = false;
-        let chosen = null;
+    const usedThumbTimes = [];
+    for (const style of VARIANTS) {
+      const dest = aiThumbPath(req.params.jobId, style);
+      const candidates = pickBeatCandidates(style);
+      let ok = false;
+      let chosen = null;
+      let chosenBrightness = 0;
+      for (const timeSec of candidates) {
+        if (usedThumbTimes.some((t) => Math.abs(t - timeSec) < 18)) continue; // avoid same moment across variants
+        try {
+          await extractStyledFrame(sourceVideo, timeSec, dest, style);
+          const bright = await measureImageBrightness(dest);
+          if (bright < Number(process.env.THUMB_MIN_BRIGHTNESS || 58)) {
+            console.log(`[ai-thumbnails ${req.params.jobId}] source-frame ${style} @ ${timeSec.toFixed(1)}s rejected dark brightness=${bright.toFixed(1)}`);
+            try { await fs.unlink(dest); } catch {}
+            continue;
+          }
+          ok = true; chosen = timeSec; chosenBrightness = bright; usedThumbTimes.push(timeSec); break;
+        } catch {}
+      }
+      // If all bright/unique candidates failed, allow the best candidate even if dark rather than DALL-E generic.
+      if (!ok && candidates.length > 0) {
         for (const timeSec of candidates) {
           try {
             await extractStyledFrame(sourceVideo, timeSec, dest, style);
-            ok = true; chosen = timeSec; break;
+            const bright = await measureImageBrightness(dest);
+            ok = true; chosen = timeSec; chosenBrightness = bright; usedThumbTimes.push(timeSec); break;
           } catch {}
         }
-        if (ok) {
-          results[style] = `/jobs/${req.params.jobId}/ai-thumbnails/${style}`;
-          console.log(`[ai-thumbnails ${req.params.jobId}] source-frame ${style} @ ${chosen.toFixed(1)}s OK (analyze=${analyzeJobId_ || 'auto'})`);
-        } else {
-          errors[style] = `source-frame extraction failed (${candidates.length} candidates)`;
-          console.warn(`[ai-thumbnails ${req.params.jobId}] source-frame ${style} failed (${candidates.length} candidates)`);
-        }
-      })
-    );
+      }
+      if (ok) {
+        results[style] = `/jobs/${req.params.jobId}/ai-thumbnails/${style}`;
+        console.log(`[ai-thumbnails ${req.params.jobId}] source-frame ${style} @ ${chosen.toFixed(1)}s OK brightness=${chosenBrightness.toFixed(1)} (analyze=${analyzeJobId_ || 'auto'})`);
+      } else {
+        errors[style] = `source-frame extraction failed (${candidates.length} candidates)`;
+        console.warn(`[ai-thumbnails ${req.params.jobId}] source-frame ${style} failed (${candidates.length} candidates)`);
+      }
+    }
   }
 
   // ── Secondary fallback: enhanced real frames from rendered recap ──────────

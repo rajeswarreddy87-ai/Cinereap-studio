@@ -1,4 +1,4 @@
-# CineRecap VPS Pipeline — Code Reference (v2.8.7)
+# CineRecap VPS Pipeline — Code Reference (v2.8.8)
 
 **Server path:** `/root/cinerecap-render-server/`  
 **Live URL:** `http://109.123.241.130:4040`  
@@ -111,7 +111,7 @@ Server reports **0.3–0.6s timing drift** — not 5–10s.
 4. **Music** — default bed `-26dB` (was `-18`), stronger ducking `ratio=12`
 5. **v2.7.1 fixes retained** — analyzeJobId auto-resolve, per-beat TTS, video speed-up in mux
 
-Verify: `GET /health` → `"version": "2.8.7"`
+Verify: `GET /health` → `"version": "2.8.8"`
 
 ---
 
@@ -498,3 +498,25 @@ Expected logs:
 ```
 
 `GET /health` now reports `version: 2.8.7`.
+
+
+## v2.8.8 thumbnail brightness / uniqueness filter
+
+User reported source-frame thumbnails were still too dark and all variants selected the same red/dark source moment.
+
+Fixes:
+
+- Added `measureImageBrightness()` using ffprobe signalstats.
+- Source-frame thumbnail selection now rejects candidates below `THUMB_MIN_BRIGHTNESS=58`.
+- Thumbnail variants are selected sequentially and avoid timestamps within 18s of an already chosen thumbnail.
+- If all bright/unique candidates fail, source-frame fallback still chooses a source frame before using DALL-E.
+- Logs now include brightness values and dark-frame rejection lines.
+
+Expected logs:
+
+```text
+source-frame dramatic @ ... rejected dark brightness=...
+source-frame bold @ ... OK brightness=...
+```
+
+`GET /health` now reports `version: 2.8.8`.

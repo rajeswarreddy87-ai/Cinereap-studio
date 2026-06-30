@@ -1,3 +1,35 @@
+            }
+            // Body beats: spread evenly, proportional to audioSeconds.
+            const frac = n > 2 ? (i - 0.5) / (n - 1) : 0.5;
+            const clipDur = Math.min(t.audioSeconds * 0.7, 8);
+            const center = safeStartPre + Math.max(0, Math.min(1, frac)) * (safeWindow - clipDur);
+            return { ...t, startSec: Math.max(safeStartPre, center), endSec: Math.min(center + clipDur, safeEndPre) };
+          });
+          console.log(`[render ${jobId}] redistributed ${zeroCount}/${n} zero-origin timestamps across ${safeStartPre.toFixed(0)}-${safeEndPre.toFixed(0)}s`);
+        }
+      }
+      // Now activate audioSeconds sync: use the measured narration duration per beat
+      // directly as the on-screen duration (beats.js planSyncedRender otherwise
+      // estimates this from word counts, which diverges for TTS-generated audio).
+      // Only activate when there is no explicit beats array (that path already handles sync).
+      if ((!Array.isArray(beats) || beats.length === 0) && voiceoverFileIds.length > 0) {
+        const totalAudioSec = timestamps.reduce((a, t) => a + (Number(t.audioSeconds) || 0), 0);
+        if (totalAudioSec > 10) {
+          let srcDurAudio = 0;
+          try { srcDurAudio = await probeDurationSec(sourcePath); } catch {}
+          let safeCeilingAudio = srcDurAudio;
+          if (srcDurAudio > 0) {
+            const ct = Math.min(srcDurAudio * 0.08, Math.max(90, srcDurAudio * 0.035));
+            safeCeilingAudio = Math.max(srcDurAudio * 0.5, srcDurAudio - ct);
+          }
+          const audioScenes = timestamps.map((t) => ({
+            startSec: Number(t.startSec),
+            endSec:   Number(t.endSec),
+            reason:   t.reason || '',
+          }));
+          const audioBeatDurations = timestamps.map((t) => Number(t.audioSeconds));
+          try {
+            const audioTimeline = buildSyncedTimeline(audioScenes, audioBeatDurations, {
               sourceDurationSec: safeCeilingAudio || srcDurAudio || undefined,
             });
             if (audioTimeline.length > 0) {
@@ -87,35 +119,3 @@
               if (firstSc && lastSc) {
                 let resolvedStart = Math.min(Number(b.startSec), firstSc.startSec);
                 let resolvedEnd = _ceilAL > 0
-                  ? Math.min(lastSc.endSec, _ceilAL) : lastSc.endSec;
-
-                // ChatGPT pipeline: confidence < 0.7 → expand window to adjacent scenes.
-                // Low confidence means Claude is uncertain the narration matches this footage;
-                // a larger pool gives buildSyncedTimeline better clip options to choose from.
-                const conf = Number.isFinite(Number(b.confidence)) ? Number(b.confidence) : 1.0;
-                if (conf < 0.7 && _scenesMap) {
-                  const lastUsedId = b.sceneIds[b.sceneIds.length - 1];
-                  const expandIds = [lastUsedId + 1, lastUsedId + 2].filter((id) => _scenesMap.has(id));
-                  for (const eid of expandIds) {
-                    const esc = _scenesMap.get(eid);
-                    if (esc) resolvedEnd = Math.max(resolvedEnd, _ceilAL > 0 ? Math.min(esc.endSec, _ceilAL) : esc.endSec);
-                  }
-                  if (expandIds.length > 0) {
-                    console.log(`[render ${jobId}] FIX-B: beat ${i} confidence=${conf.toFixed(2)} < 0.7 — expanded window +${expandIds.length} adjacent scenes`);
-                  }
-                }
-
-                _sceneIdsResolved.count++;
-                return {
-                  ...b,
-                  startSec: resolvedStart,
-                  endSec:   resolvedEnd,
-                };
-              }
-            }
-            // FIX B fallback (no sceneIds stored or scene not found in map):
-            // extend window to next beat's start — same as original FIX B.
-            _sceneIdsResolved.fallback++;
-            if (i < rawBeats.length - 1) {
-              return { ...b, endSec: Math.max(Number(b.endSec), Number(rawBeats[i + 1].startSec)) };
-            }

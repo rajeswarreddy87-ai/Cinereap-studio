@@ -1,3 +1,35 @@
+        // ── DIRECT-TIMESTAMP PATH (on-demand hook) ──────────────────────────
+        // When the hook was generated on-demand, _hookDirectTimestamps holds the
+        // actual {startSec,endSec} of the beats used to write the narration.
+        // Use these directly — no position-index lookup table needed.
+        if (_hookDirectTimestamps && _hookDirectTimestamps.length > 0) {
+          for (let _di = 0; _di < _hookDirectTimestamps.length; _di++) {
+            const dt = _hookDirectTimestamps[_di];
+            const mid = (Number(dt.startSec) + Number(dt.endSec)) / 2;
+            if (mid < 30 || mid > _hCeil - 5) {
+              console.log(`[render ${jobId}] HOOK-DIRECT: idx=${_di} mid=${mid.toFixed(0)}s out of range — skipping`);
+              continue;
+            }
+            const clipLen  = Math.min(6, Math.max(3, Number(dt.endSec) - Number(dt.startSec)));
+            const subStart = Math.max(30, mid - clipLen / 2);
+            const subEnd   = subStart + clipLen;
+            const subPath  = path.join(UPLOADS_DIR, `hook-sub-${jobId}-d${_di}.mp4`);
+            const subArgs  = buildTrimArgs({ inputPath: sourcePath, startSec: subStart, endSec: subEnd, outputPath: subPath, reencode: true });
+            await new Promise((res) => {
+              const ff = spawn("ffmpeg", subArgs, { stdio: "ignore" });
+              const t  = setTimeout(() => { try { ff.kill("SIGKILL"); } catch {} res(); }, 60_000);
+              ff.on("close", (code) => { clearTimeout(t); if (code === 0) _hookSubClips.push(subPath); res(); });
+              ff.on("error", () => { clearTimeout(t); res(); });
+            });
+          }
+          if (_hookSubClips.length > 0) {
+            console.log(`[render ${jobId}] HOOK: direct-timestamp multi-clips: ${_hookSubClips.length} sub-clips from [${_hookDirectTimestamps.map(t => Math.round(t.startSec)).join(",")}]s`);
+          }
+        }
+        // ── END DIRECT-TIMESTAMP PATH ────────────────────────────────────────
+
+        // Primary lookup: scenesList index → exact detected scene boundaries.
+        // Fallback A: _preTrimBeats index map (when scenesList absent from analyze job).
         const _hookSceneLookup = _scenesMap
           ?? (Array.isArray(_preTrimBeats) && _preTrimBeats.length > 0
             ? new Map(_preTrimBeats.map(b => [b.index, b]))
@@ -177,35 +209,3 @@
         _outroDurSec = await probeDurationSec(_outroTtsPath);
         if (_outroDurSec > 0.1) { _outroTtsOk = true; }
       } catch (e1) {
-        console.warn(`[render ${jobId}] OUTRO TTS: primary provider failed — ${e1?.message || e1}`);
-      }
-
-      // Attempt 2: OpenAI fallback (reliable, always available)
-      if (!_outroTtsOk && SERVER_OPENAI_KEY) {
-        try {
-          await new Promise(r => setTimeout(r, 2000)); // brief pause before fallback
-          await _ttsOnce("openai", SERVER_OPENAI_KEY, "onyx", 1.0, _outroText, _outroTtsPath);
-          _outroDurSec = await probeDurationSec(_outroTtsPath);
-          if (_outroDurSec > 0.1) { _outroTtsOk = true; console.log(`[render ${jobId}] OUTRO TTS: used OpenAI fallback`); }
-        } catch (e2) {
-          console.warn(`[render ${jobId}] OUTRO TTS: OpenAI fallback also failed — ${e2?.message || e2}`);
-        }
-      }
-
-      if (!_outroTtsOk) {
-        console.warn(`[render ${jobId}] OUTRO TTS: all providers failed — outro skipped`);
-      }
-
-      if (_outroTtsOk) {
-        console.log(`[render ${jobId}] OUTRO TTS: ${_outroDurSec.toFixed(1)}s — id=${_outroTtsId}`);
-        // Use footage from 55% into the film — avoids the climax/ending region
-        // that story beats already cover (last 30%), preventing the same footage
-        // appearing in the outro that viewers just watched in beats 70-80.
-        let _oSrcDur = 0;
-        try { _oSrcDur = await probeDurationSec(sourcePath); } catch {}
-        if (_oSrcDur > 60) {
-          const _oStart    = Math.max(30, _oSrcDur * 0.55);
-          const _oEnd      = Math.min(_oSrcDur - 3, _oStart + Math.max(_outroDurSec + 3, 15));
-          const _oClipPath = path.join(UPLOADS_DIR, `outro-clip-${jobId}.mp4`);
-          const _oArgs     = buildTrimArgs({ inputPath: sourcePath, startSec: _oStart, endSec: _oEnd, outputPath: _oClipPath, reencode: true });
-          await new Promise((res) => {

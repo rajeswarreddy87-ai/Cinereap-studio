@@ -1,3 +1,18 @@
+      `cold blue/green on the antagonist. Punchy oversaturated colors. ` +
+      `Camera slightly low-angle to emphasise power struggle. No text. No watermarks. 16:9.`
+    );
+  }
+  // cinematic
+  return (
+    `${storyCtx}` +
+    `Widescreen cinematic YouTube thumbnail for: "${title}". ` +
+    `The protagonist stands small against an imposing, dangerous environment or crowd. ` +
+    `Atmospheric: moody blue-grey haze, orange-amber practical lights in background, ` +
+    `Hollywood orange-teal colour grade, heavy film grain, epic scale. ` +
+    `The hero's body language conveys vulnerability or defiance. ` +
+    `Netflix key-art quality. No text. No watermarks. 16:9 aspect ratio.`
+  );
+}
 
 /* ---------- POST /jobs/:jobId/ai-thumbnails: real-frame channel thumbnails -- */
 // Primary: enhanced real frames from the rendered recap video (actual movie character faces).
@@ -72,27 +87,44 @@ app.post("/jobs/:jobId/ai-thumbnails", requireAuth, async (req, res) => {
   };
 
   if (sourceOk && storyData.beats.length > 0) {
-    await Promise.allSettled(
-      VARIANTS.map(async (style) => {
-        const dest = aiThumbPath(req.params.jobId, style);
-        const candidates = pickBeatCandidates(style);
-        let ok = false;
-        let chosen = null;
+    const usedThumbTimes = [];
+    for (const style of VARIANTS) {
+      const dest = aiThumbPath(req.params.jobId, style);
+      const candidates = pickBeatCandidates(style);
+      let ok = false;
+      let chosen = null;
+      let chosenBrightness = 0;
+      for (const timeSec of candidates) {
+        if (usedThumbTimes.some((t) => Math.abs(t - timeSec) < 18)) continue; // avoid same moment across variants
+        try {
+          await extractStyledFrame(sourceVideo, timeSec, dest, style);
+          const bright = await measureImageBrightness(dest);
+          if (bright < Number(process.env.THUMB_MIN_BRIGHTNESS || 58)) {
+            console.log(`[ai-thumbnails ${req.params.jobId}] source-frame ${style} @ ${timeSec.toFixed(1)}s rejected dark brightness=${bright.toFixed(1)}`);
+            try { await fs.unlink(dest); } catch {}
+            continue;
+          }
+          ok = true; chosen = timeSec; chosenBrightness = bright; usedThumbTimes.push(timeSec); break;
+        } catch {}
+      }
+      // If all bright/unique candidates failed, allow the best candidate even if dark rather than DALL-E generic.
+      if (!ok && candidates.length > 0) {
         for (const timeSec of candidates) {
           try {
             await extractStyledFrame(sourceVideo, timeSec, dest, style);
-            ok = true; chosen = timeSec; break;
+            const bright = await measureImageBrightness(dest);
+            ok = true; chosen = timeSec; chosenBrightness = bright; usedThumbTimes.push(timeSec); break;
           } catch {}
         }
-        if (ok) {
-          results[style] = `/jobs/${req.params.jobId}/ai-thumbnails/${style}`;
-          console.log(`[ai-thumbnails ${req.params.jobId}] source-frame ${style} @ ${chosen.toFixed(1)}s OK (analyze=${analyzeJobId_ || 'auto'})`);
-        } else {
-          errors[style] = `source-frame extraction failed (${candidates.length} candidates)`;
-          console.warn(`[ai-thumbnails ${req.params.jobId}] source-frame ${style} failed (${candidates.length} candidates)`);
-        }
-      })
-    );
+      }
+      if (ok) {
+        results[style] = `/jobs/${req.params.jobId}/ai-thumbnails/${style}`;
+        console.log(`[ai-thumbnails ${req.params.jobId}] source-frame ${style} @ ${chosen.toFixed(1)}s OK brightness=${chosenBrightness.toFixed(1)} (analyze=${analyzeJobId_ || 'auto'})`);
+      } else {
+        errors[style] = `source-frame extraction failed (${candidates.length} candidates)`;
+        console.warn(`[ai-thumbnails ${req.params.jobId}] source-frame ${style} failed (${candidates.length} candidates)`);
+      }
+    }
   }
 
   // ── Secondary fallback: enhanced real frames from rendered recap ──────────
@@ -137,30 +169,3 @@ app.post("/jobs/:jobId/ai-thumbnails", requireAuth, async (req, res) => {
     );
   }
 
-  // ── FALLBACK: DALL-E only for styles where real frame extraction failed ───
-  const missingStyles = VARIANTS.filter((style) => !results[style]);
-  if (missingStyles.length > 0 && SERVER_OPENAI_KEY) {
-    await Promise.allSettled(
-      missingStyles.map(async (style) => {
-        try {
-          const prompt = buildChannelDallEPrompt(style, storyData);
-          const dest = aiThumbPath(req.params.jobId, style);
-          console.log(`[ai-thumbnails ${req.params.jobId}] DALL-E fallback ${style} prompt: ${prompt.slice(0, 120)}…`);
-          await generateDalleThumbnail(SERVER_OPENAI_KEY, prompt, dest);
-          results[style] = `/jobs/${req.params.jobId}/ai-thumbnails/${style}`;
-          console.log(`[ai-thumbnails ${req.params.jobId}] DALL-E fallback ${style} OK`);
-        } catch (e) {
-          errors[style] = (errors[style] ? errors[style] + " | " : "") + String(e?.message || e);
-          console.warn(`[ai-thumbnails ${req.params.jobId}] DALL-E fallback ${style} failed:`, e?.message || e);
-        }
-      })
-    );
-  }
-
-  if (Object.keys(results).length === 0) {
-    return res.status(502).json({ error: "All thumbnail variants failed", details: errors });
-  }
-  const thumbPaths = {};
-  for (const [style] of Object.entries(results)) {
-    thumbPaths[style] = aiThumbPath(req.params.jobId, style);
-  }
