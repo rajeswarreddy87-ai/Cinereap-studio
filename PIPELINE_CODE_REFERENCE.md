@@ -1,4 +1,4 @@
-# CineRecap VPS Pipeline — Code Reference (v2.8.6)
+# CineRecap VPS Pipeline — Code Reference (v2.8.7)
 
 **Server path:** `/root/cinerecap-render-server/`  
 **Live URL:** `http://109.123.241.130:4040`  
@@ -111,7 +111,7 @@ Server reports **0.3–0.6s timing drift** — not 5–10s.
 4. **Music** — default bed `-26dB` (was `-18`), stronger ducking `ratio=12`
 5. **v2.7.1 fixes retained** — analyzeJobId auto-resolve, per-beat TTS, video speed-up in mux
 
-Verify: `GET /health` → `"version": "2.8.6"`
+Verify: `GET /health` → `"version": "2.8.7"`
 
 ---
 
@@ -471,3 +471,30 @@ Logs should now show:
 instead of DALL-E-first generation.
 
 `GET /health` now reports `version: 2.8.6`.
+
+
+## v2.8.7 source-beat thumbnail selection
+
+The first real-frame thumbnail patch still selected random scene-change frames from the rendered recap. This produced dark/empty thumbnails without clear hero representation.
+
+Fixes:
+
+- Thumbnail primary source is now the original source movie file when an analyze job/sourceFileId is available.
+- Thumbnail timestamps are selected from high-scoring analyze beats, not random scene changes.
+- Beat scoring prioritizes hero-in-trouble situations:
+  - blood, shot, gun, death, funeral, grave, crash, hospital, grief/loss
+  - fight, brawl, punch, knockout, threat, revenge, Escobar
+  - arena/crowd/cemetery/night/final/climax
+- For each style (`dramatic`, `bold`, `cinematic`), the route tries multiple candidate frames from top beats.
+- Fallback order is now:
+  1. source-frame from analyzed source movie
+  2. render-frame from final recap
+  3. DALL-E fallback only if both real-frame paths fail
+
+Expected logs:
+
+```text
+[ai-thumbnails <job>] source-frame dramatic @ ...s OK
+```
+
+`GET /health` now reports `version: 2.8.7`.

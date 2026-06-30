@@ -1,3 +1,64 @@
+        const _hookSceneLookup = _scenesMap
+          ?? (Array.isArray(_preTrimBeats) && _preTrimBeats.length > 0
+            ? new Map(_preTrimBeats.map(b => [b.index, b]))
+            : null);
+        // Fallback B: 1-based beat POSITION map.
+        // GPT is given the beat list as "${i+1}. narration" and returns hookSceneIds
+        // as 1-based list positions (e.g. "2" means the 2nd beat, not scene index 2).
+        // Those values get stored as if they are scene detection indices, so
+        // _hookSceneLookup.get(2) finds FFmpeg scene #2 (early credits, ~60 s) instead
+        // of the 2nd story beat.  This second map resolves the position interpretation.
+        const _hookBeatPosLookup = Array.isArray(_preTrimBeats) && _preTrimBeats.length > 0
+          ? new Map(_preTrimBeats.map((b, i) => [i + 1, b]))
+          : null;
+        console.log(
+          `[render ${jobId}] HOOK-DBG: hookSceneIds=${JSON.stringify(_hookSceneIds)}, ` +
+          `sceneLookup=${_hookSceneLookup ? _hookSceneLookup.size : 'null'}, ` +
+          `beatPosLookup=${_hookBeatPosLookup ? _hookBeatPosLookup.size : 'null'}`
+        );
+
+        if (_hookSceneIds && _hookSceneIds.length > 0 && (_hookSceneLookup || _hookBeatPosLookup)) {
+          // Multi-clip path: one 5-6 s clip per hookSceneId so footage mirrors
+          // each dramatic moment the hook narration actually describes.
+          for (let _hi = 0; _hi < _hookSceneIds.length; _hi++) {
+            const id = _hookSceneIds[_hi];
+            // Try scene-index lookup first.
+            let sc = _hookSceneLookup?.get(id);
+            // If scene-index lookup returned a very early scene (<90 s) it is probably
+            // a credits/logo mismatch (GPT returned a beat position, not a scene index).
+            // Fall back to the 1-based beat-position map in that case.
+            if (!sc || (Number(sc.startSec) < 90 && _hookBeatPosLookup)) {
+              const bpSc = _hookBeatPosLookup?.get(id);
+              if (bpSc && Number(bpSc.startSec) >= 90) sc = bpSc;
+            }
+            if (!sc) {
+              console.log(`[render ${jobId}] HOOK-DBG: id=${id} not in any lookup — skipping`);
+              continue;
+            }
+            const mid     = (Number(sc.startSec) + Number(sc.endSec)) / 2;
+            if (mid < 30 || mid > _hCeil - 5) {
+              console.log(`[render ${jobId}] HOOK-DBG: id=${id} mid=${mid.toFixed(1)}s out of range (30..${(_hCeil-5).toFixed(0)}s) — skipping`);
+              continue;
+            }
+            const clipLen = Math.min(6, Math.max(3, Number(sc.endSec) - Number(sc.startSec)));
+            const subStart = Math.max(30, mid - clipLen / 2);
+            const subEnd   = subStart + clipLen;
+            const subPath  = path.join(UPLOADS_DIR, `hook-sub-${jobId}-${_hi}.mp4`);
+            const subArgs  = buildTrimArgs({ inputPath: sourcePath, startSec: subStart, endSec: subEnd, outputPath: subPath, reencode: true });
+            await new Promise((res) => {
+              const ff = spawn("ffmpeg", subArgs, { stdio: "ignore" });
+              const t  = setTimeout(() => { try { ff.kill("SIGKILL"); } catch {} res(); }, 60_000);
+              ff.on("close", (code) => { clearTimeout(t); if (code === 0) _hookSubClips.push(subPath); res(); });
+              ff.on("error", () => { clearTimeout(t); res(); });
+            });
+          }
+          if (_hookSubClips.length > 0) {
+            console.log(`[render ${jobId}] HOOK: trimmed ${_hookSubClips.length} sub-clips from hookSceneIds=[${_hookSceneIds.join(",")}]`);
+          } else {
+            console.log(`[render ${jobId}] HOOK-DBG: all hookSceneIds filtered — will try beat-based emergency clips`);
+          }
+        }
+
         // Emergency fallback: hookSceneIds lookup produced nothing.
         // Use the first 5 story beats (past the credits region) as hook footage.
         // These are guaranteed real story content in chronological order.
@@ -148,64 +209,3 @@
           const _oClipPath = path.join(UPLOADS_DIR, `outro-clip-${jobId}.mp4`);
           const _oArgs     = buildTrimArgs({ inputPath: sourcePath, startSec: _oStart, endSec: _oEnd, outputPath: _oClipPath, reencode: true });
           await new Promise((res) => {
-            const ff = spawn("ffmpeg", _oArgs, { stdio: "ignore" });
-            const t  = setTimeout(() => { try { ff.kill("SIGKILL"); } catch {} res(); }, 90_000);
-            ff.on("close", (code) => {
-              clearTimeout(t);
-              if (code === 0) {
-                clipPaths.push(_oClipPath);
-                voiceoverFileIds.push(_outroTtsId);
-                console.log(`[render ${jobId}] OUTRO: appended clip (${_oStart.toFixed(0)}–${_oEnd.toFixed(0)}s) + TTS ${_outroTtsId}`);
-              } else {
-                console.warn(`[render ${jobId}] outro clip failed (code ${code}) — skipping`);
-              }
-              res();
-            });
-            ff.on("error", (e) => { clearTimeout(t); console.warn(`[render ${jobId}] outro clip error:`, e?.message || e); res(); });
-          });
-        }
-      }
-    }
-  } catch (outroErr) {
-    console.warn(`[render ${jobId}] outro generation failed (non-fatal):`, outroErr?.message || outroErr);
-  }
-  // ── END OUTRO SEGMENT ─────────────────────────────────────────────────────
-
-  const outputPath     = path.join(OUTPUT_DIR, `recap-${jobId}.mp4`);
-  let musicPath        = musicPathOverride
-    ? musicPathOverride
-    : (musicFileId ? path.join(UPLOADS_DIR, musicFileId) : null);
-  let adaptiveMusicPath = null;
-  let outputDurationSec = 0; // used by poster generation below
-
-  // ── BEAT-BY-BEAT MUX ─────────────────────────────────────────────────────
-  // GROUP-BY-BEAT MUX: concat each beat's sub-clips into one beat video (video-only),
-  // then mux with the beat's full TTS voice file using -shortest.
-  // This ensures narration plays CONTINUOUSLY over all visual cuts within a beat —
-  // no audio interruption at 6-second sub-clip boundaries.
-  //
-  // clipPaths layout: [sub1_b0, sub2_b0, sub3_b0, sub1_b1, ...]
-  //   Hook is NOT in clipPaths — it is muxed independently after body BEAT-MUX.
-  //   cleanClips[j].beatIndex → which beat owns sub-clip j
-  //   voiceoverFileIds[beatIndex] → the beat's TTS file
-
-  // Build beat groups: beatIndex → [clipPath, ...] in timeline order
-  const _beatGroupMap = new Map();
-  for (let _j = 0; _j < cleanClips.length; _j++) {
-    const _bi = typeof cleanClips[_j].beatIndex === "number" ? cleanClips[_j].beatIndex : _j;
-    if (!_beatGroupMap.has(_bi)) _beatGroupMap.set(_bi, []);
-    _beatGroupMap.get(_bi).push(clipPaths[_j]);
-  }
-  // Ordered list of unique beat indices (preserves timeline order)
-  const _beatOrder = [...new Set(cleanClips.map((cc) => typeof cc.beatIndex === "number" ? cc.beatIndex : 0))];
-  console.log(`[render ${jobId}] BEAT-MUX MAP: ${cleanClips.length} sub-clips → ${_beatOrder.length} body beats`);
-
-  // Helper: mux a video file with a voice TTS file (no audio seek needed — full beat voice)
-  // padSec is dynamic — callers pass the probed TTS-video gap so the pad is exactly what's
-  // needed, avoiding 2s of frozen-frame clone on beats where TTS fits the footage tightly.
-  const _muxVideoWithVoice = (videoPath, voicePath, outPath, padSec = 0.25) => new Promise((res) => {
-    // Video gets tpad=0.6s clone frames so there is always a visual tail after narration.
-    // Audio is mapped directly (no apad filter) — apad+filter_complex+shortest caused
-    // audio corruption (stammering, silent beats) on this FFmpeg build.
-    //
-    // -shortest stops at whichever stream ends first:

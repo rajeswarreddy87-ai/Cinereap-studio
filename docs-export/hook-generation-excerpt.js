@@ -1,3 +1,64 @@
+              sourceDurationSec: safeCeilingAudio || srcDurAudio || undefined,
+            });
+            if (audioTimeline.length > 0) {
+              timestamps = audioTimeline.filter(
+                (t) => Number.isFinite(t.startSec) && Number.isFinite(t.endSec) && t.endSec - t.startSec >= 0.1
+              );
+              console.log(`[render ${jobId}] audioSeconds sync: ${audioTimeline.length} segs from ${audioScenes.length} beats, total=${totalAudioSec.toFixed(1)}s`);
+            }
+          } catch (e) {
+            console.warn(`[render ${jobId}] audioSeconds sync failed, using redistributed timestamps:`, e?.message || e);
+          }
+        }
+      }
+    }
+  }
+
+  // ── AUTO-LOAD ANALYZE BEATS (scene-to-scene narration sync) ─────────────
+  // The app sends zero-origin timestamps ({startSec:0,endSec:0}) because it
+  // doesn't forward the scene windows from the analyze step to the render call.
+  // The analyze step already ran Claude and produced perfect per-beat data:
+  // real startSec/endSec windows + narration text for each scene.
+  // We look that up here and inject it as the beats array so the sync planner
+  // can align narration to actual movie scenes — no app change needed.
+  if ((!Array.isArray(beats) || beats.length === 0) && voiceoverFileIds.length > 0) {
+    const zeroTsCount = Array.isArray(timestamps)
+      ? timestamps.filter((t) => t.startSec === 0 && (t.endSec === 0 || t.endSec <= 1)).length
+      : 0;
+    if (zeroTsCount > (timestamps?.length ?? 0) * 0.3) {
+      try {
+        const allJobs = await jobStore.list();
+        // Find the most recent completed analyze job for this source file.
+        const analyzeJob = allJobs
+          .filter(
+            (j) =>
+              j.kind === 'analyze' &&
+              (j.sourceFileId === fileId || j.result?.sourceFileId === fileId) &&
+              j.status === 'done' &&
+              Array.isArray(j.result?.beats) &&
+              j.result.beats.length > 0,
+          )
+          .sort((a, b) => b.createdAt - a.createdAt)[0];
+        if (analyzeJob) {
+          // Sort beats chronologically (they should already be, but be safe).
+          let rawBeats = analyzeJob.result.beats
+            .slice()
+            .sort((a, b) => Number(a.startSec) - Number(b.startSec));
+
+          // FIX A — Drop beats Claude labelled as SKIP (studio logos, title cards).
+          // No hard time threshold — story content starts at different points
+          // per film and region. Trust Claude's own beat notes exclusively.
+          const beforeSkip = rawBeats.length;
+          rawBeats = rawBeats.filter((b) => {
+            const narr = String(b.narration || b.reason || "").trim();
+            if (narr.toUpperCase().startsWith("SKIP")) return false;
+            if (/\b(studio|logo|production\s*company|distributor|credit|title\s*card|opening\s*credit)\b/i.test(narr)) return false;
+            return true;
+          });
+          if (rawBeats.length < beforeSkip) {
+            console.log(`[render ${jobId}] scene-sync: filtered ${beforeSkip - rawBeats.length} SKIP/credits beats`);
+          }
+
           // FIX B — Expand each beat window from its tight 6-second clip to the
           // FULL scene range (beat[i].startSec → beat[i+1].startSec).
           // Without this, 48×6s=288s of footage covers a 1226s narration only
@@ -58,64 +119,3 @@
             if (i < rawBeats.length - 1) {
               return { ...b, endSec: Math.max(Number(b.endSec), Number(rawBeats[i + 1].startSec)) };
             }
-            // Last beat: extend window to safe ceiling.
-            const lastEnd = _ceilAL > Number(b.startSec) ? _ceilAL : Number(b.endSec);
-            return { ...b, endSec: Math.max(Number(b.endSec), lastEnd) };
-          });
-          console.log(
-            `[render ${jobId}] FIX-B: sceneIds resolved ${_sceneIdsResolved.count} beats, ` +
-            `fallback FIX-B on ${_sceneIdsResolved.fallback} beats`,
-          );
-
-          _analyzeJobId = analyzeJob.id;
-          _hookText = typeof analyzeJob.result.hookText === "string" && analyzeJob.result.hookText.trim()
-            ? analyzeJob.result.hookText.trim() : null;
-          _hookSceneIds = Array.isArray(analyzeJob.result.hookSceneIds) && analyzeJob.result.hookSceneIds.length > 0
-            ? analyzeJob.result.hookSceneIds.map(Number).filter(Number.isFinite) : null;
-          if (_hookText) {
-            console.log(
-              `[render ${jobId}] HOOK: loaded ${_hookText.split(/\s+/).filter(Boolean).length}-word hook` +
-              (_hookSceneIds ? ` with hookSceneIds=[${_hookSceneIds.join(",")}]` : " (no hookSceneIds)")
-            );
-          }
-          console.log(
-            `[render ${jobId}] scene-sync: loaded ${beats.length} beats from ` +
-            `analyze job ${analyzeJob.id} — windows expanded to full scene ranges`,
-          );
-          await jobStore.update(jobId, {
-            message: `Scene sync: ${beats.length} scenes, windows expanded for unique footage`,
-          });
-        }
-      } catch (e) {
-        console.warn(`[render ${jobId}] could not auto-load analyze beats:`, e?.message || e);
-      }
-    }
-  }
-
-  // ---- v2.2 TRUE SYNC: if the caller sent per-beat narration windows, replace
-  // the incoming timestamps with a narration-paced timeline (no looping). We
-  // measure the voiceover length up front so each beat's on-screen duration
-  // matches how long it is spoken. `syncMode` then forces videoLoopCount=0.
-  let syncMode = false;
-  let syncBeatDurations = null;   // per-beat seconds (for music spans)
-  let syncMoods = null;           // per-beat moods (for music spans)
-  let voiceTotalPre = 0;
-  let _perBeatTtsDurations = null; // set by per-beat TTS; used for SRT + sync score
-  let whisperBeatDurations = null; // hoisted here so Phase-B gap-fill can read it
-  if (Array.isArray(beats) && beats.length > 0 &&
-      (voiceoverFileIds.length > 0 || !!(SERVER_SPEECHIFY_KEY || SERVER_OPENAI_KEY))) {
-    // ── UNIVERSAL BEAT NORMALISATION ──────────────────────────────────────
-    // Runs BEFORE anything else in the sync block so it applies whether
-    // beats came from the app request body OR were auto-loaded from the
-    // analyze job.  Previously the SKIP filter and window expansion only
-    // lived in the auto-load path, so app-sent beats (which bypass
-    // auto-load) still carried 6-second windows and SKIP entries —
-    // causing the planner to cycle the same 288s of footage 4+ times.
-    {
-      const beatsBefore = beats.length;
-
-      // ── PAIRED SORT: keep voiceoverFileIds in lockstep with beats ───────
-      // When the app sends one audio file per beat (lengths match), sorting
-      // beats by startSec without reordering the audio causes a complete
-      // narration-to-video mismatch: audio plays in script order while video
-      // plays in chronological order. Fix: tag each beat with its original

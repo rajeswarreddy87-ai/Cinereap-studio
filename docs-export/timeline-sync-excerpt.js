@@ -1,3 +1,64 @@
+  //
+  // The app always sends an `audioSeconds` field on each timestamp recording
+  // exactly how long that beat's narration runs. When the AI script step
+  // didn't produce real scene windows (startSec=0, endSec=0), the clips all
+  // point to the first frame of the movie and the visuals loop endlessly.
+  // Fix: spread the windows evenly across the credits-safe region of the film
+  // so the footage actually advances, then use audioSeconds as exact on-screen
+  // durations instead of guessing from word counts.
+  {
+    const hasAudioSec = Array.isArray(timestamps) && timestamps.length > 0 &&
+      timestamps.every((t) => typeof t.audioSeconds === 'number' && t.audioSeconds > 0);
+    if (hasAudioSec) {
+      // Count how many timestamps have no real scene window.
+      const zeroCount = timestamps.filter(
+        (t) => t.startSec === 0 && (t.endSec === 0 || t.endSec <= 1)
+      ).length;
+      const needsRedistribution = zeroCount > timestamps.length * 0.3;
+      if (needsRedistribution) {
+        let srcDurPre = 0;
+        try { srcDurPre = await probeDurationSec(sourcePath); } catch {}
+        if (srcDurPre > 60) {
+          const creditsTailPre = Math.min(srcDurPre * 0.08, Math.max(90, srcDurPre * 0.035));
+          const safeEndPre   = Math.max(srcDurPre * 0.5, srcDurPre - creditsTailPre);
+          const safeStartPre = Math.min(180, srcDurPre * 0.04);
+          const n = timestamps.length;
+          const safeWindow = safeEndPre - safeStartPre;
+          timestamps = timestamps.map((t, i) => {
+            // Keep any timestamp that already has a real non-trivial window.
+            if (t.startSec > 0 && t.endSec > t.startSec + 1 && t.endSec < srcDurPre * 0.9) return t;
+            // Intro: first timestamp spanning the whole movie — give it the opening.
+            if (i === 0 && t.endSec >= srcDurPre * 0.5) {
+              const winDur = Math.min(t.audioSeconds * 0.8, 10);
+              return { ...t, startSec: safeStartPre, endSec: Math.min(safeStartPre + winDur, safeEndPre) };
+            }
+            // Outro: last timestamp — give it the closing section.
+            if (i === n - 1) {
+              const winDur = Math.min(t.audioSeconds * 0.8, 10);
+              return { ...t, startSec: Math.max(safeEndPre - winDur, safeStartPre), endSec: safeEndPre };
+            }
+            // Body beats: spread evenly, proportional to audioSeconds.
+            const frac = n > 2 ? (i - 0.5) / (n - 1) : 0.5;
+            const clipDur = Math.min(t.audioSeconds * 0.7, 8);
+            const center = safeStartPre + Math.max(0, Math.min(1, frac)) * (safeWindow - clipDur);
+            return { ...t, startSec: Math.max(safeStartPre, center), endSec: Math.min(center + clipDur, safeEndPre) };
+          });
+          console.log(`[render ${jobId}] redistributed ${zeroCount}/${n} zero-origin timestamps across ${safeStartPre.toFixed(0)}-${safeEndPre.toFixed(0)}s`);
+        }
+      }
+      // Now activate audioSeconds sync: use the measured narration duration per beat
+      // directly as the on-screen duration (beats.js planSyncedRender otherwise
+      // estimates this from word counts, which diverges for TTS-generated audio).
+      // Only activate when there is no explicit beats array (that path already handles sync).
+      if ((!Array.isArray(beats) || beats.length === 0) && voiceoverFileIds.length > 0) {
+        const totalAudioSec = timestamps.reduce((a, t) => a + (Number(t.audioSeconds) || 0), 0);
+        if (totalAudioSec > 10) {
+          let srcDurAudio = 0;
+          try { srcDurAudio = await probeDurationSec(sourcePath); } catch {}
+          let safeCeilingAudio = srcDurAudio;
+          if (srcDurAudio > 0) {
+            const ct = Math.min(srcDurAudio * 0.08, Math.max(90, srcDurAudio * 0.035));
+            safeCeilingAudio = Math.max(srcDurAudio * 0.5, srcDurAudio - ct);
           }
           const audioScenes = timestamps.map((t) => ({
             startSec: Number(t.startSec),
@@ -658,64 +719,3 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
                 }, 300_000); // 5 min — CPU embedding of ~178 scene frames takes 2-4 min
 
                 if (embedRes && embedRes.frames > 0) {
-                  // 2. Match each beat's narration text to best-matching frame
-                  const nonEmptyTexts = beatTexts.map((t) => t.trim() || "film scene");
-                  const matchRes = await callClipSidecar("/match", {
-                    jobId: _analyzeJobId,
-                    texts: nonEmptyTexts,
-                  }, 60_000);
-
-                  if (matchRes && Array.isArray(matchRes.results) && matchRes.results.length === scenes.length) {
-                    let clipApplied = 0;
-                    scenes = scenes.map((sc, i) => {
-                      const m = matchRes.results[i];
-                      // Only apply if score is confident enough (CLIP cosine > 0.22)
-                      // and the matched frame is within the general timeline region.
-                      if (!m || m.score < 0.22) return sc;
-                      const center = m.timeSec;
-                      // FIX: Widened window guard. The old strict check (center must be
-                      // within sc.startSec..sc.endSec) prevented CLIP from correcting
-                      // beats where Claude placed the timestamp in the wrong scene.
-                      // New guard: allow CLIP to relocate a beat's window as long as the
-                      // matched frame is within ±15% of movie duration from the beat midpoint.
-                      // This lets CLIP escape Claude's wrong timestamps (e.g. "Layla scene"
-                      // assigned to minute 30 but Layla actually appears at minute 45)
-                      // while still staying in the correct chronological region.
-                      const _scMid = (Number(sc.startSec) + Number(sc.endSec)) / 2;
-                      const _liberalRadius = srcDurClip > 0 ? srcDurClip * 0.15 : 300;
-                      if (center < _scMid - _liberalRadius || center > _scMid + _liberalRadius) return sc;
-                      const winHalf = Math.max(8, (sc.endSec - sc.startSec) / 2);
-                      clipApplied++;
-                      return {
-                        ...sc,
-                        startSec: Math.max(0, center - winHalf),
-                        endSec: center + winHalf,
-                        reason: (sc.reason || "") + ` [clip:${m.score.toFixed(2)}]`,
-                      };
-                    });
-                    console.log(
-                      `[render ${jobId}] CLIP: semantic windows applied to ${clipApplied}/${scenes.length} beats ` +
-                      `(frames=${embedRes.frames}, analyzeJob=${_analyzeJobId})`
-                    );
-                  }
-                }
-              }
-            }
-          } catch (clipErr) {
-            console.warn(`[render ${jobId}] CLIP matching skipped:`, clipErr?.message || clipErr);
-          }
-        }
-        // ── END CLIP SEMANTIC MATCHING ────────────────────────────────────────
-
-        // ── GEMINI FLASH VERIFICATION ────────────────────────────────────────
-        // Final multimodal verifier: analyze candidate + CLIP/Whisper candidates →
-        // Gemini Flash picks the best clip. Runs only when GEMINI_API_KEY is set.
-        if (SERVER_GEMINI_KEY) {
-          const maxVerify = Math.max(0, Math.min(scenes.length, Number(process.env.GEMINI_VERIFY_MAX_BEATS || 35)));
-          let attemptedGemini = 0, appliedGemini = 0, rejectedGemini = 0, skippedGemini = 0, failedGemini = 0;
-          for (let i = 0; i < maxVerify; i++) {
-            const cands = _dedupeCandidates([
-              { ...originalBeatScenes[i], label: "analyze" },
-              siglipCandidateScenes[i] ? { ...siglipCandidateScenes[i], label: "siglip" } : null,
-              scenes[i] ? { ...scenes[i], label: scenes[i].reason?.includes('[siglip:') ? "siglip-current" : "current" } : null,
-              transcriptCandidateScenes[i] ? { ...transcriptCandidateScenes[i], label: "whisper" } : null,
