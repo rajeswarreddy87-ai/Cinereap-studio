@@ -1,4 +1,4 @@
-# CineRecap VPS Pipeline — Code Reference (v2.8.9)
+# CineRecap VPS Pipeline — Code Reference (v2.9.3)
 
 **Server path:** `/root/cinerecap-render-server/`  
 **Live URL:** `http://109.123.241.130:4040`  
@@ -533,3 +533,113 @@ Fixes:
 - Hook and YouTube upload/metadata/thumbnail code were left untouched.
 
 `GET /health` now reports `version: 2.8.9` and `youtubeConfigured: true`.
+
+
+## v2.9.3 — ROOT CAUSE of the repeating "39s frozen recap" (structural, not a small patch)
+
+This is the verification the user asked for: *why does fixing one thing keep breaking the body, and is re-uploading needed?*
+
+### What actually happens
+
+The render worker `runRenderFromIngest()` in `src/index.js` wraps **all** of sync
+planning — beat normalisation, BEAT-TRIM, HOOK-V2, CLIP/SigLIP matching, Gemini
+verification, Whisper alignment, scene subdivision, and `planSyncedRender()` — in
+**one ~720-line `try` block** (roughly lines 4217–4941 in the export).
+
+Its `catch` used to do exactly one thing:
+
+```js
+} catch (e) {
+  console.warn(`[render ${jobId}] sync planning failed, falling back to loop align:`, e?.message || e);
+}
+```
+
+So **any** error thrown anywhere in those 720 lines is silently swallowed,
+`syncMode` stays `false`, and the render continues with a degenerate timeline.
+Downstream, BEAT-MUX maps every sub-clip into a **single** beat:
+
+```
+BEAT-MUX MAP: 127 sub-clips → 1 body beats
+```
+
+That one beat is muxed with only the first beat's TTS, so the video is a few
+seconds long while the full narration is frozen on the last frame. That is the
+exact symptom: *"39s → extends to 2.29 min with a still frame and no narration."*
+
+### Why every "fix" breaks something else
+
+The error in the `catch` is almost always a **reference error** introduced when the
+single giant `src/index.js` is edited from two sources (server-side patches **and**
+the Replit/app-side workflow). Confirmed instances from prior logs:
+
+- `Cannot access 'COPYRIGHT_SAFE_MODE' before initialization` (v2.8.2)
+- `_dedupeCandidates is not defined` (v2.8.9)
+- `originalBeatScenes is not defined` (v2.9.1)
+
+Each "small fix" only removed that one undefined symbol. The **silent catch** and
+the **single-source-of-truth violation** were never addressed, so the next edit
+reintroduced a new reference error and the body collapsed again. The variables that
+drive sync (`srcDur`, `safeCeiling`, `voDurs`, `beatTexts`, `safeStart`,
+`useEvenDist`) are all declared **inside** the try block, so the `catch` cannot even
+attempt a proper rebuild — confirming this is structural rot, not a content bug.
+
+### Fix shipped in this commit (scope-safe, minimal, no new reference risk)
+
+1. **Catch no longer hides the error.** It now logs the full message + stack as
+   `SYNC PLANNING THREW …`, sets `_syncPlanFailed`/`_syncPlanError`, and writes the
+   error into the job status message.
+2. **Body-collapse guard before BEAT-MUX.** If a real multi-beat analysis
+   (`beats.length >= 4`) collapses to `<= 1` body beat, the render **aborts with an
+   actionable error** (including the upstream cause) instead of shipping a broken
+   frozen-frame video and wasting a manual upload.
+3. **Partial-collapse warning.** If more than half the beats lose their own window,
+   it logs `PARTIAL BODY COLLAPSE` so a short-but-not-empty recap is explained.
+
+Both guards use only function-scope variables (`beats`, `_beatOrder`, `cleanClips`,
+`jobId`), so the fix itself cannot introduce the class of bug it detects.
+
+### Answering the user's two questions
+
+- **"Should I start from the upload stage?"** — **No.** The source movie and the
+  analyze beats are intact; the failure is purely in render-time sync planning.
+  Re-uploading or re-analyzing will not change the outcome. Only a **re-render**
+  (after the upstream reference error is fixed) is needed.
+- **"Serious issue, verify instead of patching?"** — Verified above: the serious
+  issue is the monolithic silent `try/catch` plus editing one 5,600-line file from
+  two sources. The permanent fix is process + structure, not another symbol patch.
+
+### Permanent structural recommendation (next, once it can be tested)
+
+1. **Single source of truth for `src/index.js`.** Stop editing the render worker
+   from both the server and Replit. Pick one; the other consumes the built artifact.
+2. **Break the 720-line block into small functions** (`normaliseBeats`,
+   `generateHook`, `matchVisuals`, `verifyWithGemini`, `buildPlan`) each with its own
+   `try/catch`, so one failing stage degrades only itself, not the whole body.
+3. **Add a guaranteed even-distribution safety net** in `buildPlan`'s catch (hoist
+   `voDurs`/`beatTexts`/`safeCeiling`/`safeStart` to function scope first) so a
+   thrown matcher still yields a complete, narration-paced body via
+   `buildSyncedTimeline(beats, perBeatDurations)`.
+4. **CI lint gate:** run `node --check src/index.js` (and ideally ESLint
+   `no-undef`) on every deploy so a reference error is caught before it reaches a
+   render.
+
+### Deploy (must be applied on the VPS — not auto-deployed from this repo)
+
+This repo holds the **exported copy** `docs-export/index-vps.js`. Apply the same two
+guards to the live `/root/cinerecap-render-server/src/index.js`:
+
+```bash
+cd /root/cinerecap-render-server
+# 1. edit src/index.js: replace the one-line sync-plan catch with the verbose
+#    SYNC PLANNING THREW catch (sets _syncPlanFailed/_syncPlanError), and add the
+#    body-collapse guard right after the "BEAT-MUX MAP" log line.
+node --check src/index.js          # must pass before deploy
+docker compose up -d --force-recreate render
+curl -s localhost:4040/health      # expect "version":"2.9.3"
+```
+
+After deploying, run one render. If the body still collapses, the logs will now
+show the **exact** `SYNC PLANNING THREW: <real error>` line — fix that one symbol,
+re-render (no re-upload), and the body returns.
+
+`GET /health` should then report `version: 2.9.3`.

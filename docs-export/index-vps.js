@@ -4214,6 +4214,11 @@ async function runRenderFromIngest(jobId, {
   let voiceTotalPre = 0;
   let _perBeatTtsDurations = null; // set by per-beat TTS; used for SRT + sync score
   let whisperBeatDurations = null; // hoisted here so Phase-B gap-fill can read it
+  // Structural guard state: when the (large) sync-planning try block throws, this
+  // records the real error so it is never silently hidden behind a degraded
+  // "loop align" render. See the body-collapse guard before BEAT-MUX MAP.
+  let _syncPlanFailed = false;
+  let _syncPlanError = null;
   if (Array.isArray(beats) && beats.length > 0 &&
       (voiceoverFileIds.length > 0 || !!(SERVER_SPEECHIFY_KEY || SERVER_OPENAI_KEY))) {
     // ── UNIVERSAL BEAT NORMALISATION ──────────────────────────────────────
@@ -4937,7 +4942,24 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
         }
       }
     } catch (e) {
-      console.warn(`[render ${jobId}] sync planning failed, falling back to loop align:`, e?.message || e);
+      // STRUCTURAL FIX (v2.9.3): do NOT silently degrade. Every recurring
+      // "39s frozen recap" regression has been a reference error thrown
+      // somewhere inside this ~720-line block (e.g. `COPYRIGHT_SAFE_MODE`
+      // before init, `_dedupeCandidates is not defined`, `originalBeatScenes
+      // is not defined`). The old single-line warn hid the real cause and let
+      // the render continue with a degenerate timeline that collapses the
+      // whole body into one beat. Record the full error + stack and flag it so
+      // the body-collapse guard below can fail loudly with an actionable
+      // message instead of shipping a broken video.
+      _syncPlanFailed = true;
+      _syncPlanError = e;
+      console.error(
+        `[render ${jobId}] SYNC PLANNING THREW (body will collapse if not caught downstream): ` +
+        `${e?.message || e}\n${e?.stack || ""}`
+      );
+      await jobStore.update(jobId, {
+        message: `Sync planning error: ${String(e?.message || e).slice(0, 160)}`,
+      }).catch(() => {});
     }
   }
 
@@ -5706,6 +5728,39 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
   // Ordered list of unique beat indices (preserves timeline order)
   const _beatOrder = [...new Set(cleanClips.map((cc) => typeof cc.beatIndex === "number" ? cc.beatIndex : 0))];
   console.log(`[render ${jobId}] BEAT-MUX MAP: ${cleanClips.length} sub-clips → ${_beatOrder.length} body beats`);
+
+  // ── STRUCTURAL GUARD (v2.9.3): body-collapse detection ──────────────────────
+  // Root cause of every repeated "short frozen recap": an error thrown inside
+  // the large sync-planning try/catch is swallowed, syncMode stays false, and
+  // the fallback timeline maps every sub-clip into a single beat. The hook then
+  // renders fine while the body is one tiny clip with the full narration frozen
+  // on the last frame (the "39s → 2.29min still frame, no narration" symptom).
+  //
+  // Instead of shipping that broken output (and wasting a full render + manual
+  // upload), fail loudly here with the real upstream error so it is fixable in
+  // one pass rather than discovered after download. Only triggers when we had a
+  // real multi-beat analysis to begin with.
+  if (Array.isArray(beats) && beats.length >= 4 && _beatOrder.length <= 1) {
+    const _cause = _syncPlanFailed
+      ? `Upstream sync planning threw: ${String(_syncPlanError?.message || _syncPlanError)}`
+      : `No sync-plan error was recorded, so a downstream step dropped beatIndex/sub-clips.`;
+    const _msg =
+      `BODY COLLAPSE: ${beats.length} analyzed beats produced only ${_beatOrder.length} body beat(s) ` +
+      `from ${cleanClips.length} sub-clips. ${_cause} ` +
+      `Aborting before mux to avoid a short frozen-frame recap. ` +
+      `Fix the upstream error (search logs for "SYNC PLANNING THREW") and re-render — ` +
+      `re-uploading the movie is NOT required, the source and analyze beats are intact.`;
+    console.error(`[render ${jobId}] ${_msg}`);
+    throw new Error(_msg);
+  }
+  // Partial-collapse warning: more than half the beats lost their own window.
+  if (Array.isArray(beats) && beats.length >= 8 && _beatOrder.length < beats.length * 0.5) {
+    console.warn(
+      `[render ${jobId}] PARTIAL BODY COLLAPSE: ${_beatOrder.length}/${beats.length} beats kept their own ` +
+      `timeline window — recap will be shorter than narration. ` +
+      (_syncPlanFailed ? `Sync planning threw: ${String(_syncPlanError?.message || _syncPlanError)}` : `Check beatIndex assignment in the timeline planner.`)
+    );
+  }
 
   // Helper: mux a video file with a voice TTS file (no audio seek needed — full beat voice)
   // padSec is dynamic — callers pass the probed TTS-video gap so the pad is exactly what's
