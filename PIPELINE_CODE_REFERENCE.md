@@ -763,4 +763,17 @@ concat balanced — **video 1143.36s vs audio 1143.10s (0.26s)** — no deficit.
 Net effect: final video length ≈ narration length; footage plays under narration
 the whole way through; no frozen-frame tail.
 
+### Verified live (render `toM2X7wI1I`, full re-render after v2.9.4 deploy)
+
+```text
+[render toM2X7wI1I] SEGMENT-NORM: re-encoded 1 outlier segment(s) → 1280x720@24/1 (dominant) for drift-free concat
+ffprobe final:
+  video stream: 1140.300s
+  audio stream: 1140.288s   → video−audio = 0.012s (12 ms)
+freezedetect (last 90s): no freeze ≥2s
+```
+
+Before (v2.9.3): video 1217.7s vs audio 1143.6s (74s gap + frozen-frame tail).
+After (v2.9.4): **12 ms** difference, no frozen tail, video ends with narration.
+
 `GET /health` reports `version: 2.9.4`.
