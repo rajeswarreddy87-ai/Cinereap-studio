@@ -399,7 +399,7 @@ app.get("/health", (_req, res) => {
 
   res.json({
     ok: true,
-    version: "2.8.9",
+    version: "2.9.3",
     serverTranscription: Boolean(SERVER_OPENAI_KEY),
     serverAnalysis: Boolean(SERVER_ANTHROPIC_KEY),
     serverModel: SERVER_ANTHROPIC_MODEL || null,
@@ -916,16 +916,8 @@ app.post("/jobs/:jobId/ai-thumbnails", requireAuth, async (req, res) => {
           ok = true; chosen = timeSec; chosenBrightness = bright; usedThumbTimes.push(timeSec); break;
         } catch {}
       }
-      // If all bright/unique candidates failed, allow the best candidate even if dark rather than DALL-E generic.
-      if (!ok && candidates.length > 0) {
-        for (const timeSec of candidates) {
-          try {
-            await extractStyledFrame(sourceVideo, timeSec, dest, style);
-            const bright = await measureImageBrightness(dest);
-            ok = true; chosen = timeSec; chosenBrightness = bright; usedThumbTimes.push(timeSec); break;
-          } catch {}
-        }
-      }
+      // If all bright/unique source candidates failed, do NOT accept a dark frame.
+      // Leave this style unresolved so it can fall back to rendered-frame or DALL-E.
       if (ok) {
         results[style] = `/jobs/${req.params.jobId}/ai-thumbnails/${style}`;
         console.log(`[ai-thumbnails ${req.params.jobId}] source-frame ${style} @ ${chosen.toFixed(1)}s OK brightness=${chosenBrightness.toFixed(1)} (analyze=${analyzeJobId_ || 'auto'})`);
@@ -3898,6 +3890,8 @@ async function runRenderFromIngest(jobId, {
   let _scenesMap    = null;
   let _hookTtsId       = null;
   let _hookFinalDurSec = 0;
+  const COPYRIGHT_SAFE_MODE = String(process.env.COPYRIGHT_SAFE_MODE || "true").toLowerCase() !== "false";
+  const _watermarkText = String(process.env.WATERMARK_TEXT || process.env.DEFAULT_CHANNEL_NAME || "Super Short Summary").replace(/'/g, "\\'").slice(0, 40);
 
   // When the app sends beats directly (bypass path) AND tells us which analyze job
   // produced them, prime CLIP matching now so semantic frame search can run.
@@ -4214,9 +4208,9 @@ async function runRenderFromIngest(jobId, {
   let voiceTotalPre = 0;
   let _perBeatTtsDurations = null; // set by per-beat TTS; used for SRT + sync score
   let whisperBeatDurations = null; // hoisted here so Phase-B gap-fill can read it
-  // Structural guard state: when the (large) sync-planning try block throws, this
-  // records the real error so it is never silently hidden behind a degraded
-  // "loop align" render. See the body-collapse guard before BEAT-MUX MAP.
+  // Structural guard state (v2.9.3): when the large sync-planning try block
+  // throws, this records the real error so it is never silently hidden behind a
+  // degraded "loop align" render. See the body-collapse guard before BEAT-MUX.
   let _syncPlanFailed = false;
   let _syncPlanError = null;
   if (Array.isArray(beats) && beats.length > 0 &&
@@ -4628,6 +4622,41 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
         let scenes = beats.map((b) => ({ startSec: Number(b.startSec), endSec: Number(b.endSec), reason: b.reason || b.narration || "" }));
         const beatTexts = beats.map((b) => (typeof b.narration === "string" ? b.narration : ""));
 
+        // ── v2.9.3: restore render-time helpers/inputs missing from the build ──
+        // `isProtectedBeatForVisual` and `sourceTranscriptSegments` were
+        // referenced here but never defined after dual-source edits, so the
+        // first one threw `isProtectedBeatForVisual is not defined`, the catch
+        // below swallowed it, and the whole body collapsed to one beat
+        // (the ~30s frozen-frame recap). Define both locally, right before use.
+        //
+        // Protected story beats stay anchored to their analyzed window and are
+        // NOT moved by CLIP/SigLIP/Gemini visual recentering.
+        const isProtectedBeatForVisual = (b) => {
+          const _t = String((b && (b.narration || b.reason)) || "").toLowerCase();
+          if (!_t) return false;
+          return /\b(funeral|cemetery|grave|burial|coffin|casket|death|dies|died|dead|killed|kill|murder|shot|shoot|gun|blood|hospital|coma|dying|overdose|suicide|grief|mourn|cry|tears|climax|final\s*(fight|round|bout)|championship|knockout|crash|accident)\b/i.test(_t);
+        };
+        // Source Whisper transcript segments from the analyze job (best-effort).
+        // findTranscriptCandidateForBeat() returns null on an empty array, so a
+        // missing transcript degrades gracefully instead of throwing.
+        let sourceTranscriptSegments = [];
+        try {
+          if (_analyzeJobId) {
+            const _ajForTx = await jobStore.get(_analyzeJobId).catch(() => null);
+            if (Array.isArray(_ajForTx?.result?.segments)) {
+              sourceTranscriptSegments = _ajForTx.result.segments;
+            }
+          }
+        } catch (_txErr) {
+          console.warn(`[render ${jobId}] transcript segments load failed (continuing without dialogue candidates):`, _txErr?.message || _txErr);
+        }
+        console.log(`[render ${jobId}] SYNC: transcript candidates from ${sourceTranscriptSegments.length} source segments`);
+
+        const protectedVisualBeats = beats.map(isProtectedBeatForVisual);
+        const originalBeatScenes = scenes.map((sc) => ({ ...sc, label: "analyze" }));
+        const transcriptCandidateScenes = beatTexts.map((txt) => findTranscriptCandidateForBeat(txt, sourceTranscriptSegments, srcDur));
+        let siglipCandidateScenes = new Array(scenes.length).fill(null);
+
         // ── CLIP SEMANTIC MATCHING (best-effort, falls back to time windows) ────
         // When the CLIP sidecar has embeddings for this analyze job, replace each
         // beat's time window with a window centred on the most semantically
@@ -4943,14 +4972,13 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
       }
     } catch (e) {
       // STRUCTURAL FIX (v2.9.3): do NOT silently degrade. Every recurring
-      // "39s frozen recap" regression has been a reference error thrown
-      // somewhere inside this ~720-line block (e.g. `COPYRIGHT_SAFE_MODE`
-      // before init, `_dedupeCandidates is not defined`, `originalBeatScenes
-      // is not defined`). The old single-line warn hid the real cause and let
-      // the render continue with a degenerate timeline that collapses the
-      // whole body into one beat. Record the full error + stack and flag it so
-      // the body-collapse guard below can fail loudly with an actionable
-      // message instead of shipping a broken video.
+      // "short frozen recap" has been a ReferenceError thrown somewhere in this
+      // ~720-line block (COPYRIGHT_SAFE_MODE before init, _dedupeCandidates,
+      // originalBeatScenes, isProtectedBeatForVisual, sourceTranscriptSegments…).
+      // The old one-line warn hid the real cause and let the render continue
+      // with a degenerate timeline that collapses the body to one beat. Record
+      // the full error + stack and flag it so the body-collapse guard below
+      // fails loudly with an actionable message instead of shipping a bad video.
       _syncPlanFailed = true;
       _syncPlanError = e;
       console.error(
@@ -5734,12 +5762,8 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
   // the large sync-planning try/catch is swallowed, syncMode stays false, and
   // the fallback timeline maps every sub-clip into a single beat. The hook then
   // renders fine while the body is one tiny clip with the full narration frozen
-  // on the last frame (the "39s → 2.29min still frame, no narration" symptom).
-  //
-  // Instead of shipping that broken output (and wasting a full render + manual
-  // upload), fail loudly here with the real upstream error so it is fixable in
-  // one pass rather than discovered after download. Only triggers when we had a
-  // real multi-beat analysis to begin with.
+  // on the last frame. Fail loudly here with the real upstream error instead of
+  // shipping that broken output and wasting a full render + manual upload.
   if (Array.isArray(beats) && beats.length >= 4 && _beatOrder.length <= 1) {
     const _cause = _syncPlanFailed
       ? `Upstream sync planning threw: ${String(_syncPlanError?.message || _syncPlanError)}`
@@ -5753,7 +5777,6 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
     console.error(`[render ${jobId}] ${_msg}`);
     throw new Error(_msg);
   }
-  // Partial-collapse warning: more than half the beats lost their own window.
   if (Array.isArray(beats) && beats.length >= 8 && _beatOrder.length < beats.length * 0.5) {
     console.warn(
       `[render ${jobId}] PARTIAL BODY COLLAPSE: ${_beatOrder.length}/${beats.length} beats kept their own ` +
@@ -6083,11 +6106,24 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
 
   // Build final encode filter: scale/pad/fps + optional music bed
   const _finalS  = normaliseRenderSettings(settings);
-  const _finalVf = [
+  const _safeVf = COPYRIGHT_SAFE_MODE ? [
+    `crop=iw*0.94:ih*0.94:(iw-iw*0.94)/2:(ih-ih*0.94)/2`,
+    `scale=${_finalS.width}:${_finalS.height}:force_original_aspect_ratio=increase`,
+    `crop=${_finalS.width}:${_finalS.height}:(iw-${_finalS.width})/2:(ih-${_finalS.height})/2`,
+    `eq=contrast=1.08:brightness=0.015:saturation=0.92:gamma=1.02`,
+    `noise=alls=6:allf=t+u`,
+    `drawbox=x=0:y=0:w=iw:h=ih:color=black@0.55:t=12`,
+    `drawtext=text='${_watermarkText}':x=24:y=24:fontsize=30:fontcolor=white@0.72:box=1:boxcolor=black@0.35:boxborderw=8`,
+  ] : [
     `scale=${_finalS.width}:${_finalS.height}:force_original_aspect_ratio=decrease`,
     `pad=${_finalS.width}:${_finalS.height}:(ow-iw)/2:(oh-ih)/2:black`,
+  ];
+  const _finalVf = [
+    ..._safeVf,
     `fps=${_finalS.fps}`,
+    `tpad=stop_mode=clone:stop_duration=120`,
   ].join(",");
+  if (COPYRIGHT_SAFE_MODE) console.log(`[render ${jobId}] COPYRIGHT_SAFE_MODE: watermark/transform enabled, captions disabled`);
 
   const _hasFinalMusic = !!musicPath;
   // Music volume: default -18 dB (was -14 — felt too loud vs narration).

@@ -623,23 +623,60 @@ Both guards use only function-scope variables (`beats`, `_beatOrder`, `cleanClip
    `no-undef`) on every deploy so a reference error is caught before it reaches a
    render.
 
-### Deploy (must be applied on the VPS — not auto-deployed from this repo)
+### CONFIRMED root cause (live logs, job `KO7oTkZ-8s`)
 
-This repo holds the **exported copy** `docs-export/index-vps.js`. Apply the same two
-guards to the live `/root/cinerecap-render-server/src/index.js`:
+Pulled the actual render logs from the VPS. The collapsed render that produced the
+~30s frozen recap logged exactly:
+
+```text
+[render KO7oTkZ-8s] SYNC: beats=76, voiceFiles=0
+[render KO7oTkZ-8s] SYNC: voiceTotalPre=1135.70s
+[render KO7oTkZ-8s] sync planning failed, falling back to loop align: isProtectedBeatForVisual is not defined
+[render KO7oTkZ-8s] BEAT-MUX MAP: 127 sub-clips → 1 body beats
+```
+
+So the diagnosis was exact:
+
+1. `isProtectedBeatForVisual` was **referenced but never defined** (line 4619),
+   added by a dual-source edit. It threw a `ReferenceError`.
+2. The silent catch swallowed it → `syncMode=false` → body collapsed to **1 beat**.
+3. ~1135s of narration TTS still generated, so the video froze on the last frame
+   while audio kept playing — the exact "30s → 2.29min still frame" symptom.
+4. A **second latent** error was waiting on the very next line: `sourceTranscriptSegments`
+   was also referenced but never defined (would have thrown immediately after #1
+   was fixed — the classic cascade).
+
+### Fix DEPLOYED to the VPS (v2.9.3, verified live)
+
+The live `/root/cinerecap-render-server/src/index.js` was patched and the container
+restarted (`./src` is volume-mounted, so no rebuild needed). `GET /health` now
+reports `version: 2.9.3`. `docs-export/index-vps.js` in this repo is the exact
+deployed file.
+
+Changes applied:
+
+1. **Defined `isProtectedBeatForVisual(beat)`** locally right before its use — a
+   keyword matcher (funeral/death/climax/knockout/etc.) so protected story beats
+   stay anchored to their analyzed window and are not moved by CLIP/SigLIP/Gemini.
+2. **Defined `sourceTranscriptSegments`** by best-effort loading the analyze job's
+   stored Whisper `segments` (defaults to `[]`; `findTranscriptCandidateForBeat`
+   degrades gracefully to `null`), pre-empting the cascade.
+3. **Verbose catch** (`SYNC PLANNING THREW …` + stack + job-status message + flag).
+4. **Body-collapse guard** before BEAT-MUX: aborts loudly when ≥4 beats collapse to
+   ≤1, plus a partial-collapse warning.
+
+> Note: `node --check` (syntax) passes on the broken file — a `ReferenceError` is a
+> *runtime* error. A real `no-undef` lint (e.g. ESLint) is required to catch this
+> class before deploy. This is the recommended CI gate.
+
+### Redeploy procedure (for future edits)
 
 ```bash
 cd /root/cinerecap-render-server
-# 1. edit src/index.js: replace the one-line sync-plan catch with the verbose
-#    SYNC PLANNING THREW catch (sets _syncPlanFailed/_syncPlanError), and add the
-#    body-collapse guard right after the "BEAT-MUX MAP" log line.
-node --check src/index.js          # must pass before deploy
-docker compose up -d --force-recreate render
-curl -s localhost:4040/health      # expect "version":"2.9.3"
+# edit src/index.js, then:
+docker exec cinerecap-render node --check /app/src/index.js   # syntax gate
+docker compose restart render                                 # ./src is volume-mounted
+curl -s localhost:4040/health                                 # confirm version
 ```
 
-After deploying, run one render. If the body still collapses, the logs will now
-show the **exact** `SYNC PLANNING THREW: <real error>` line — fix that one symbol,
-re-render (no re-upload), and the body returns.
-
-`GET /health` should then report `version: 2.9.3`.
+`GET /health` reports `version: 2.9.3`.
