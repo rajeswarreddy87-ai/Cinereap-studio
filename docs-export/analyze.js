@@ -94,7 +94,7 @@ export function buildAnalyzeMessages({ movie, frames, channelName, maxClipSecond
   }
   const cast = movie.cast
     ? `\nFilm characters (use these names — NOT the actors' real names): ${movie.cast}.`
-    : `\nNo cast list provided — use your training knowledge of "${movie.title}"${movie.year ? ` (${movie.year})` : ""} to identify every character by their FICTIONAL CHARACTER NAME. Never use actor real names.`;
+    : `\nNo cast list provided — identify characters ONLY when the transcript, extracted character list, on-screen text, or unmistakable dialogue supports the name. Never use actor real names. If a name or relationship is uncertain, use a neutral role label such as "the trainer", "the manager", "the daughter", "one of the men", or "the officer".`;
   const director = movie.director ? `, directed by ${movie.director}` : "";
   const year = movie.year ? ` (${movie.year})` : "";
   const genre = movie.genre ? `${movie.genre} ` : "";
@@ -343,7 +343,7 @@ export function buildClipNotesMessages({ movie, frames, maxClipSeconds = 6, targ
 export function buildScriptFromNotesMessages({ movie, channelName, beatNotes, transcriptBlock = "" }) {
   const cast = movie.cast
     ? `\nFilm characters (use these names — NOT the actors' real names): ${movie.cast}.`
-    : `\nNo cast list provided — use your training knowledge of "${movie.title}"${movie.year ? ` (${movie.year})` : ""} to identify every character by their FICTIONAL CHARACTER NAME. Never use actor real names.`;
+    : `\nNo cast list provided — identify characters ONLY when the transcript, extracted character list, on-screen text, or unmistakable dialogue supports the name. Never use actor real names. If a name or relationship is uncertain, use a neutral role label such as "the trainer", "the manager", "the daughter", "one of the men", or "the officer".`;
   const director = movie.director ? `, directed by ${movie.director}` : "";
   const year = movie.year ? ` (${movie.year})` : "";
   const genre = movie.genre ? `${movie.genre} ` : "";
@@ -768,7 +768,7 @@ export function parseStoryOutlineResponse(rawText) {
 export function buildSceneScriptMessages({ movie, channelName, beats, characters, transcriptBlock = "", narrationLang = "English", storyOutline = [], batchInfo = null }) {
   const cast = movie.cast
     ? `\nFilm characters (use these names — NOT the actors' real names): ${movie.cast}.`
-    : `\nNo cast list provided — use your training knowledge of "${movie.title}"${movie.year ? ` (${movie.year})` : ""} to identify every character by their FICTIONAL CHARACTER NAME. Never use actor real names.`;
+    : `\nNo cast list provided — identify characters ONLY when the transcript, extracted character list, on-screen text, or unmistakable dialogue supports the name. Never use actor real names. If a name or relationship is uncertain, use a neutral role label such as "the trainer", "the manager", "the daughter", "one of the men", or "the officer".`;
   const director = movie.director ? `, directed by ${movie.director}` : "";
   const year = movie.year ? ` (${movie.year})` : "";
   const genre = movie.genre ? `${movie.genre} ` : "";
@@ -806,6 +806,21 @@ export function buildSceneScriptMessages({ movie, channelName, beats, characters
         `Movie: "${movie.title}"${year}${director}${cast}. Film length ${Math.round(movie.durationSec)}s.\n\n` +
         charText +
         outlineText +
+        `CHARACTER / RELATIONSHIP ACCURACY CONTRACT (mandatory):
+` +
+        `- Do NOT infer family relationships unless the transcript or character list explicitly confirms them.
+` +
+        `- Do NOT invent names for unnamed people. Use neutral labels when uncertain.
+` +
+        `- Do NOT swap character names between people in the same scene.
+` +
+        `- If a transcript line is ambiguous, say "one of them" or describe the action without naming.
+` +
+        `- Relationship words like father, brother, uncle, wife, daughter, manager, trainer must be used only when confirmed.
+` +
+        `- Prefer accuracy over dramatic wording; a wrong name is worse than a generic label.
+
+` +
         (transcriptBlock
           ? `Ground the recap in this ACTUAL dialogue transcript (real plot, names, key lines). Do NOT invent ` +
             `events it does not support.\n\nTRANSCRIPT:\n${transcriptBlock}\n\n`

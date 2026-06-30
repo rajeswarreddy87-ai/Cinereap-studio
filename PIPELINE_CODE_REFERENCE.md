@@ -1,4 +1,4 @@
-# CineRecap VPS Pipeline — Code Reference (v2.8.3)
+# CineRecap VPS Pipeline — Code Reference (v2.8.4)
 
 **Server path:** `/root/cinerecap-render-server/`  
 **Live URL:** `http://109.123.241.130:4040`  
@@ -110,7 +110,7 @@ Server reports **0.3–0.6s timing drift** — not 5–10s.
 4. **Music** — default bed `-26dB` (was `-18`), stronger ducking `ratio=12`
 5. **v2.7.1 fixes retained** — analyzeJobId auto-resolve, per-beat TTS, video speed-up in mux
 
-Verify: `GET /health` → `"version": "2.8.3"`
+Verify: `GET /health` → `"version": "2.8.4"`
 
 ---
 
@@ -414,3 +414,19 @@ Fixes:
 - Hook max output increased to 700 tokens.
 
 `GET /health` now reports `version: 2.8.3`.
+
+
+## v2.8.4 body prompt grounding upgrade
+
+User observed wrong character names and relationships in the body narration.
+
+Fixes:
+
+- Removed permissive reliance on model training knowledge when no cast list is provided.
+- Names may now be used only when supported by transcript, extracted character list, on-screen text, or unmistakable dialogue.
+- If a name or relationship is uncertain, Claude is instructed to use a neutral role label such as `the trainer`, `the manager`, `the daughter`, `one of the men`, etc.
+- Added a mandatory `CHARACTER / RELATIONSHIP ACCURACY CONTRACT` to the body prompt.
+- Strengthened attribution rule: no guessing job/relationship/action when multiple characters appear; use `one of them` if ambiguous.
+- Added explicit `NAME SAFETY` rule in narration quality section.
+
+`GET /health` now reports `version: 2.8.4`.

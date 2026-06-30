@@ -412,7 +412,7 @@ app.get("/health", (_req, res) => {
 
   res.json({
     ok: true,
-    version: "2.8.3",
+    version: "2.8.4",
     serverTranscription: Boolean(SERVER_OPENAI_KEY),
     serverAnalysis: Boolean(SERVER_ANTHROPIC_KEY),
     serverModel: SERVER_ANTHROPIC_MODEL || null,

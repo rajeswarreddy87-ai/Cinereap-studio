@@ -114,3 +114,8 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
             console.log(`[render ${jobId}] HOOK-V2: "${_hookText.slice(0, 70)}..." sourceBeatIds=[${_hookV2BeatIds.join(",")}]`);
           }
         }
+      } catch (hv2GenErr) {
+        console.warn(`[render ${jobId}] HOOK-V2 generation skipped (non-fatal):`, hv2GenErr?.message || hv2GenErr);
+      }
+    }
+    // ── END HOOK V2 GENERATION ─────────────────────────────────────────────
