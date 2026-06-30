@@ -1,4 +1,4 @@
-# CineRecap VPS Pipeline — Code Reference (v2.9.3)
+# CineRecap VPS Pipeline — Code Reference (v2.9.4)
 
 **Server path:** `/root/cinerecap-render-server/`  
 **Live URL:** `http://109.123.241.130:4040`  
@@ -706,11 +706,61 @@ The body no longer collapses: a full ~20-minute recap with 76 body beats and a
 100% pre-render sync score, watermark applied. The earlier identical input had
 produced a ~30s frozen clip.
 
-**Known remaining (minor, not the reported bug):** the video stream is ~74s longer
-than the audio. This is the accumulated per-beat `tpad=stop_duration=0.6s` clone
-tail across 76 beats (+ hook), i.e. a brief frozen frame after each beat's
-narration, not one long dead-air tail. Optional follow-up: clamp each muxed beat
-to its audio duration (tighten the v2.7.6 `-t` clamp / reduce tpad) so the video
-stream tracks the audio more closely. Deliberately left unchanged here to avoid
-regressing the opposite failure (video ending before narration) right after the
-body-collapse fix.
+The video stream is ~74s longer than the audio — investigated and fixed in v2.9.4.
+
+
+## v2.9.4 — verify A/V sync + fix end-of-video frozen frame (hook/body param mismatch)
+
+User asked whether the v2.9.3 ~74s video/audio difference causes drift. Verified
+empirically against render `ouR-OfMY5l` on the live VPS.
+
+### Verification: NO drift in the body
+
+- Per-segment probe of all 76 `beat-muxed-*` segments: each is balanced (worst
+  single-segment |video−audio| = **0.32s**; the small per-beat lead-out does not
+  drift narration).
+- Raw `-c copy` concat of the **body** segments: video **1118.82s** vs audio
+  **1118.56s** → **0.26s total over 18.6 min**. The concat demuxer keeps the
+  streams container-aligned, so the per-beat tails do **not** accumulate.
+- `silencedetect` on the body: no silence ≥1.5s → narration is continuous.
+
+Conclusion: **narration stays matched to the video throughout the body — there is
+no progressive A/V drift.**
+
+### Root cause of the ~74s difference: hook/body parameter mismatch
+
+`ffprobe` of the segments:
+
+```text
+hook segment : 1920x1080  25 fps  time_base 1/12800
+body segments: 1280x720   24 fps  time_base 1/12288
+```
+
+Concatenating segments with **different resolution / fps / timebase** corrupts the
+concat timeline: the joined **video stream under-runs the audio by ~45s**. The old
+final `tpad=stop_duration=120` then froze the last frame to cover it, producing:
+
+- ~45s where the last ~45s of narration plays over a **frozen frame** (confirmed by
+  `freezedetect`: video freezes at ~1098s while narration runs to ~1143.6s), then
+- ~74s of **silent frozen frame** after narration ends (video stream 1217.7s vs
+  audio 1143.6s).
+
+Proof: normalizing the hook to the body spec (1280x720/24fps) made the `-c copy`
+concat balanced — **video 1143.36s vs audio 1143.10s (0.26s)** — no deficit.
+
+### Fix shipped (v2.9.4, deployed to VPS)
+
+1. **Segment normalisation before concat**: probe every muxed segment, find the
+   dominant `WxH@fps` spec (the body), and re-encode any outlier (the hook) to
+   match. Only outliers are re-encoded, so it is cheap. This removes the ~45s
+   video under-run and the frozen-frame-over-narration section.
+2. **Final tail clamp**: `tpad=stop_mode=clone:stop_duration=120` → `=2` (small
+   safety so the last word is never clipped) **plus** restored
+   `-t outputDurationSec` on the final encode, so the MP4 ends right after the last
+   beat's footage instead of holding a frozen frame for ~74s. `outputDurationSec`
+   = Σ muxed-segment durations ≥ narration length, so speech can never be cut.
+
+Net effect: final video length ≈ narration length; footage plays under narration
+the whole way through; no frozen-frame tail.
+
+`GET /health` reports `version: 2.9.4`.

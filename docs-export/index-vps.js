@@ -399,7 +399,7 @@ app.get("/health", (_req, res) => {
 
   res.json({
     ok: true,
-    version: "2.9.3",
+    version: "2.9.4",
     serverTranscription: Boolean(SERVER_OPENAI_KEY),
     serverAnalysis: Boolean(SERVER_ANTHROPIC_KEY),
     serverModel: SERVER_ANTHROPIC_MODEL || null,
@@ -6067,6 +6067,62 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
   }
   // ── END HOOK-V2 SEGMENT ───────────────────────────────────────────────────
 
+  // ── SEGMENT NORMALISATION (v2.9.4) ─────────────────────────────────────────
+  // Concatenating segments with mismatched video params (resolution / fps /
+  // timebase) corrupts the concat timeline and makes the final video stream
+  // UNDER-RUN the audio. Observed on render ouR-OfMY5l: the hook segment was
+  // 1920x1080@25fps while body beats were 1280x720@24fps, so the concatenated
+  // video ended ~45s before narration → the last ~45s of narration played over
+  // a frozen frame (then a long silent frozen tail). Re-encode any segment whose
+  // video params differ from the dominant spec so every segment shares identical
+  // width/height/fps before concat. Only outliers are re-encoded (cheap).
+  try {
+    if (_muxedPaths.length > 1) {
+      const _probeVParams = (p) => new Promise((resolve) => {
+        const ff = spawn("ffprobe", ["-v","error","-select_streams","v:0",
+          "-show_entries","stream=width,height,r_frame_rate","-of","json", p],
+          { stdio: ["ignore","pipe","ignore"] });
+        let out = "";
+        ff.stdout.on("data", (d) => { out += d; });
+        ff.on("close", () => { try { const s = JSON.parse(out).streams?.[0] || {}; resolve({ w:Number(s.width)||0, h:Number(s.height)||0, fr:String(s.r_frame_rate||"") }); } catch { resolve({ w:0,h:0,fr:"" }); } });
+        ff.on("error", () => resolve({ w:0,h:0,fr:"" }));
+      });
+      const _allP = await Promise.all(_muxedPaths.map(_probeVParams));
+      const _counts = new Map();
+      _allP.forEach((pp) => { const k = `${pp.w}x${pp.h}@${pp.fr}`; _counts.set(k, (_counts.get(k)||0)+1); });
+      let _domKey = null, _domN = -1;
+      for (const [k,n] of _counts) { if (n > _domN) { _domN = n; _domKey = k; } }
+      const _dom = _allP[_allP.findIndex((pp) => `${pp.w}x${pp.h}@${pp.fr}` === _domKey)] || _allP[0];
+      const _domFps = (() => { const m = String(_dom.fr).split("/"); const n = Number(m[0])||24, d = Number(m[1])||1; return Math.max(1, Math.round(n/d)); })();
+      if (_dom.w > 0 && _dom.h > 0 && _counts.size > 1) {
+        let _normCount = 0;
+        for (let _i = 0; _i < _muxedPaths.length; _i++) {
+          const pp = _allP[_i];
+          if (pp.w === _dom.w && pp.h === _dom.h && pp.fr === _dom.fr) continue;
+          const _src = _muxedPaths[_i];
+          const _normPath = _src.replace(/\.mp4$/i, "") + "-norm.mp4";
+          const _ok = await new Promise((resolve) => {
+            const ff = spawn("ffmpeg", [
+              "-y","-hide_banner","-loglevel","error","-i", _src,
+              "-vf", `scale=${_dom.w}:${_dom.h}:force_original_aspect_ratio=increase,crop=${_dom.w}:${_dom.h},fps=${_domFps},setsar=1`,
+              "-c:v","libx264","-preset","ultrafast","-crf","23","-pix_fmt","yuv420p",
+              "-c:a","aac","-b:a","192k","-ar","48000","-ac","2",
+              _normPath,
+            ], { stdio: "ignore" });
+            const t = setTimeout(() => { try { ff.kill("SIGKILL"); } catch {} resolve(false); }, 180_000);
+            ff.on("close", (c) => { clearTimeout(t); resolve(c === 0); });
+            ff.on("error", () => { clearTimeout(t); resolve(false); });
+          });
+          if (_ok) { _muxedPaths[_i] = _normPath; _normCount++; }
+        }
+        if (_normCount > 0) console.log(`[render ${jobId}] SEGMENT-NORM: re-encoded ${_normCount} outlier segment(s) → ${_domKey} (dominant) for drift-free concat`);
+      }
+    }
+  } catch (_normErr) {
+    console.warn(`[render ${jobId}] SEGMENT-NORM failed (continuing):`, _normErr?.message || _normErr);
+  }
+  // ── END SEGMENT NORMALISATION ──────────────────────────────────────────────
+
   const manifestPath  = path.join(UPLOADS_DIR, `concat-${jobId}.txt`);
   await fs.writeFile(manifestPath, buildConcatManifest(_muxedPaths), "utf8");
 
@@ -6121,7 +6177,12 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
   const _finalVf = [
     ..._safeVf,
     `fps=${_finalS.fps}`,
-    `tpad=stop_mode=clone:stop_duration=120`,
+    // Small safety pad so the video stream cannot end a few frames before the
+    // narration audio (last word never clipped). The whole output is then hard-
+    // clamped to outputDurationSec (sum of muxed segment durations) via -t below,
+    // so this no longer produces a long frozen tail. (Was stop_duration=120 with
+    // NO clamp → ~74s of frozen last frame after narration ended.)
+    `tpad=stop_mode=clone:stop_duration=2`,
   ].join(",");
   if (COPYRIGHT_SAFE_MODE) console.log(`[render ${jobId}] COPYRIGHT_SAFE_MODE: watermark/transform enabled, captions disabled`);
 
@@ -6158,6 +6219,15 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
     "-map", "[vout]", "-map", "[aout]",
     "-c:v", _finalS.codec, "-crf", String(_finalS.crf), "-preset", _encPreset, "-pix_fmt", "yuv420p",
     "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+    // Hard-clamp the final MP4 to the concatenated content duration so the video
+    // ends right at the last beat's footage (~0.2s after the final word) instead
+    // of holding a frozen frame for ~74s. outputDurationSec = Σ muxed-segment
+    // durations = max(video,audio) per segment, so it is ≥ the narration length
+    // and can never truncate speech. v2.9.4 restores the clamp lost in a prior
+    // overwrite.
+    ...(Number.isFinite(outputDurationSec) && outputDurationSec > 1
+      ? ["-t", String(outputDurationSec.toFixed(3))]
+      : []),
     "-movflags", "+faststart",
     outputPath,
   ];
