@@ -1,3 +1,53 @@
+        const timer = setTimeout(() => {
+          try { ff.kill("SIGKILL"); } catch {}
+          console.warn(`[render ${jobId}] ffmpeg trim ${i} timed out (${TRIM_TIMEOUT_MS / 1000}s) — skipping`);
+          clipDone();
+        }, TRIM_TIMEOUT_MS);
+
+        ff.on("close", (code) => {
+          clearTimeout(timer);
+          if (code === 0) trimResults[i] = clipPath;
+          else console.warn(`[render ${jobId}] ffmpeg trim ${i} failed (code ${code}) — skipping`);
+          clipDone();
+        });
+        ff.on("error", (err) => {
+          clearTimeout(timer);
+          console.warn(`[render ${jobId}] ffmpeg trim ${i} spawn error: ${err?.message || err} — skipping`);
+          clipDone();
+        });
+      }
+
+      // Edge case: nothing was ever launched (0 clips)
+      if (nextIndex >= cleanClips.length && active === 0) finish();
+    };
+
+    launchNext(); // kick off the pool
+  });
+
+  // Compact to only successfully-trimmed clips (no holes).
+  let clipPaths = trimResults.filter((p) => p);
+  if (clipPaths.length === 0) {
+    throw new Error("All clip trims failed — check the source file and timestamps.");
+  }
+
+  // Hook is kept separate — it will be muxed as an independent segment after
+  // the body BEAT-MUX completes, then prepended to the final manifest.
+  // (No clipPaths / voiceoverFileIds modification here.)
+
+  // ── HOOK FOOTAGE CLIP — DISABLED ─────────────────────────────────────────
+  // Legacy hook system. Superseded by HOOK V2 above.
+  if (false && _hookTtsId) {
+    let _hSrcDur = 0;
+    try { _hSrcDur = await probeDurationSec(sourcePath); } catch {}
+    if (_hSrcDur > 40) {
+      // Cap hook footage at first 35% of movie — prevents picking from the
+      // climax/ending region that story beats already cover, which causes the
+      // "same scene appears at hook AND near end" problem.
+      const _hCeil = Math.min(_hSrcDur * 0.35, _hSrcDur - 60);
+      try {
+        const _hookMergedPath = path.join(UPLOADS_DIR, `hook-clip-${jobId}.mp4`);
+        let _hookSubClips = [];
+
         // ── DIRECT-TIMESTAMP PATH (on-demand hook) ──────────────────────────
         // When the hook was generated on-demand, _hookDirectTimestamps holds the
         // actual {startSec,endSec} of the beats used to write the narration.
@@ -159,53 +209,3 @@
           console.log(`[render ${jobId}] HOOK: single sub-clip prepended + TTS ${_hookTtsId}`);
         } else if (_hookSubClips.length > 1) {
           // Merge sub-clips into one hook track then prepend
-          const _hManifest = path.join(UPLOADS_DIR, `hook-manifest-${jobId}.txt`);
-          await fs.writeFile(_hManifest, _hookSubClips.map((p) => `file '${p}'`).join("\n"), "utf8");
-          await new Promise((res) => {
-            const ff = spawn("ffmpeg", [
-              "-f", "concat", "-safe", "0", "-i", _hManifest,
-              "-c:v", "libx264", "-preset", "fast", "-crf", "23", "-an", "-y", _hookMergedPath,
-            ], { stdio: "ignore" });
-            const t = setTimeout(() => { try { ff.kill("SIGKILL"); } catch {} res(); }, 90_000);
-            ff.on("close", (code) => {
-              clearTimeout(t);
-              if (code === 0) {
-                clipPaths.unshift(_hookMergedPath);
-                voiceoverFileIds.unshift(_hookTtsId);
-                console.log(`[render ${jobId}] HOOK: ${_hookSubClips.length} sub-clips merged + prepended + TTS ${_hookTtsId}`);
-              } else {
-                console.warn(`[render ${jobId}] hook merge failed (code ${code}) — skipping hook`);
-              }
-              res();
-            });
-            ff.on("error", (e) => { clearTimeout(t); console.warn(`[render ${jobId}] hook merge error:`, e?.message || e); res(); });
-          });
-          for (const sc of _hookSubClips) { try { await fs.unlink(sc); } catch {} }
-          try { await fs.unlink(_hManifest); } catch {}
-        }
-      } catch (hClipErr) {
-        console.warn(`[render ${jobId}] hook clip failed (non-fatal):`, hClipErr?.message || hClipErr);
-      }
-    } // end if (_hSrcDur > 40)
-  }
-  // ── END HOOK FOOTAGE CLIP ─────────────────────────────────────────────────
-
-  // ── OUTRO SEGMENT — DISABLED ─────────────────────────────────────────────
-  // Outro removed. Video ends cleanly after last body beat.
-  if (false) try {
-    const _outroText = (typeof settings?.outroText === "string" && settings.outroText.trim())
-      ? settings.outroText.trim()
-      : "That's the complete story. If you enjoyed this breakdown, hit like and subscribe for more movie recaps every week.";
-    if (_hookTtsKey) {
-      const _outroTtsSpeed = (settings && settings.ttsSpeed) || 1.0;
-      const _outroTtsId    = `${jobId}-outro-tts-beat-000.mp3`;
-      const _outroTtsPath  = path.join(UPLOADS_DIR, _outroTtsId);
-      let _outroDurSec     = 0;
-      let _outroTtsOk      = false;
-
-      // Attempt 1: primary TTS provider (same as story beats)
-      try {
-        await _ttsOnce(_hookTtsProvider, _hookTtsKey, _hookTtsVoice, _outroTtsSpeed, _outroText, _outroTtsPath);
-        _outroDurSec = await probeDurationSec(_outroTtsPath);
-        if (_outroDurSec > 0.1) { _outroTtsOk = true; }
-      } catch (e1) {

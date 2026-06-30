@@ -1,3 +1,53 @@
+    const imgRes = await fetch(entry.url);
+    if (!imgRes.ok) throw new Error(`Image download failed: ${imgRes.status}`);
+    buf = Buffer.from(await imgRes.arrayBuffer());
+  } else if (entry?.b64_json) {
+    buf = Buffer.from(entry.b64_json, "base64");
+  } else {
+    throw new Error("No url or b64_json in DALL-E response");
+  }
+  // Re-encode to JPEG via ffmpeg (normalises size + strips metadata)
+  const tmpPng = destPath + ".tmp.png";
+  await fs.writeFile(tmpPng, buf);
+  await new Promise((resolve) => {
+    const ff = spawn("ffmpeg", ["-y", "-loglevel", "error", "-i", tmpPng,
+      "-vf", "scale=1280:-2", "-q:v", "3", destPath], { stdio: "ignore" });
+    ff.on("close", resolve); ff.on("error", resolve);
+  });
+  try { await fs.unlink(tmpPng); } catch {}
+  await fs.stat(destPath); // throws if file wasn't written
+  return destPath;
+}
+
+// Build a channel-style DALL-E prompt from the story data.
+// The goal: hyperrealistic YouTube thumbnail showing hero in danger — matching
+// the "Super Short Summary" channel aesthetic (close-up face, tabloid drama).
+function buildChannelDallEPrompt(style, { youtubeTitle, storySummary, movieTitle }) {
+  const title = (youtubeTitle || movieTitle || "a dramatic movie scene").replace(/['"]/g, "");
+  const summary = (storySummary || "").slice(0, 220).replace(/['"]/g, "");
+  const storyCtx = summary
+    ? `Story context: "${summary}". `
+    : "";
+
+  if (style === "dramatic") {
+    return (
+      `${storyCtx}` +
+      `YouTube movie recap thumbnail — tabloid drama style, title: "${title}". ` +
+      `Hyperrealistic cinematic close-up: the PROTAGONIST (the victim or hero from this story) fills most of the frame. ` +
+      `Their face shows raw fear, desperation, or pain — wide eyes, tense jaw, sweat. ` +
+      `A threatening figure or dark force looms behind them or is partially visible at the edge. ` +
+      `Dramatic chiaroscuro: face lit from one side by a harsh amber/orange practical light, ` +
+      `deep black background with cool blue shadows. Shallow depth of field, film grain, ` +
+      `sharp on the eyes. No text. No watermarks. No subtitles. 16:9 aspect ratio.`
+    );
+  }
+  if (style === "bold") {
+    return (
+      `${storyCtx}` +
+      `YouTube thumbnail — high-voltage confrontation scene for: "${title}". ` +
+      `Hyperrealistic film still: the hero faces the antagonist or threat head-on. ` +
+      `Both figures tense, aggressive body language, intense eye contact or a physical clash. ` +
+      `Extreme high-contrast lighting — vivid warm orange side-light on hero, ` +
       `cold blue/green on the antagonist. Punchy oversaturated colors. ` +
       `Camera slightly low-angle to emphasise power struggle. No text. No watermarks. 16:9.`
     );
@@ -119,53 +169,3 @@ app.post("/jobs/:jobId/ai-thumbnails", requireAuth, async (req, res) => {
       }
       if (ok) {
         results[style] = `/jobs/${req.params.jobId}/ai-thumbnails/${style}`;
-        console.log(`[ai-thumbnails ${req.params.jobId}] source-frame ${style} @ ${chosen.toFixed(1)}s OK brightness=${chosenBrightness.toFixed(1)} (analyze=${analyzeJobId_ || 'auto'})`);
-      } else {
-        errors[style] = `source-frame extraction failed (${candidates.length} candidates)`;
-        console.warn(`[ai-thumbnails ${req.params.jobId}] source-frame ${style} failed (${candidates.length} candidates)`);
-      }
-    }
-  }
-
-  // ── Secondary fallback: enhanced real frames from rendered recap ──────────
-  let videoOk = false;
-  try { await fs.stat(outputVideo); videoOk = true; } catch {}
-  const stillMissingAfterSource = VARIANTS.filter((style) => !results[style]);
-  if (videoOk && stillMissingAfterSource.length > 0) {
-    const duration = await new Promise((resolve) => {
-      let out = "";
-      const fp = spawn("ffprobe", ["-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1", outputVideo], { stdio: ["ignore", "pipe", "ignore"] });
-      fp.stdout.on("data", (c) => { out += c; });
-      fp.on("close", () => resolve(parseFloat(out.trim()) || 60));
-      fp.on("error", () => resolve(60));
-    });
-    const sceneTs = await findSceneChangeTimestamps(outputVideo, duration);
-    const TARGET_REGIONS = {
-      dramatic:  { lo: 0.45, hi: 0.78, fallback: 0.62 },
-      bold:      { lo: 0.18, hi: 0.58, fallback: 0.42 },
-      cinematic: { lo: 0.55, hi: 0.90, fallback: 0.72 },
-    };
-    const pickTimestamp = (style) => {
-      const { lo, hi, fallback } = TARGET_REGIONS[style];
-      const inRegion = sceneTs.filter((t) => t >= duration * lo && t <= duration * hi);
-      if (inRegion.length > 0) {
-        const center = duration * ((lo + hi) / 2);
-        return inRegion.reduce((a, b) => Math.abs(b - center) < Math.abs(a - center) ? b : a);
-      }
-      return Math.max(1, Math.min(duration * fallback, duration - 1));
-    };
-    await Promise.allSettled(
-      stillMissingAfterSource.map(async (style) => {
-        try {
-          const timeSec = pickTimestamp(style);
-          const dest = aiThumbPath(req.params.jobId, style);
-          await extractStyledFrame(outputVideo, timeSec, dest, style);
-          results[style] = `/jobs/${req.params.jobId}/ai-thumbnails/${style}`;
-          console.log(`[ai-thumbnails ${req.params.jobId}] render-frame ${style} @ ${timeSec.toFixed(1)}s OK`);
-        } catch (e) {
-          errors[style] = (errors[style] ? errors[style] + " | " : "") + String(e?.message || e);
-        }
-      })
-    );
-  }
-

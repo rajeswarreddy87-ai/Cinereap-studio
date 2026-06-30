@@ -1,3 +1,53 @@
+        });
+      }
+    } catch (autoErr) {
+      console.warn(`[render ${jobId}] AUTO-LOAD: failed:`, autoErr?.message || autoErr);
+      await jobStore.update(jobId, {
+        message: `Scene lookup failed: ${String(autoErr?.message || autoErr).slice(0, 80)}`,
+      });
+    }
+  }
+
+  // ── PRE-SYNC: redistribute zero-origin timestamps and activate audioSeconds
+  // sync when the app sent per-beat audioSeconds but no real scene windows.
+  //
+  // The app always sends an `audioSeconds` field on each timestamp recording
+  // exactly how long that beat's narration runs. When the AI script step
+  // didn't produce real scene windows (startSec=0, endSec=0), the clips all
+  // point to the first frame of the movie and the visuals loop endlessly.
+  // Fix: spread the windows evenly across the credits-safe region of the film
+  // so the footage actually advances, then use audioSeconds as exact on-screen
+  // durations instead of guessing from word counts.
+  {
+    const hasAudioSec = Array.isArray(timestamps) && timestamps.length > 0 &&
+      timestamps.every((t) => typeof t.audioSeconds === 'number' && t.audioSeconds > 0);
+    if (hasAudioSec) {
+      // Count how many timestamps have no real scene window.
+      const zeroCount = timestamps.filter(
+        (t) => t.startSec === 0 && (t.endSec === 0 || t.endSec <= 1)
+      ).length;
+      const needsRedistribution = zeroCount > timestamps.length * 0.3;
+      if (needsRedistribution) {
+        let srcDurPre = 0;
+        try { srcDurPre = await probeDurationSec(sourcePath); } catch {}
+        if (srcDurPre > 60) {
+          const creditsTailPre = Math.min(srcDurPre * 0.08, Math.max(90, srcDurPre * 0.035));
+          const safeEndPre   = Math.max(srcDurPre * 0.5, srcDurPre - creditsTailPre);
+          const safeStartPre = Math.min(180, srcDurPre * 0.04);
+          const n = timestamps.length;
+          const safeWindow = safeEndPre - safeStartPre;
+          timestamps = timestamps.map((t, i) => {
+            // Keep any timestamp that already has a real non-trivial window.
+            if (t.startSec > 0 && t.endSec > t.startSec + 1 && t.endSec < srcDurPre * 0.9) return t;
+            // Intro: first timestamp spanning the whole movie — give it the opening.
+            if (i === 0 && t.endSec >= srcDurPre * 0.5) {
+              const winDur = Math.min(t.audioSeconds * 0.8, 10);
+              return { ...t, startSec: safeStartPre, endSec: Math.min(safeStartPre + winDur, safeEndPre) };
+            }
+            // Outro: last timestamp — give it the closing section.
+            if (i === n - 1) {
+              const winDur = Math.min(t.audioSeconds * 0.8, 10);
+              return { ...t, startSec: Math.max(safeEndPre - winDur, safeStartPre), endSec: safeEndPre };
             }
             // Body beats: spread evenly, proportional to audioSeconds.
             const frac = n > 2 ? (i - 0.5) / (n - 1) : 0.5;
@@ -69,53 +119,3 @@
               j.status === 'done' &&
               Array.isArray(j.result?.beats) &&
               j.result.beats.length > 0,
-          )
-          .sort((a, b) => b.createdAt - a.createdAt)[0];
-        if (analyzeJob) {
-          // Sort beats chronologically (they should already be, but be safe).
-          let rawBeats = analyzeJob.result.beats
-            .slice()
-            .sort((a, b) => Number(a.startSec) - Number(b.startSec));
-
-          // FIX A — Drop beats Claude labelled as SKIP (studio logos, title cards).
-          // No hard time threshold — story content starts at different points
-          // per film and region. Trust Claude's own beat notes exclusively.
-          const beforeSkip = rawBeats.length;
-          rawBeats = rawBeats.filter((b) => {
-            const narr = String(b.narration || b.reason || "").trim();
-            if (narr.toUpperCase().startsWith("SKIP")) return false;
-            if (/\b(studio|logo|production\s*company|distributor|credit|title\s*card|opening\s*credit)\b/i.test(narr)) return false;
-            return true;
-          });
-          if (rawBeats.length < beforeSkip) {
-            console.log(`[render ${jobId}] scene-sync: filtered ${beforeSkip - rawBeats.length} SKIP/credits beats`);
-          }
-
-          // FIX B — Expand each beat window from its tight 6-second clip to the
-          // FULL scene range (beat[i].startSec → beat[i+1].startSec).
-          // Without this, 48×6s=288s of footage covers a 1226s narration only
-          // by cycling the same clips 4+ times.  With full ranges, the pool is
-          // ~5800s for a 2-hour film — far more than enough, zero re-cycling.
-          // Compute safe ceiling for last-beat window extension (avoids credits).
-          let _srcDurAL = 0;
-          try { _srcDurAL = await probeDurationSec(sourcePath); } catch {}
-          const _ceilAL = _srcDurAL > 0
-            ? Math.max(_srcDurAL * 0.5, _srcDurAL - Math.min(_srcDurAL * 0.08, Math.max(90, _srcDurAL * 0.035)))
-            : 0;
-
-          // ChatGPT pipeline: build a sceneId → timestamp map from the stored
-          // scenesList so we can resolve exact detected-scene boundaries per beat.
-          const _scenesList = analyzeJob.result.scenesList;
-          _scenesMap = Array.isArray(_scenesList) && _scenesList.length > 0
-            ? new Map(_scenesList.map((s) => [s.index, s])) : null;
-          const _sceneIdsResolved = { count: 0, fallback: 0 };
-
-          beats = rawBeats.map((b, i) => {
-            // ChatGPT pipeline: use sceneIds to resolve EXACT detected-scene window.
-            // beat.sceneIds covers [firstScene ... lastScene] from scene detection.
-            if (Array.isArray(b.sceneIds) && b.sceneIds.length > 0 && _scenesMap) {
-              const firstSc = _scenesMap.get(b.sceneIds[0]);
-              const lastSc  = _scenesMap.get(b.sceneIds[b.sceneIds.length - 1]);
-              if (firstSc && lastSc) {
-                let resolvedStart = Math.min(Number(b.startSec), firstSc.startSec);
-                let resolvedEnd = _ceilAL > 0
