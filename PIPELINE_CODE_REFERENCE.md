@@ -680,3 +680,37 @@ curl -s localhost:4040/health                                 # confirm version
 ```
 
 `GET /health` reports `version: 2.9.3`.
+
+### Verified live (render `ouR-OfMY5l`, full re-render after deploy)
+
+Re-rendered the same movie/analyze job on the patched server. Logs:
+
+```text
+[render ouR-OfMY5l] SYNC: transcript candidates from 0 source segments   ← new code runs, no throw
+[render ouR-OfMY5l] SYNC MODE on: 278 segs, voice=1131.7s
+[render ouR-OfMY5l] SYNC SCORE: 100% overall (76/76 beats perfect ≥95%, 0 beats <80%)
+[render ouR-OfMY5l] BEAT-MUX MAP: 278 sub-clips → 76 body beats          ← was "→ 1 body beat"
+[render ouR-OfMY5l] SYNC-VALIDATION: 75 PASS / 1 WARN / 0 FIX
+[render ouR-OfMY5l] COPYRIGHT_SAFE_MODE: watermark/transform enabled
+```
+
+`ffprobe` on the output:
+
+```text
+video stream duration: 1217.73s  (~20.3 min)
+audio stream duration: 1143.63s  (~19.1 min)
+format duration:       1217.73s
+```
+
+The body no longer collapses: a full ~20-minute recap with 76 body beats and a
+100% pre-render sync score, watermark applied. The earlier identical input had
+produced a ~30s frozen clip.
+
+**Known remaining (minor, not the reported bug):** the video stream is ~74s longer
+than the audio. This is the accumulated per-beat `tpad=stop_duration=0.6s` clone
+tail across 76 beats (+ hook), i.e. a brief frozen frame after each beat's
+narration, not one long dead-air tail. Optional follow-up: clamp each muxed beat
+to its audio duration (tighten the v2.7.6 `-t` clamp / reduce tpad) so the video
+stream tracks the audio more closely. Deliberately left unchanged here to avoid
+regressing the opposite failure (video ending before narration) right after the
+body-collapse fix.
