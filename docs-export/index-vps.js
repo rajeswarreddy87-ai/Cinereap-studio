@@ -357,7 +357,7 @@ app.get("/health", (_req, res) => {
 
   res.json({
     ok: true,
-    version: "3.0.0",
+    version: "3.0.1",
     serverTranscription: Boolean(SERVER_OPENAI_KEY),
     serverAnalysis: Boolean(SERVER_ANTHROPIC_KEY),
     serverModel: SERVER_ANTHROPIC_MODEL || null,
@@ -4293,13 +4293,22 @@ async function runRenderFromIngest(jobId, {
     // Save full beat list before trimming — hook footage lookup needs all scene indices.
     _preTrimBeats = beats.slice();
     {
-      const _beatWindows = beats.map(b => Math.max(0, Number(b.endSec) - Number(b.startSec)));
-      const _nonZeroWindows = _beatWindows.filter(w => w > 0);
-      const _sorted = _nonZeroWindows.slice().sort((a,b) => a-b);
-      const _medianWin = _sorted.length ? _sorted[Math.floor(_sorted.length/2)] : 0;
-      // Clamp measured avg to a sane range: 8s-25s per beat.
-      const AVG_BEAT_SEC  = Math.max(8, Math.min(25, _medianWin || 15));
-      console.log(`[render ${jobId}] BEAT-TRIM: measured median beat window=${_medianWin.toFixed(1)}s → using ${AVG_BEAT_SEC.toFixed(1)}s/beat avg`);
+      // FIX (v3.0.1): use real narration-word count to estimate TTS duration/beat.
+      // The beat-window (endSec-startSec) is expanded to next-beat-start by the
+      // normalisation step above, so it reflects source coverage, not TTS length.
+      // TTS rate ≈ 2.5 words/second (Speechify Dominic at speed=1.0). Count the
+      // median word count across all beats and divide by 2.5 for a real estimate.
+      const _beatWords = beats.map(b => {
+        const txt = String(b.narration || b.reason || "");
+        return txt.trim() ? txt.trim().split(/\s+/).length : 0;
+      }).filter(w => w > 0);
+      const _sortedW = _beatWords.slice().sort((a,b)=>a-b);
+      const _medianWords = _sortedW.length ? _sortedW[Math.floor(_sortedW.length/2)] : 0;
+      const TTS_WPS = 2.5; // words per second at Speechify speed=1.0
+      const _estSecPerBeat = _medianWords > 0 ? _medianWords / TTS_WPS : 0;
+      // Clamp to a sane TTS range: 10s-25s per beat.
+      const AVG_BEAT_SEC  = Math.max(10, Math.min(25, _estSecPerBeat || 15));
+      console.log(`[render ${jobId}] BEAT-TRIM: median narration ${_medianWords.toFixed(0)}w → ${_estSecPerBeat.toFixed(1)}s/beat TTS → using ${AVG_BEAT_SEC.toFixed(1)}s/beat avg`);
       const BEATS_TARGET  = Math.max(40, Math.min(120, Math.round((+targetMinutes || 20) * 60 / AVG_BEAT_SEC)));
       if (beats.length > BEATS_TARGET) {
         const original = beats.slice();
