@@ -940,3 +940,39 @@ guessed wrong. `analyze.js` threads `overview`/`keywords` into
 `buildStoryOutlineMessages` and `buildSceneScriptMessages`.
 
 `GET /health` reports `version: 2.9.8`.
+
+
+## v2.9.9 — make the Gemini verifier actually work (content sync)
+
+Verification found Gemini was **dead weight**: the last render logged
+`GEMINI: attempted=0, skipped=35` — it never made a single call. The function and
+prompt were fine; it was **starved of candidates**. Gemini only runs when a beat has
+≥2 distinct candidate clips, but two of the four candidate sources were dead:
+
+- `siglipCandidateScenes` was declared all-`null` and **never assigned** (the SigLIP
+  match only overwrote `scenes[i]` in place) — a documented v2.7.5 behavior that was
+  lost in an overwrite.
+- Whisper transcript segments were **never persisted** in the analyze result, so the
+  render's `sourceTranscriptSegments` was always empty → transcript candidates null.
+
+So every beat had only [analyze window] + [current window] (identical unless SigLIP
+relocated it) → `<2` → skipped.
+
+Fixes:
+
+- **A. Persist Whisper `segments`** in the analyze result → render builds real
+  transcript candidate windows (`findTranscriptCandidateForBeat`). *(Requires a fresh
+  analyze; older jobs have no segments.)*
+- **B. Retain the SigLIP top match** as an independent `siglipCandidateScenes[i]`
+  whenever it is at least weakly confident and in-region — even when not directly
+  applied to `scenes[i]`. This is the key fix that gives Gemini a real alternative.
+- **C. Threshold tuning**: capture a SigLIP candidate at `VISUAL_APPLY_THRESHOLD`
+  (0.16) while keeping direct-apply at 0.22. New log:
+  `CLIP: semantic windows applied to X/N beats, K SigLIP candidates retained`.
+
+Net: Gemini now compares analyze vs SigLIP vs transcript windows per beat and picks
+the clip whose visible action matches the narration — the content-sync layer (SigLIP
+alone only relocates; it never verifies). Pairs with the TMDb grounding (accurate
+names + accurate footage).
+
+`GET /health` reports `version: 2.9.9`.

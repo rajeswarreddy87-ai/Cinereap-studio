@@ -357,7 +357,7 @@ app.get("/health", (_req, res) => {
 
   res.json({
     ok: true,
-    version: "2.9.8",
+    version: "2.9.9",
     serverTranscription: Boolean(SERVER_OPENAI_KEY),
     serverAnalysis: Boolean(SERVER_ANTHROPIC_KEY),
     serverModel: SERVER_ANTHROPIC_MODEL || null,
@@ -2265,6 +2265,11 @@ Timestamps in chapters must be evenly spaced across the ${_estMins2}-minute esti
         message: "Analysis complete",
         result: {
           duration, sourceFileId: fileId, ...parsed,
+          // Fix A (v2.9.9): persist Whisper transcript segments so the render can
+          // build per-beat transcript candidate windows (findTranscriptCandidateForBeat).
+          // Without this, render-time sourceTranscriptSegments was always empty and
+          // the Gemini verifier never had a transcript candidate to compare.
+          ...(Array.isArray(transcriptSegments) && transcriptSegments.length ? { segments: transcriptSegments } : {}),
           ...(_hookText ? { hookText: _hookText } : {}),
           ...(_hookSceneIds && _hookSceneIds.length > 0 ? { hookSceneIds: _hookSceneIds } : {}),
           ...(_ytTitle ? { youtubeTitle: _ytTitle } : {}),
@@ -4749,24 +4754,40 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
 
                   if (matchRes && Array.isArray(matchRes.results) && matchRes.results.length === scenes.length) {
                     let clipApplied = 0;
+                    let siglipCandCount = 0;
+                    // Fix C (v2.9.9): capture a SigLIP candidate at a lower threshold
+                    // than the direct-apply threshold, so weak-but-plausible matches
+                    // still become a Gemini candidate (Gemini then decides).
+                    const _SIGLIP_APPLY = 0.22;
+                    const _SIGLIP_CAND  = Number(process.env.VISUAL_APPLY_THRESHOLD || 0.16);
                     scenes = scenes.map((sc, i) => {
                       const m = matchRes.results[i];
-                      // Only apply if score is confident enough (CLIP cosine > 0.22)
-                      // and the matched frame is within the general timeline region.
-                      if (!m || m.score < 0.22) return sc;
+                      if (!m || !(m.score > 0)) return sc;
                       const center = m.timeSec;
-                      // FIX: Widened window guard. The old strict check (center must be
-                      // within sc.startSec..sc.endSec) prevented CLIP from correcting
-                      // beats where Claude placed the timestamp in the wrong scene.
-                      // New guard: allow CLIP to relocate a beat's window as long as the
-                      // matched frame is within ±15% of movie duration from the beat midpoint.
-                      // This lets CLIP escape Claude's wrong timestamps (e.g. "Layla scene"
-                      // assigned to minute 30 but Layla actually appears at minute 45)
-                      // while still staying in the correct chronological region.
+                      // Window guard: matched frame must be within ±15% of movie
+                      // duration from the beat midpoint (stay in the right region).
                       const _scMid = (Number(sc.startSec) + Number(sc.endSec)) / 2;
                       const _liberalRadius = srcDurClip > 0 ? srcDurClip * 0.15 : 300;
-                      if (center < _scMid - _liberalRadius || center > _scMid + _liberalRadius) return sc;
+                      const inRegion = !(center < _scMid - _liberalRadius || center > _scMid + _liberalRadius);
                       const winHalf = Math.max(8, (sc.endSec - sc.startSec) / 2);
+
+                      // Fix B (v2.9.9): ALWAYS retain the SigLIP window as an
+                      // independent Gemini candidate when it is at least weakly
+                      // confident and in-region — even if we do NOT directly
+                      // relocate scenes[i] below. This was the missing piece that
+                      // left Gemini with <2 candidates and skipped on every beat.
+                      if (m.score >= _SIGLIP_CAND && inRegion) {
+                        siglipCandidateScenes[i] = {
+                          startSec: Math.max(0, center - winHalf),
+                          endSec: center + winHalf,
+                          reason: `siglip:${m.score.toFixed(2)}`,
+                        };
+                        siglipCandCount++;
+                      }
+
+                      // Direct apply (unchanged behaviour): only when confident
+                      // enough (>=0.22) and in-region.
+                      if (m.score < _SIGLIP_APPLY || !inRegion) return sc;
                       clipApplied++;
                       return {
                         ...sc,
@@ -4776,7 +4797,8 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
                       };
                     });
                     console.log(
-                      `[render ${jobId}] CLIP: semantic windows applied to ${clipApplied}/${scenes.length} beats ` +
+                      `[render ${jobId}] CLIP: semantic windows applied to ${clipApplied}/${scenes.length} beats, ` +
+                      `${siglipCandCount} SigLIP candidates retained ` +
                       `(frames=${embedRes.frames}, analyzeJob=${_analyzeJobId})`
                     );
                   }
