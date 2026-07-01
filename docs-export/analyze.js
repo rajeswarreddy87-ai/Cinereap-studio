@@ -713,7 +713,7 @@ export function parseSceneNotesResponse(rawText) {
  *
  * Called once, after all Stage-A batches complete.
  */
-export function buildStoryOutlineMessages({ movie, beatNotes, transcriptBlock = "" }) {
+export function buildStoryOutlineMessages({ movie, beatNotes, transcriptBlock = "", overview = "" }) {
   const notesText = Array.isArray(beatNotes) && beatNotes.length
     ? beatNotes.map((n) => `[${n.t}] beat ${n.index}: ${n.note || "(no note)"}`).join("\n")
     : "(no beat notes available)";
@@ -723,6 +723,9 @@ export function buildStoryOutlineMessages({ movie, beatNotes, transcriptBlock = 
       type: "text",
       text:
         `You are preparing a YouTube movie recap for "${movie.title}" (film length ${Math.round(movie.durationSec)}s).\n\n` +
+        (overview
+          ? `OFFICIAL PLOT SUMMARY (authoritative — use it to get character relationships and major plot facts right):\n${overview}\n\n`
+          : "") +
         (transcriptBlock
           ? `TRANSCRIPT (real dialogue — treat as authoritative):\n${transcriptBlock}\n\n`
           : "") +
@@ -772,7 +775,7 @@ export function parseStoryOutlineResponse(rawText) {
  * transcript, the ordered scene beats, and the extracted character list (so
  * names/relationships stay consistent). Text-only.
  */
-export function buildSceneScriptMessages({ movie, channelName, beats, characters, transcriptBlock = "", narrationLang = "English", storyOutline = [], batchInfo = null }) {
+export function buildSceneScriptMessages({ movie, channelName, beats, characters, transcriptBlock = "", narrationLang = "English", storyOutline = [], batchInfo = null, overview = "", keywords = "" }) {
   const cast = movie.cast
     ? `\nFilm characters (use these names — NOT the actors' real names): ${movie.cast}.`
     : `\nNo cast list provided — identify characters ONLY when the transcript, extracted character list, on-screen text, or unmistakable dialogue supports the name. Never use actor real names. If a name or relationship is uncertain, use a neutral role label such as "the trainer", "the manager", "the daughter", "one of the men", or "the officer".`;
@@ -812,6 +815,10 @@ export function buildSceneScriptMessages({ movie, channelName, beats, characters
         `You are a YouTube ${genre}recap scriptwriter for "${channelName}", specialised in COPYRIGHT-SAFE recaps.\n` +
         `Movie: "${movie.title}"${year}${director}${cast}. Film length ${Math.round(movie.durationSec)}s.\n\n` +
         charText +
+        (overview
+          ? `OFFICIAL PLOT SUMMARY (authoritative — reconcile the narration with this; use it to get character relationships correct and to avoid inventing events):\n${overview}\n\n`
+          : "") +
+        (keywords ? `THEMES (for tone/emphasis, not to be stated literally): ${keywords}.\n\n` : "") +
         outlineText +
         `CHARACTER / RELATIONSHIP ACCURACY CONTRACT (mandatory):
 ` +
@@ -1000,6 +1007,7 @@ export function parseSceneScriptResponse(rawText) {
  */
 export async function analyzeWithScenes({
   apiKey, model, movie, channelName, scenes, segments = [], transcriptBlock = "", narrationLang = "English",
+  overview = "", keywords = "",
 }) {
   if (!scenes || scenes.length === 0) throw new Error("analyzeWithScenes: no scenes provided");
 
@@ -1062,7 +1070,7 @@ export async function analyzeWithScenes({
   // this to keep narration coherent across all beats/batches. Fails gracefully.
   let storyOutline = [];
   try {
-    const outlineMessages = buildStoryOutlineMessages({ movie, beatNotes: beats, transcriptBlock });
+    const outlineMessages = buildStoryOutlineMessages({ movie, beatNotes: beats, transcriptBlock, overview });
     const outlineText = await callClaude({ apiKey, model, messages: outlineMessages, maxTokens: 2000 });
     storyOutline = parseStoryOutlineResponse(outlineText);
   } catch (outlineErr) {
@@ -1082,7 +1090,7 @@ export async function analyzeWithScenes({
   for (let bi = 0; bi < scriptBatches.length; bi++) {
     const batchInfo = { start: bi * SCRIPT_BATCH, total: beats.length, prevEnding: prevNarrationEnd };
     const scriptMessages = buildSceneScriptMessages({
-      movie, channelName, beats: scriptBatches[bi], characters, transcriptBlock, narrationLang, storyOutline, batchInfo,
+      movie, channelName, beats: scriptBatches[bi], characters, transcriptBlock, narrationLang, storyOutline, batchInfo, overview, keywords,
     });
     // 14000 tokens: 60 beats × ~200 tokens/beat = 12,000 + JSON wrapper headroom.
     const scriptText = await callClaude({ apiKey, model, messages: scriptMessages, maxTokens: 14000 });

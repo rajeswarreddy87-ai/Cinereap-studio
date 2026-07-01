@@ -30,7 +30,7 @@ import { promises as fsp } from "node:fs";
 import { transcribeMovie, buildTranscriptBlock } from "./transcribe.js";
 import { planSyncedRender, buildSyncedTimeline } from "./beats.js";
 import { _dedupeCandidates, _tokSet, _jaccard, findTranscriptCandidateForBeat } from "./lib/candidates.js";
-import { fetchTmdbCast } from "./lib/tmdb.js";
+import { fetchTmdbMeta } from "./lib/tmdb.js";
 import { planMusicTimeline, dominantMood } from "./music.js";
 
 const PORT = Number(process.env.PORT || 8787);
@@ -357,7 +357,7 @@ app.get("/health", (_req, res) => {
 
   res.json({
     ok: true,
-    version: "2.9.7",
+    version: "2.9.8",
     serverTranscription: Boolean(SERVER_OPENAI_KEY),
     serverAnalysis: Boolean(SERVER_ANTHROPIC_KEY),
     serverModel: SERVER_ANTHROPIC_MODEL || null,
@@ -2000,25 +2000,33 @@ app.post("/analyze", requireAuth, async (req, res) => {
           console.warn(`[analyze ${jobId}] CLIP metadata write failed (non-fatal):`, _cmErr?.message);
         }
 
-        // ── TMDb CAST ENRICHMENT (v2.9.7) ──────────────────────────────────
-        // If the app didn't supply a cast list and a TMDB key is configured,
-        // look up the film's real character names and inject them as movie.cast.
-        // The analyze prompts prefer a provided cast over guessing from the
-        // (speaker-less) transcript — the biggest lever for name accuracy.
-        // Mutates the shared `movie` object so the fixed-frame fallback below
-        // benefits too. Fails soft: any error leaves movie.cast unchanged.
-        if ((!movie.cast || !String(movie.cast).trim()) && SERVER_TMDB_KEY && movie.title) {
+        // ── TMDb GROUNDING (v2.9.8) ────────────────────────────────────────
+        // One TMDb lookup enriches the analysis with authoritative story facts:
+        //   • cast (character names + he/she pronouns + lead markers)
+        //   • official plot summary (relationships + plot ground truth)
+        //   • genre (fills the empty movie.genre slot → tone/pacing)
+        //   • keywords/themes (hook + thumbnail scoring)
+        // Whisper has no speaker labels, so this is the biggest lever against
+        // wrong names/relationships. Mutates the shared `movie` object so the
+        // fixed-frame fallback benefits too. Fails soft.
+        let _tmdbOverview = "";
+        let _tmdbKeywords = "";
+        if (SERVER_TMDB_KEY && movie.title) {
           try {
-            const _tmdbCast = await fetchTmdbCast({ apiKey: SERVER_TMDB_KEY, title: movie.title, year: movie.year });
-            if (_tmdbCast) {
-              movie.cast = _tmdbCast;
-              console.log(`[analyze ${jobId}] TMDb cast for "${movie.title}": ${_tmdbCast}`);
-              await jobStore.update(jobId, { message: "Loaded character list from TMDb" });
+            const _meta = await fetchTmdbMeta({ apiKey: SERVER_TMDB_KEY, title: movie.title, year: movie.year });
+            if (_meta && (_meta.castRich || _meta.overview)) {
+              if ((!movie.cast || !String(movie.cast).trim()) && _meta.castRich) movie.cast = _meta.castRich;
+              if ((!movie.genre || !String(movie.genre).trim()) && _meta.genres) movie.genre = _meta.genres;
+              if ((!movie.director || !String(movie.director).trim()) && _meta.director) movie.director = _meta.director;
+              _tmdbOverview = _meta.overview || "";
+              _tmdbKeywords = _meta.keywords || "";
+              console.log(`[analyze ${jobId}] TMDb: cast=[${_meta.castNames}] | genre=[${_meta.genres}] | themes=[${_meta.keywords.slice(0, 80)}] | overview=${_meta.overview ? _meta.overview.length + "ch" : "none"}`);
+              await jobStore.update(jobId, { message: "Loaded cast, plot & themes from TMDb" });
             } else {
-              console.log(`[analyze ${jobId}] TMDb: no cast found for "${movie.title}"`);
+              console.log(`[analyze ${jobId}] TMDb: no match for "${movie.title}"`);
             }
           } catch (_tmdbErr) {
-            console.warn(`[analyze ${jobId}] TMDb lookup failed (continuing without cast):`, _tmdbErr?.message || _tmdbErr);
+            console.warn(`[analyze ${jobId}] TMDb lookup failed (continuing):`, _tmdbErr?.message || _tmdbErr);
           }
         }
 
@@ -2032,6 +2040,8 @@ app.post("/analyze", requireAuth, async (req, res) => {
           transcriptBlock,
           narrationLang,
           targetClipCount: effectiveTargetClipCount,
+          overview: _tmdbOverview,
+          keywords: _tmdbKeywords,
         });
         await jobStore.update(jobId, { progress: 90, message: `Scene analysis complete (${scenes.length} scenes, ${parsed.characters?.length || 0} characters)` });
       } catch (sceneErr) {

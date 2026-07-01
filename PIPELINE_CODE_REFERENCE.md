@@ -906,3 +906,37 @@ Miguel 'Magic' Escobar, Mikey, Eli Frost, Gabe, Keith 'Buzzsaw' Brady, Gloria
 
 This is the third `src/lib/` module (after `candidates.js`), continuing the
 incremental modularization. `GET /health` reports `version: 2.9.7`.
+
+
+## v2.9.8 — TMDb full story grounding (plot + genre + themes + pronouns)
+
+Expanded the TMDb integration from cast-only to a full grounding bundle, via a
+single `append_to_response=credits,keywords` request (`fetchTmdbMeta`):
+
+- **Official plot summary (`overview`)** — injected into the story-outline pass and
+  the per-beat script prompt as an *authoritative* source for character
+  relationships and plot facts. Biggest anti-hallucination lever after cast.
+- **Cast with pronouns + lead markers** — `movie.cast` is now e.g.
+  `Billy 'The Great' Hope (male, lead), Maureen Hope (female), Leila Hope (female)…`
+  so narration uses correct he/she and emphasizes protagonists.
+- **Genre** — fills the previously-empty `movie.genre` slot → better tone/pacing.
+- **Keywords/themes** — e.g. `boxing, tragedy, death, father daughter relationship`
+  → passed to the script prompt for tone/emphasis (also useful to hook/thumbnail
+  scoring later).
+- Also fills `movie.director` when absent.
+
+Verified live (analyze `rqsI6iM3SJ`, "Southpaw"):
+
+```text
+TMDb: cast=[Billy 'The Great' Hope, Maureen Hope, Titus 'Tick' Wills, Leila Hope, …]
+    | genre=[Action, Drama]
+    | themes=[sports, fighter, tragedy, death, boxing, father daughter relationship]
+    | overview=455ch
+```
+
+The "father daughter relationship" theme + overview directly ground the
+Billy→Leila (daughter) and Billy→Maureen (wife) relationships that were previously
+guessed wrong. `analyze.js` threads `overview`/`keywords` into
+`buildStoryOutlineMessages` and `buildSceneScriptMessages`.
+
+`GET /health` reports `version: 2.9.8`.

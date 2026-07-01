@@ -55,3 +55,68 @@ export async function fetchTmdbCast({ apiKey, title, year, maxCharacters = 15 })
   const uniq = [...new Set(names)];
   return uniq.length ? uniq.join(", ") : null;
 }
+
+const _genderWord = (g) => (g === 1 ? "female" : g === 2 ? "male" : "");
+
+/**
+ * Rich lookup (v2.9.8): one `append_to_response` call fetches movie details +
+ * credits + keywords together. Returns a grounding bundle for the analyze
+ * prompts:
+ *   - castNames : plain comma-separated character names (backward compatible)
+ *   - castRich  : character names annotated with pronoun + lead hints, e.g.
+ *                 "Billy Hope (male, lead), Maureen Hope (female), ..." — improves
+ *                 he/she accuracy and protagonist emphasis in narration
+ *   - overview  : official plot synopsis (authoritative for relationships/plot)
+ *   - genres    : e.g. "Drama, Sport"  (fills the empty movie.genre slot)
+ *   - keywords  : plot themes, e.g. "boxing, revenge, single father"
+ *   - director, tagline, year
+ * Returns null if the film can't be found.
+ */
+export async function fetchTmdbMeta({ apiKey, title, year, maxCharacters = 15 }) {
+  if (!apiKey || !title) return null;
+
+  const q = `/search/movie?query=${encodeURIComponent(title)}${year ? `&year=${encodeURIComponent(year)}` : ""}`;
+  const search = await _tmdbGet(q, apiKey);
+  const results = Array.isArray(search?.results) ? search.results : [];
+  if (results.length === 0) return null;
+
+  const lc = String(title).trim().toLowerCase();
+  const exact = results.find((r) => String(r.title || r.original_title || "").trim().toLowerCase() === lc);
+  const chosen = exact || results.slice().sort((a, b) => (b.popularity || 0) - (a.popularity || 0))[0];
+  if (!chosen?.id) return null;
+
+  const details = await _tmdbGet(`/movie/${chosen.id}?append_to_response=credits,keywords`, apiKey);
+
+  const castArr = Array.isArray(details?.credits?.cast) ? details.credits.cast : [];
+  const castDetailed = castArr
+    .filter((c) => c && c.character && !/^self$|uncredited|\(voice\)|^voice$/i.test(c.character))
+    .slice(0, maxCharacters)
+    .map((c) => ({ character: String(c.character).split("/")[0].trim(), gender: _genderWord(c.gender) }))
+    .filter((c) => c.character);
+
+  const castNames = [...new Set(castDetailed.map((c) => c.character))];
+  const castRich = castDetailed.map((c, i) => {
+    const bits = [];
+    if (c.gender) bits.push(c.gender);
+    if (i < 3) bits.push("lead");
+    return bits.length ? `${c.character} (${bits.join(", ")})` : c.character;
+  }).join(", ");
+
+  const crew = Array.isArray(details?.credits?.crew) ? details.credits.crew : [];
+  const director = crew.find((p) => p.job === "Director")?.name || "";
+  const genres = Array.isArray(details?.genres) ? details.genres.map((g) => g.name).join(", ") : "";
+  const kwArr = details?.keywords?.keywords || details?.keywords?.results || [];
+  const keywords = Array.isArray(kwArr) ? kwArr.map((k) => k.name).slice(0, 20).join(", ") : "";
+
+  return {
+    tmdbId: chosen.id,
+    castNames: castNames.join(", "),
+    castRich: castRich || castNames.join(", "),
+    overview: String(details?.overview || "").trim(),
+    genres,
+    keywords,
+    director,
+    tagline: String(details?.tagline || "").trim(),
+    year: String(details?.release_date || "").slice(0, 4),
+  };
+}
