@@ -399,7 +399,7 @@ app.get("/health", (_req, res) => {
 
   res.json({
     ok: true,
-    version: "2.9.4",
+    version: "2.9.5",
     serverTranscription: Boolean(SERVER_OPENAI_KEY),
     serverAnalysis: Boolean(SERVER_ANTHROPIC_KEY),
     serverModel: SERVER_ANTHROPIC_MODEL || null,
@@ -6162,17 +6162,23 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
 
   // Build final encode filter: scale/pad/fps + optional music bed
   const _finalS  = normaliseRenderSettings(settings);
+  // QUALITY (v2.9.5): sources are often sub-1080p (this movie is 720p). Use a
+  // Lanczos upscale (sharper than the default bilinear) + a light unsharp pass so
+  // the 720p→1080p result looks crisp instead of soft, and drop the copyright
+  // grain slightly (heavy noise over an upscaled soft image looks muddy).
   const _safeVf = COPYRIGHT_SAFE_MODE ? [
     `crop=iw*0.94:ih*0.94:(iw-iw*0.94)/2:(ih-ih*0.94)/2`,
-    `scale=${_finalS.width}:${_finalS.height}:force_original_aspect_ratio=increase`,
+    `scale=${_finalS.width}:${_finalS.height}:force_original_aspect_ratio=increase:flags=lanczos`,
     `crop=${_finalS.width}:${_finalS.height}:(iw-${_finalS.width})/2:(ih-${_finalS.height})/2`,
     `eq=contrast=1.08:brightness=0.015:saturation=0.92:gamma=1.02`,
-    `noise=alls=6:allf=t+u`,
+    `unsharp=5:5:0.8:5:5:0.0`,
+    `noise=alls=4:allf=t+u`,
     `drawbox=x=0:y=0:w=iw:h=ih:color=black@0.55:t=12`,
     `drawtext=text='${_watermarkText}':x=24:y=24:fontsize=30:fontcolor=white@0.72:box=1:boxcolor=black@0.35:boxborderw=8`,
   ] : [
-    `scale=${_finalS.width}:${_finalS.height}:force_original_aspect_ratio=decrease`,
+    `scale=${_finalS.width}:${_finalS.height}:force_original_aspect_ratio=decrease:flags=lanczos`,
     `pad=${_finalS.width}:${_finalS.height}:(ow-iw)/2:(oh-ih)/2:black`,
+    `unsharp=5:5:0.6:3:3:0.0`,
   ];
   const _finalVf = [
     ..._safeVf,
@@ -6210,14 +6216,19 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
     : `[0:v]${_finalVf}[vout];` +
       `[0:a]aresample=async=1,aformat=sample_fmts=fltp:channel_layouts=stereo[aout]`;
 
-  const _encPreset = _finalS.codec === "libx264" ? "ultrafast" : "fast";
+  // QUALITY (v2.9.5): the final encode is the delivered file — do NOT use the
+  // ultrafast preset here (it produces visible blocking, worsened by the upscale).
+  // "veryfast" + a lower CRF gives a clearly cleaner image at a modest time cost.
+  // Intermediate clips stay ultrafast (they are re-encoded again here anyway).
+  const _encPreset = _finalS.codec === "libx264" ? "veryfast" : "medium";
+  const _finalCrf = Math.min(Number(_finalS.crf) || 23, 20);
   const _finalArgs = [
     "-y", "-hide_banner", "-loglevel", "info", "-stats", "-progress", "pipe:1",
     "-f", "concat", "-safe", "0", "-i", manifestPath,
     ...(_hasFinalMusic ? ["-i", musicPath] : []),
     "-filter_complex", _finalFilter,
     "-map", "[vout]", "-map", "[aout]",
-    "-c:v", _finalS.codec, "-crf", String(_finalS.crf), "-preset", _encPreset, "-pix_fmt", "yuv420p",
+    "-c:v", _finalS.codec, "-crf", String(_finalCrf), "-preset", _encPreset, "-pix_fmt", "yuv420p",
     "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
     // Hard-clamp the final MP4 to the concatenated content duration so the video
     // ends right at the last beat's footage (~0.2s after the final word) instead

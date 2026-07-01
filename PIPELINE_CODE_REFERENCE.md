@@ -1,4 +1,4 @@
-# CineRecap VPS Pipeline — Code Reference (v2.9.4)
+# CineRecap VPS Pipeline — Code Reference (v2.9.5)
 
 **Server path:** `/root/cinerecap-render-server/`  
 **Live URL:** `http://109.123.241.130:4040`  
@@ -777,3 +777,43 @@ Before (v2.9.3): video 1217.7s vs audio 1143.6s (74s gap + frozen-frame tail).
 After (v2.9.4): **12 ms** difference, no frozen tail, video ends with narration.
 
 `GET /health` reports `version: 2.9.4`.
+
+
+## v2.9.5 — P0: image sharpness + script/name accuracy (Sonnet retained)
+
+### Context
+Source movies here are often sub-1080p (this one is **1280×720/24fps**), so the body
+cannot contain true 1080p detail. The fix is to (a) make the upscale as crisp as
+possible and stop compounding softness, and (b) improve name/relationship accuracy
+in the script — while keeping `claude-sonnet-4-5` (user saw no Opus improvement).
+
+### Image quality (`src/index.js`, final encode)
+- Upscale now uses **Lanczos** (`scale=…:flags=lanczos`) instead of the default
+  bilinear — noticeably sharper 720p→1080p.
+- Added a light **`unsharp`** pass after colour grading (both copyright-safe and
+  plain branches).
+- Reduced copyright grain `noise=alls=6 → 4` (heavy grain over an upscaled soft
+  image looked muddy).
+- Final encoder preset **`ultrafast → veryfast`** and CRF clamped to **≤20** for the
+  delivered file (ultrafast caused visible blocking, worsened by the upscale).
+  Intermediate clips stay ultrafast (they are re-encoded again at the final step).
+  Trade-off: the final encode is somewhat slower; acceptable for background renders.
+
+### Script / name / relationship accuracy (`src/analyze.js`, Stage A)
+- **Cast sheet now merges across ALL Stage-A batches**, not just batch 0.
+  Previously the authoritative character list came only from the first ~15 scenes,
+  so characters introduced later (villains, allies, mid-film family reveals) were
+  missing from the sheet that grounds Stage-B narration → mislabels / name swaps.
+  Now every batch returns characters; they are merged per-name (richest note kept),
+  first-appearance order preserved, capped at 30. Log: `cast sheet: N characters
+  merged across M batch(es)`.
+- The existing CHARACTER/RELATIONSHIP ACCURACY CONTRACT, attribution-precision
+  rules, and transcript grounding (v2.8.4/2.8.5) remain in force.
+
+> Note on the deeper accuracy limit: Whisper has **no speaker diarization**, so the
+> transcript is un-attributed text. Claude must infer who says what from context.
+> The single biggest future accuracy lever is a **real cast list** (e.g. TMDb lookup
+> by title, or user-provided) passed as `movie.cast` — the prompts already prefer it
+> over guessing. Recommended P1 follow-up.
+
+`GET /health` reports `version: 2.9.5`.

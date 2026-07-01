@@ -1007,15 +1007,32 @@ export async function analyzeWithScenes({
   for (let i = 0; i < scenes.length; i += BATCH) batches.push(scenes.slice(i, i + BATCH));
 
   // ── PASS 1 (Stage A): scene notes + characters ──────────────────────────
+  // ACCURACY FIX (v2.9.5): request the character sheet on EVERY batch and merge,
+  // instead of only trusting batch 0. Previously the authoritative cast list came
+  // solely from the first ~15 scenes, so any character introduced later in the
+  // film (villains, allies, family revealed mid-story) was absent from the sheet
+  // that grounds Stage-B narration → they got mislabeled or name-swapped. Merging
+  // per-name across all batches gives Stage B the full, consistent cast.
   const noteByIndex = new Map();
-  let characters = [];
+  const charByName = new Map(); // lowercased name -> { name, note }
   for (let bi = 0; bi < batches.length; bi++) {
-    const messages = buildSceneNotesMessages({ movie, scenes: batches[bi], segments, isFirstBatch: bi === 0 });
+    const messages = buildSceneNotesMessages({ movie, scenes: batches[bi], segments, isFirstBatch: true });
     const text = await callClaude({ apiKey, model, messages });
     const parsed = parseSceneNotesResponse(text);
-    if (bi === 0 && parsed.characters.length) characters = parsed.characters;
+    for (const c of parsed.characters) {
+      const key = String(c.name || "").toLowerCase().trim();
+      if (!key) continue;
+      const existing = charByName.get(key);
+      if (!existing) charByName.set(key, { name: c.name, note: c.note });
+      // Keep the richest (longest) description seen across batches.
+      else if (c.note && c.note.length > (existing.note?.length || 0)) existing.note = c.note;
+    }
     for (const b of parsed.beats) noteByIndex.set(b.index, b.note);
   }
+  // Preserve first-appearance order (protagonists first); cap to avoid a bloated
+  // cast of one-off minor names poisoning the Stage-B prompt.
+  let characters = [...charByName.values()].slice(0, 30);
+  console.log(`[analyzeWithScenes] cast sheet: ${characters.length} characters merged across ${batches.length} batch(es)`);
 
   // Build ordered beat list — trust Claude's scene notes exclusively.
   // Claude is instructed to label studio logos, title cards, and production
