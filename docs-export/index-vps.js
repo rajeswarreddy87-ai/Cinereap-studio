@@ -357,7 +357,7 @@ app.get("/health", (_req, res) => {
 
   res.json({
     ok: true,
-    version: "2.9.9",
+    version: "3.0.0",
     serverTranscription: Boolean(SERVER_OPENAI_KEY),
     serverAnalysis: Boolean(SERVER_ANTHROPIC_KEY),
     serverModel: SERVER_ANTHROPIC_MODEL || null,
@@ -4282,11 +4282,24 @@ async function runRenderFromIngest(jobId, {
 
     // ── RECAP LENGTH TARGET ────────────────────────────────────────────────────
     // Compute beat target from user-selected duration (passed as targetMinutes).
-    // Average TTS per beat ≈ 15s empirically; clamp between 40 and 120 beats.
+    // FIX (v3.0.0): Use a measured per-beat TTS average instead of the fixed 15s.
+    // Each beat's window is (endSec-startSec)/5 (Claude produces ~10s windows on a
+    // 10s scene), but that's inaccurate for the actual TTS length. Better: measure
+    // the median window duration from the beat list itself and scale from there.
+    // Empirically: Sonnet 4.5 at ~32 avgWords/beat → ~13s TTS. Using window size
+    // as a proxy: if beats are narrow (≤12s each) we need more of them to hit the
+    // target duration. Formula: BEATS_TARGET = (targetMinutes * 60) / avgBeatWindowSec
+    // clamped 40–120, with a fallback to 15s when window data is unavailable.
     // Save full beat list before trimming — hook footage lookup needs all scene indices.
     _preTrimBeats = beats.slice();
     {
-      const AVG_BEAT_SEC  = 15;
+      const _beatWindows = beats.map(b => Math.max(0, Number(b.endSec) - Number(b.startSec)));
+      const _nonZeroWindows = _beatWindows.filter(w => w > 0);
+      const _sorted = _nonZeroWindows.slice().sort((a,b) => a-b);
+      const _medianWin = _sorted.length ? _sorted[Math.floor(_sorted.length/2)] : 0;
+      // Clamp measured avg to a sane range: 8s-25s per beat.
+      const AVG_BEAT_SEC  = Math.max(8, Math.min(25, _medianWin || 15));
+      console.log(`[render ${jobId}] BEAT-TRIM: measured median beat window=${_medianWin.toFixed(1)}s → using ${AVG_BEAT_SEC.toFixed(1)}s/beat avg`);
       const BEATS_TARGET  = Math.max(40, Math.min(120, Math.round((+targetMinutes || 20) * 60 / AVG_BEAT_SEC)));
       if (beats.length > BEATS_TARGET) {
         const original = beats.slice();
@@ -4815,7 +4828,9 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
         // Final multimodal verifier: analyze candidate + CLIP/Whisper candidates →
         // Gemini Flash picks the best clip. Runs only when GEMINI_API_KEY is set.
         if (SERVER_GEMINI_KEY) {
-          const maxVerify = Math.max(0, Math.min(scenes.length, Number(process.env.GEMINI_VERIFY_MAX_BEATS || 35)));
+          // FIX (v3.0.0): cover all beats by default (was 35 = first half only).
+          // Gemini verifies N beats total — 999 means effectively unlimited (all beats).
+          const maxVerify = Math.max(0, Math.min(scenes.length, Number(process.env.GEMINI_VERIFY_MAX_BEATS || 999)));
           let attemptedGemini = 0, appliedGemini = 0, rejectedGemini = 0, skippedGemini = 0, failedGemini = 0;
           for (let i = 0; i < maxVerify; i++) {
             const cands = _dedupeCandidates([
@@ -4885,8 +4900,22 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
             safeStart = logoFloor;
           }
         }
+        // FIX (v3.0.0): Enforce the logo-safety floor on every beat's scene window.
+        // Previously safeStart was computed but only used as a scan-range hint for
+        // planSyncedRender; beats whose startSec was 0-240s still went through and
+        // produced credits/logo footage in the body. Now any beat window that starts
+        // before the floor is shifted forward so its footage is credits-free.
         if (safeStart > 0) {
-          console.log(`[render ${jobId}] SYNC: intro-skip floor = ${safeStart.toFixed(1)}s (no footage before first real beat)`);
+          let floorApplied = 0;
+          scenes = scenes.map((sc, _i) => {
+            if (Number(sc.startSec) >= safeStart) return sc;
+            const dur = Math.max(0, Number(sc.endSec) - Number(sc.startSec));
+            const newStart = safeStart;
+            const newEnd   = safeStart + dur;
+            floorApplied++;
+            return { ...sc, startSec: newStart, endSec: newEnd };
+          });
+          console.log(`[render ${jobId}] SYNC: intro-skip floor = ${safeStart.toFixed(1)}s (${floorApplied} beats clamped to avoid credits footage)`);
         }
         // Decide distribution mode:
         //   per-beat-audio  → voice files count equals beats count → exact audio durations

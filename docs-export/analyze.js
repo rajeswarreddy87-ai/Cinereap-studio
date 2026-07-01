@@ -830,6 +830,15 @@ export function buildSceneScriptMessages({ movie, channelName, beats, characters
 ` +
         `- If a transcript line is ambiguous, say "one of them" or describe the action without naming.
 ` +
+        `- FIGHTER IDENTITY RULE (v3.0.0): boxing / sports films feature multiple fighters. ` +
+        `DO NOT call every opposing fighter by the villain's name (e.g. "Escobar"). ` +
+        `Use the correct opponent name for each fight/scene: if the transcript or beat note says ` +
+        `"Brady", "Garcia", "opponent", or a different name, use THAT name — not a recurring ` +
+        `antagonist. Reserve the villain's name only for beats where they are confirmed on screen ` +
+        `by transcript dialogue or a beat note. When the opponent is unknown, use "his opponent", ` +
+        `"the challenger", "the other fighter", etc.
+
+` +
         `- Relationship words like father, brother, uncle, wife, daughter, manager, trainer must be used only when confirmed.
 ` +
         `- Prefer accuracy over dramatic wording; a wrong name is worse than a generic label.
@@ -891,9 +900,12 @@ export function buildSceneScriptMessages({ movie, channelName, beats, characters
         `     future events before their beat's timestamp.\n` +
         `  C. NO REPETITION: if a fact was established in a prior beat (character identity, plot event, ` +
         `     revelation), do NOT restate it verbatim — reference briefly instead.\n` +
-        `  D. BEAT DURATION TARGET: each beat narration should take 8–12 seconds to speak aloud ` +
-        `     (approximately 2–3 sentences, 20–40 words). Target 10 seconds. Major climax or revelation ` +
-        `     beats may extend to 15 seconds. Do NOT write 1-sentence micro-beats.\n` +
+        `  D. BEAT DURATION TARGET (v3.0.0): each beat narration MUST take 12–18 seconds to speak aloud ` +
+        `     (approximately 3–4 full sentences, 35–55 words). Target 15 seconds. ` +
+        `     Major climax or revelation beats may extend to 20 seconds (60–70 words). ` +
+        `     CRITICAL: always complete the last sentence — never cut a thought mid-sentence. ` +
+        `     End each beat at a natural pause (end of sentence, comma-then-pause, or scene conclusion). ` +
+        `     Do NOT write 1–2 sentence micro-beats (under 25 words) — these create abrupt jumps.\n` +
         `  E. YOUTUBE NARRATION STYLE: punchy, direct, present-tense active voice. Specific nouns and ` +
         `     actions. No film-theory commentary, no meta-references to "the film" or "the scene". ` +
         `     Speak as if narrating the events AS they happen on screen.\n\n` +
