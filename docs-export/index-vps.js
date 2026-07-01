@@ -357,7 +357,7 @@ app.get("/health", (_req, res) => {
 
   res.json({
     ok: true,
-    version: "3.0.1",
+    version: "3.0.2",
     serverTranscription: Boolean(SERVER_OPENAI_KEY),
     serverAnalysis: Boolean(SERVER_ANTHROPIC_KEY),
     serverModel: SERVER_ANTHROPIC_MODEL || null,
@@ -4840,19 +4840,44 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
           // FIX (v3.0.0): cover all beats by default (was 35 = first half only).
           // Gemini verifies N beats total — 999 means effectively unlimited (all beats).
           const maxVerify = Math.max(0, Math.min(scenes.length, Number(process.env.GEMINI_VERIFY_MAX_BEATS || 999)));
+          // ROOT CAUSE FIX (v3.0.2): the Whisper transcript candidate was the source
+          // of the visual mismatch Gemini introduced.
+          //
+          // findTranscriptCandidateForBeat matches NARRATION TEXT (descriptive prose
+          // like "Billy trains intensely in the gym preparing for his comeback") against
+          // SPOKEN DIALOGUE ("you gotta stay tight, protect yourself") using Jaccard
+          // word overlap. These two text types share almost zero content words — so the
+          // Whisper candidate was effectively a random window from anywhere in the movie
+          // that happened to share a generic word like "fight" or "him". Gemini then
+          // systematically picked it because at 480p/6fps, a dialogue scene where
+          // characters say "training" looks like a plausible match for narration about
+          // training — but it's from a completely wrong scene.
+          //
+          // Fix: Gemini now ONLY chooses between the analyze window (Claude assigned)
+          // and the SigLIP window (image-embedding match). These are both meaningful
+          // options. If SigLIP didn't find a distinct window (deduped), Gemini skips —
+          // the analyze window stands unchanged, which is safe (Claude wrote the
+          // narration while looking AT those frames).
+          //
+          // Also raised accept threshold 0.35→0.65: only apply Gemini's choice when
+          // it is genuinely confident, not just "least bad". Below 0.65 the analyze
+          // window is kept (it was assigned for the right visual content).
           let attemptedGemini = 0, appliedGemini = 0, rejectedGemini = 0, skippedGemini = 0, failedGemini = 0;
           for (let i = 0; i < maxVerify; i++) {
             const cands = _dedupeCandidates([
               { ...originalBeatScenes[i], label: "analyze" },
               siglipCandidateScenes[i] ? { ...siglipCandidateScenes[i], label: "siglip" } : null,
-              scenes[i] ? { ...scenes[i], label: scenes[i].reason?.includes('[siglip:') ? "siglip-current" : "current" } : null,
-              transcriptCandidateScenes[i] ? { ...transcriptCandidateScenes[i], label: "whisper" } : null,
+              // "current" only if it has been meaningfully moved by siglip (not same as analyze)
+              scenes[i] && scenes[i].reason?.includes('[clip:') ? { ...scenes[i], label: "siglip-current" } : null,
+              // ⚠️ Whisper transcript candidate REMOVED — it matches narration prose
+              // against spoken dialogue (wrong domain) and produces random-location
+              // windows that cause severe audio/visual desync when Gemini picks them.
             ]);
             if (cands.length < 2) { skippedGemini++; continue; }
             attemptedGemini++;
             const v = await verifyBeatCandidatesWithGemini({ jobId, beatIndex: i, narration: beatTexts[i], sourcePath, candidates: cands });
             if (!v) { failedGemini++; continue; }
-            if (v.confidence >= Number(process.env.GEMINI_ACCEPT_THRESHOLD || 0.35)) {
+            if (v.confidence >= Number(process.env.GEMINI_ACCEPT_THRESHOLD || 0.65)) {
               const chosen = cands[v.index];
               if (protectedVisualBeats[i] && chosen.label !== "analyze") { rejectedGemini++; continue; }
               scenes[i] = { ...scenes[i], startSec: chosen.startSec, endSec: chosen.endSec, reason: `${scenes[i]?.reason || ''} [gemini:${chosen.label}:${v.confidence.toFixed(2)}]` };
