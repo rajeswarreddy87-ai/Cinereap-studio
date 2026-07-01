@@ -30,6 +30,7 @@ import { promises as fsp } from "node:fs";
 import { transcribeMovie, buildTranscriptBlock } from "./transcribe.js";
 import { planSyncedRender, buildSyncedTimeline } from "./beats.js";
 import { _dedupeCandidates, _tokSet, _jaccard, findTranscriptCandidateForBeat } from "./lib/candidates.js";
+import { fetchTmdbCast } from "./lib/tmdb.js";
 import { planMusicTimeline, dominantMood } from "./music.js";
 
 const PORT = Number(process.env.PORT || 8787);
@@ -52,6 +53,7 @@ const SERVER_SPEECHIFY_VOICE = process.env.SPEECHIFY_VOICE_ID || "dominic"; // D
 // ElevenLabs TTS — optional second provider. Set ELEVENLABS_API_KEY to enable.
 // Default voice: George (JBFqnCBsd6RMkjVDRZzb) — deep English narrator.
 const SERVER_ELEVENLABS_KEY   = process.env.ELEVENLABS_API_KEY  || "";
+const SERVER_TMDB_KEY         = process.env.TMDB_API_KEY        || "";
 // ElevenLabs voice IDs are case-sensitive on their API. The known-good ID for
 // "Jofra – Expressive & Neutral Narrator" is mixed-case. Normalise the env var
 // so an all-caps copy-paste never causes silent 404s on every TTS request.
@@ -355,7 +357,7 @@ app.get("/health", (_req, res) => {
 
   res.json({
     ok: true,
-    version: "2.9.6",
+    version: "2.9.7",
     serverTranscription: Boolean(SERVER_OPENAI_KEY),
     serverAnalysis: Boolean(SERVER_ANTHROPIC_KEY),
     serverModel: SERVER_ANTHROPIC_MODEL || null,
@@ -1996,6 +1998,28 @@ app.post("/analyze", requireAuth, async (req, res) => {
           console.log(`[analyze ${jobId}] CLIP metadata: ${_clipMeta.length} scene midpoint frames timestamped`);
         } catch (_cmErr) {
           console.warn(`[analyze ${jobId}] CLIP metadata write failed (non-fatal):`, _cmErr?.message);
+        }
+
+        // ── TMDb CAST ENRICHMENT (v2.9.7) ──────────────────────────────────
+        // If the app didn't supply a cast list and a TMDB key is configured,
+        // look up the film's real character names and inject them as movie.cast.
+        // The analyze prompts prefer a provided cast over guessing from the
+        // (speaker-less) transcript — the biggest lever for name accuracy.
+        // Mutates the shared `movie` object so the fixed-frame fallback below
+        // benefits too. Fails soft: any error leaves movie.cast unchanged.
+        if ((!movie.cast || !String(movie.cast).trim()) && SERVER_TMDB_KEY && movie.title) {
+          try {
+            const _tmdbCast = await fetchTmdbCast({ apiKey: SERVER_TMDB_KEY, title: movie.title, year: movie.year });
+            if (_tmdbCast) {
+              movie.cast = _tmdbCast;
+              console.log(`[analyze ${jobId}] TMDb cast for "${movie.title}": ${_tmdbCast}`);
+              await jobStore.update(jobId, { message: "Loaded character list from TMDb" });
+            } else {
+              console.log(`[analyze ${jobId}] TMDb: no cast found for "${movie.title}"`);
+            }
+          } catch (_tmdbErr) {
+            console.warn(`[analyze ${jobId}] TMDb lookup failed (continuing without cast):`, _tmdbErr?.message || _tmdbErr);
+          }
         }
 
         parsed = await analyzeWithScenes({
