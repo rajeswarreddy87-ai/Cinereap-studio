@@ -276,10 +276,14 @@ async function _extractVerifierClip(sourcePath, { startSec, endSec }, outPath) {
   return new Promise((resolve) => {
     const ff = spawn("ffmpeg", [
       "-y", "-hide_banner", "-loglevel", "error",
+      // v3.0.3: raised from 480p/6fps → 720p/15fps so Gemini can identify
+      // characters, actions, and scene context. At 480p/6fps Gemini saw blurry
+      // motion-blurred stills; at 720p/15fps it sees smooth motion and clear
+      // faces — significantly improves multimodal scene understanding.
       "-ss", startSec.toFixed(3), "-i", sourcePath,
       "-t", (endSec - startSec).toFixed(3),
-      "-vf", "scale=480:-2,fps=6", "-an",
-      "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
+      "-vf", "scale=720:-2,fps=15", "-an",
+      "-c:v", "libx264", "-preset", "ultrafast", "-crf", "24",
       outPath,
     ], { stdio: "ignore" });
     const t = setTimeout(() => { try { ff.kill("SIGKILL"); } catch {} resolve(false); }, 45_000);
@@ -357,7 +361,7 @@ app.get("/health", (_req, res) => {
 
   res.json({
     ok: true,
-    version: "3.0.2",
+    version: "3.0.3",
     serverTranscription: Boolean(SERVER_OPENAI_KEY),
     serverAnalysis: Boolean(SERVER_ANTHROPIC_KEY),
     serverModel: SERVER_ANTHROPIC_MODEL || null,
@@ -4767,12 +4771,21 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
                 }, 300_000); // 5 min — CPU embedding of ~178 scene frames takes 2-4 min
 
                 if (embedRes && embedRes.frames > 0) {
-                  // 2. Match each beat's narration text to best-matching frame
+                  // 2. Match each beat's narration text to best-matching scene window.
+                  // v3.0.3: pass sceneWindows so the sidecar averages ALL stored frames
+                  // within each beat's window instead of picking the single best frame.
+                  // A 10 s scene has 5 extracted frames (start/25%/mid/75%/end) — the
+                  // averaged embedding represents the whole scene and is far more robust
+                  // than one midpoint frame that might be a close-up, cut, or dark shot.
                   const nonEmptyTexts = beatTexts.map((t) => t.trim() || "film scene");
                   const matchRes = await callClipSidecar("/match", {
                     jobId: _analyzeJobId,
                     texts: nonEmptyTexts,
-                  }, 60_000);
+                    sceneWindows: scenes.map((sc) => ({
+                      startSec: Number(sc.startSec),
+                      endSec:   Number(sc.endSec),
+                    })),
+                  }, 90_000);
 
                   if (matchRes && Array.isArray(matchRes.results) && matchRes.results.length === scenes.length) {
                     let clipApplied = 0;

@@ -1,14 +1,25 @@
 """
-CineRecap Visual Matching Sidecar — v1.2
+CineRecap Visual Matching Sidecar — v1.3
 Semantic frame-to-narration matching using OpenCLIP/SigLIP (CPU-only).
 Default model: ViT-SO400M-14-SigLIP2 (webli), with ViT-B-32/openai fallback.
 Uses open_clip_torch which downloads models in safetensors format, avoiding
 the CVE-2025-32434 vulnerability that affects torch.load with pytorch_model.bin.
 
+v1.3 improvements:
+  - /match now uses multi-frame window averaging: for each narration beat, it
+    groups ALL stored frames whose timestamp falls within the beat's scene
+    window, averages their embeddings, and reports the window's aggregate
+    similarity score. This is far more robust than single-midpoint matching:
+    a scene with quick cuts or an unrepresentative midpoint frame no longer
+    causes the whole beat to be mis-assigned.
+  - Fallback to best-single-frame when no window info is provided (backward
+    compatible with old callers).
+
 Endpoints:
   GET  /health                       readiness + model status
   POST /embed-job                    embed all frames for one analyze job (idempotent)
-  POST /match                        find best-matching frame timestamp per narration text
+  POST /match                        find best-matching scene window per narration text
+                                     (accepts optional sceneWindows for multi-frame avg)
   DELETE /embed-job/{job_id}         release stored embeddings
 """
 import os
@@ -88,9 +99,19 @@ class EmbedJobRequest(BaseModel):
     frames: List[FrameItem]
 
 
+class SceneWindow(BaseModel):
+    startSec: float
+    endSec: float
+
+
 class MatchRequest(BaseModel):
     jobId: str
     texts: List[str]
+    # v1.3: optional per-text scene windows for multi-frame averaging.
+    # When provided, every stored frame whose timeSec falls within the window
+    # is averaged into a single scene embedding — much more robust than the
+    # single midpoint frame. Length must equal len(texts) when present.
+    sceneWindows: Optional[List[Optional[SceneWindow]]] = None
 
 
 def _embed_image(path_str: str) -> Optional[np.ndarray]:
@@ -150,22 +171,72 @@ def match(req: MatchRequest):
     if not entries:
         raise HTTPException(404, f"No embeddings for job {req.jobId}")
 
-    frame_embs = np.stack([e["embedding"] for e in entries])
-    frame_norms = np.linalg.norm(frame_embs, axis=1, keepdims=True) + 1e-8
+    frame_embs  = np.stack([e["embedding"] for e in entries])
     frame_times = [e["timeSec"] for e in entries]
+    frame_norms = np.linalg.norm(frame_embs, axis=1, keepdims=True) + 1e-8
     normed_frames = frame_embs / frame_norms
 
+    use_windows = (
+        req.sceneWindows is not None
+        and len(req.sceneWindows) == len(req.texts)
+    )
+    multi_frame_used = 0
+
     results = []
-    for text in req.texts:
+    for idx, text in enumerate(req.texts):
         text_emb = _embed_text(text)
         if text_emb is None:
             mid = len(entries) // 2
             results.append({"timeSec": float(frame_times[mid]), "score": 0.0})
             continue
+
         text_norm = np.linalg.norm(text_emb) + 1e-8
-        sims = normed_frames @ (text_emb / text_norm)
+        t_normed = text_emb / text_norm
+
+        win = req.sceneWindows[idx] if use_windows else None
+
+        if win is not None:
+            # ── MULTI-FRAME WINDOW AVERAGING (v1.3) ──────────────────────────
+            # Collect all stored frames whose timestamp falls inside the beat's
+            # scene window. Average their embeddings into one scene descriptor,
+            # then score against the text. This removes the single-midpoint-
+            # frame bias: a 10 s scene with 5 stored frames (start/25%/mid/
+            # 75%/end) produces an averaged embedding that represents the whole
+            # scene rather than one potentially unrepresentative frame.
+            window_idxs = [
+                i for i, t in enumerate(frame_times)
+                if win.startSec <= t <= win.endSec
+            ]
+            if len(window_idxs) >= 2:
+                win_embs = normed_frames[window_idxs]   # already L2-normalised
+                # Average and re-normalise (mean of unit vectors is NOT unit)
+                avg_emb = win_embs.mean(axis=0)
+                avg_norm = np.linalg.norm(avg_emb) + 1e-8
+                avg_normed = avg_emb / avg_norm
+                score = float(avg_normed @ t_normed)
+                # Representative timestamp: frame within window closest to the
+                # midpoint of the window (not just the array midpoint).
+                win_mid = (win.startSec + win.endSec) / 2
+                best_win_idx = min(window_idxs, key=lambda i: abs(frame_times[i] - win_mid))
+                results.append({
+                    "timeSec": float(frame_times[best_win_idx]),
+                    "score":   score,
+                    "framesAveraged": len(window_idxs),
+                })
+                multi_frame_used += 1
+                continue
+
+        # ── FALLBACK: best single frame (original behaviour) ─────────────────
+        sims = normed_frames @ t_normed
         best_idx = int(np.argmax(sims))
-        results.append({"timeSec": float(frame_times[best_idx]), "score": float(sims[best_idx])})
+        results.append({
+            "timeSec": float(frame_times[best_idx]),
+            "score":   float(sims[best_idx]),
+            "framesAveraged": 1,
+        })
+
+    if use_windows:
+        log.info(f"match {req.jobId}: {multi_frame_used}/{len(req.texts)} beats used multi-frame averaging")
 
     return {"results": results}
 
