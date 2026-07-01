@@ -1,4 +1,4 @@
-# CineRecap VPS Pipeline — Code Reference (v2.9.6)
+# CineRecap VPS Pipeline — Code Reference (v2.9.7)
 
 **Server path:** `/root/cinerecap-render-server/`  
 **Live URL:** `http://109.123.241.130:4040`  
@@ -879,3 +879,30 @@ Deployed via the new path; `GET /health` reports `version: 2.9.6`.
 > failure mode that motivated the refactor; each further extraction (hook,
 > visual-match, timeline, mux) can now be done one at a time, each verified by the
 > gate + a render, instead of one risky big-bang rewrite.
+
+
+## v2.9.7 — TMDb cast lookup (accurate character names/relationships)
+
+The biggest remaining accuracy lever: Whisper has no speaker labels, so Claude
+guesses who says what. A real cast list fixes this.
+
+- New module **`src/lib/tmdb.js`** (`fetchTmdbCast`) — searches TMDb by title(+year),
+  picks the best match, and returns the top-billed **character** names (not actors).
+  Supports both v3 `api_key` and v4 bearer-token auth. Fails soft.
+- Wired into the `/analyze` route: when the app sends no `movie.cast` and
+  `TMDB_API_KEY` is set, the real character list is injected as `movie.cast`. The
+  analyze prompts already prefer a provided cast over guessing, so this flows into
+  Stage-A character notes and Stage-B narration.
+- `TMDB_API_KEY` added to `.env` and to `docker-compose.yml`'s `environment:` list
+  (compose only passes explicitly-declared vars into the container).
+
+Verified live (analyze `thp4OpqVGk`, "Southpaw"):
+
+```text
+[analyze thp4OpqVGk] TMDb cast for "Southpaw": Billy 'The Great' Hope, Maureen Hope,
+Titus 'Tick' Wills, Leila Hope, Jordan Mains, Hoppy, Angela Rivera, Ramone, Jon Jon,
+Miguel 'Magic' Escobar, Mikey, Eli Frost, Gabe, Keith 'Buzzsaw' Brady, Gloria
+```
+
+This is the third `src/lib/` module (after `candidates.js`), continuing the
+incremental modularization. `GET /health` reports `version: 2.9.7`.
