@@ -29,6 +29,7 @@ import { analyzeScenes, SCENE_THRESHOLD } from "./scenes.js";
 import { promises as fsp } from "node:fs";
 import { transcribeMovie, buildTranscriptBlock } from "./transcribe.js";
 import { planSyncedRender, buildSyncedTimeline } from "./beats.js";
+import { _dedupeCandidates, _tokSet, _jaccard, findTranscriptCandidateForBeat } from "./lib/candidates.js";
 import { planMusicTimeline, dominantMood } from "./music.js";
 
 const PORT = Number(process.env.PORT || 8787);
@@ -337,54 +338,9 @@ async function verifyBeatCandidatesWithGemini({ jobId, beatIndex, narration, sou
 }
 
 
-function _dedupeCandidates(cands) {
-  const out = [];
-  for (const c of cands || []) {
-    if (!c || !(Number(c.endSec) > Number(c.startSec) + 0.5)) continue;
-    const mid = (Number(c.startSec) + Number(c.endSec)) / 2;
-    if (out.some(o => Math.abs(((o.startSec + o.endSec) / 2) - mid) < 2.0)) continue;
-    out.push({ ...c, startSec: Number(c.startSec), endSec: Number(c.endSec) });
-  }
-  return out.slice(0, 5);
-}
-function _tokSet(s) {
-  return new Set(String(s || "").toLowerCase().replace(/[^a-z0-9\s]/g, " ").split(/\s+/).filter(w => w.length > 2));
-}
-function _jaccard(a, b) {
-  if (!a.size || !b.size) return 0;
-  let inter = 0;
-  for (const x of a) if (b.has(x)) inter++;
-  return inter / (a.size + b.size - inter);
-}
-function findTranscriptCandidateForBeat(narration, transcriptSegments, sourceDurationSec = 0) {
-  if (!Array.isArray(transcriptSegments) || transcriptSegments.length === 0) return null;
-  const q = _tokSet(narration);
-  if (!q.size) return null;
-  let best = null;
-  for (let i = 0; i < transcriptSegments.length; i++) {
-    const st = Number(transcriptSegments[i].start ?? transcriptSegments[i].startSec ?? 0);
-    let end = st;
-    let text = "";
-    for (let j = i; j < transcriptSegments.length; j++) {
-      const sj = transcriptSegments[j];
-      const sjEnd = Number(sj.end ?? sj.endSec ?? st);
-      if (sjEnd - st > 18) break;
-      text += " " + String(sj.text || "");
-      end = Math.max(end, sjEnd);
-    }
-    const score = _jaccard(q, _tokSet(text));
-    if (!best || score > best.score) best = { startSec: st, endSec: Math.max(end, st + 6), score, label: "whisper" };
-  }
-  if (!best || best.score < 0.09) return null;
-  const dur = Math.min(14, Math.max(6, best.endSec - best.startSec + 4));
-  const mid = (best.startSec + best.endSec) / 2;
-  return {
-    label: "whisper",
-    startSec: Math.max(0, mid - dur / 2),
-    endSec: sourceDurationSec > 0 ? Math.min(sourceDurationSec, mid + dur / 2) : mid + dur / 2,
-    score: best.score,
-  };
-}
+// Candidate/transcript helpers moved to ./lib/candidates.js (v2.9.6 modularization).
+// Imported at the top of this file. Kept out of index.js so a stray edit here
+// can't delete them and silently collapse the body.
 
 /* ---------- routes ---------- */
 app.get("/health", (_req, res) => {
@@ -399,7 +355,7 @@ app.get("/health", (_req, res) => {
 
   res.json({
     ok: true,
-    version: "2.9.5",
+    version: "2.9.6",
     serverTranscription: Boolean(SERVER_OPENAI_KEY),
     serverAnalysis: Boolean(SERVER_ANTHROPIC_KEY),
     serverModel: SERVER_ANTHROPIC_MODEL || null,
@@ -4072,13 +4028,17 @@ async function runRenderFromIngest(jobId, {
       : 0;
     if (zeroTsCount > (timestamps?.length ?? 0) * 0.3) {
       try {
+        // `fileId` was referenced here but never defined in this function (the
+        // render receives `sourcePath`). It only avoided a ReferenceError because
+        // this block is skipped whenever the app sends beats. Derive it correctly.
+        const sourceFileId = path.basename(sourcePath);
         const allJobs = await jobStore.list();
         // Find the most recent completed analyze job for this source file.
         const analyzeJob = allJobs
           .filter(
             (j) =>
               j.kind === 'analyze' &&
-              (j.sourceFileId === fileId || j.result?.sourceFileId === fileId) &&
+              (j.sourceFileId === sourceFileId || j.result?.sourceFileId === sourceFileId) &&
               j.status === 'done' &&
               Array.isArray(j.result?.beats) &&
               j.result.beats.length > 0,
@@ -4213,6 +4173,13 @@ async function runRenderFromIngest(jobId, {
   // degraded "loop align" render. See the body-collapse guard before BEAT-MUX.
   let _syncPlanFailed = false;
   let _syncPlanError = null;
+  // Hoisted to function scope (v2.9.6): the HOOK section below references
+  // _preTrimBeats, but it was declared with `const` inside the sync-planning
+  // if-block, so it was out of scope there. It only avoided a ReferenceError
+  // because the hook lookup used `_scenesMap ?? (…_preTrimBeats…)` and _scenesMap
+  // was usually truthy (short-circuit). On any analyze job without a scenesMap it
+  // would throw. Hoisting makes it always in scope; guarded by Array.isArray().
+  let _preTrimBeats = null;
   if (Array.isArray(beats) && beats.length > 0 &&
       (voiceoverFileIds.length > 0 || !!(SERVER_SPEECHIFY_KEY || SERVER_OPENAI_KEY))) {
     // ── UNIVERSAL BEAT NORMALISATION ──────────────────────────────────────
@@ -4278,7 +4245,7 @@ async function runRenderFromIngest(jobId, {
     // Compute beat target from user-selected duration (passed as targetMinutes).
     // Average TTS per beat ≈ 15s empirically; clamp between 40 and 120 beats.
     // Save full beat list before trimming — hook footage lookup needs all scene indices.
-    const _preTrimBeats = beats.slice();
+    _preTrimBeats = beats.slice();
     {
       const AVG_BEAT_SEC  = 15;
       const BEATS_TARGET  = Math.max(40, Math.min(120, Math.round((+targetMinutes || 20) * 60 / AVG_BEAT_SEC)));
@@ -4703,6 +4670,13 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
             }
 
             if (frameFiles.length > 0) {
+              // Probe source duration once, hoisted so the CLIP recenter filter
+              // below (which uses srcDurClip for its liberal radius) always sees
+              // it. Previously srcDurClip was declared only inside the legacy
+              // catch block, so the metadata-present path referenced an
+              // out-of-scope variable → latent ReferenceError.
+              let srcDurClip = 0;
+              try { srcDurClip = await probeDurationSec(sourcePath); } catch {}
               // Use clip-metadata.json written by analyze step for correct per-scene
               // timestamps. Fallback: even-spaced reconstruction (inaccurate for the
               // scene-aware path — kept for old analyze jobs that predate the metadata).
@@ -4716,8 +4690,6 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
                 console.log(`[render ${jobId}] CLIP: metadata loaded — ${frames.length} frames with scene-accurate timestamps`);
               } catch {
                 // Legacy fallback: even-spaced timestamps (wrong for scene-aware extraction)
-                let srcDurClip = 0;
-                try { srcDurClip = await probeDurationSec(sourcePath); } catch {}
                 const stepSec = srcDurClip > 0 ? srcDurClip / (frameFiles.length + 1) : 0;
                 frames = frameFiles.map((f, i) => ({
                   path: path.join(framesDir, f),
@@ -5654,78 +5626,11 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
   }
   // ── END HOOK FOOTAGE CLIP ─────────────────────────────────────────────────
 
-  // ── OUTRO SEGMENT — DISABLED ─────────────────────────────────────────────
-  // Outro removed. Video ends cleanly after last body beat.
-  if (false) try {
-    const _outroText = (typeof settings?.outroText === "string" && settings.outroText.trim())
-      ? settings.outroText.trim()
-      : "That's the complete story. If you enjoyed this breakdown, hit like and subscribe for more movie recaps every week.";
-    if (_hookTtsKey) {
-      const _outroTtsSpeed = (settings && settings.ttsSpeed) || 1.0;
-      const _outroTtsId    = `${jobId}-outro-tts-beat-000.mp3`;
-      const _outroTtsPath  = path.join(UPLOADS_DIR, _outroTtsId);
-      let _outroDurSec     = 0;
-      let _outroTtsOk      = false;
-
-      // Attempt 1: primary TTS provider (same as story beats)
-      try {
-        await _ttsOnce(_hookTtsProvider, _hookTtsKey, _hookTtsVoice, _outroTtsSpeed, _outroText, _outroTtsPath);
-        _outroDurSec = await probeDurationSec(_outroTtsPath);
-        if (_outroDurSec > 0.1) { _outroTtsOk = true; }
-      } catch (e1) {
-        console.warn(`[render ${jobId}] OUTRO TTS: primary provider failed — ${e1?.message || e1}`);
-      }
-
-      // Attempt 2: OpenAI fallback (reliable, always available)
-      if (!_outroTtsOk && SERVER_OPENAI_KEY) {
-        try {
-          await new Promise(r => setTimeout(r, 2000)); // brief pause before fallback
-          await _ttsOnce("openai", SERVER_OPENAI_KEY, "onyx", 1.0, _outroText, _outroTtsPath);
-          _outroDurSec = await probeDurationSec(_outroTtsPath);
-          if (_outroDurSec > 0.1) { _outroTtsOk = true; console.log(`[render ${jobId}] OUTRO TTS: used OpenAI fallback`); }
-        } catch (e2) {
-          console.warn(`[render ${jobId}] OUTRO TTS: OpenAI fallback also failed — ${e2?.message || e2}`);
-        }
-      }
-
-      if (!_outroTtsOk) {
-        console.warn(`[render ${jobId}] OUTRO TTS: all providers failed — outro skipped`);
-      }
-
-      if (_outroTtsOk) {
-        console.log(`[render ${jobId}] OUTRO TTS: ${_outroDurSec.toFixed(1)}s — id=${_outroTtsId}`);
-        // Use footage from 55% into the film — avoids the climax/ending region
-        // that story beats already cover (last 30%), preventing the same footage
-        // appearing in the outro that viewers just watched in beats 70-80.
-        let _oSrcDur = 0;
-        try { _oSrcDur = await probeDurationSec(sourcePath); } catch {}
-        if (_oSrcDur > 60) {
-          const _oStart    = Math.max(30, _oSrcDur * 0.55);
-          const _oEnd      = Math.min(_oSrcDur - 3, _oStart + Math.max(_outroDurSec + 3, 15));
-          const _oClipPath = path.join(UPLOADS_DIR, `outro-clip-${jobId}.mp4`);
-          const _oArgs     = buildTrimArgs({ inputPath: sourcePath, startSec: _oStart, endSec: _oEnd, outputPath: _oClipPath, reencode: true });
-          await new Promise((res) => {
-            const ff = spawn("ffmpeg", _oArgs, { stdio: "ignore" });
-            const t  = setTimeout(() => { try { ff.kill("SIGKILL"); } catch {} res(); }, 90_000);
-            ff.on("close", (code) => {
-              clearTimeout(t);
-              if (code === 0) {
-                clipPaths.push(_oClipPath);
-                voiceoverFileIds.push(_outroTtsId);
-                console.log(`[render ${jobId}] OUTRO: appended clip (${_oStart.toFixed(0)}–${_oEnd.toFixed(0)}s) + TTS ${_outroTtsId}`);
-              } else {
-                console.warn(`[render ${jobId}] outro clip failed (code ${code}) — skipping`);
-              }
-              res();
-            });
-            ff.on("error", (e) => { clearTimeout(t); console.warn(`[render ${jobId}] outro clip error:`, e?.message || e); res(); });
-          });
-        }
-      }
-    }
-  } catch (outroErr) {
-    console.warn(`[render ${jobId}] outro generation failed (non-fatal):`, outroErr?.message || outroErr);
-  }
+  // ── OUTRO SEGMENT — REMOVED ──────────────────────────────────────────────
+  // The video ends cleanly after the last body beat. The previously disabled
+  // `if (false)` outro block was removed in v2.9.6 (it referenced undefined
+  // _hookTtsKey/_hookTtsProvider/_hookTtsVoice — dead code that tripped the
+  // no-undef lint gate). Restore from git history if an outro is ever wanted.
   // ── END OUTRO SEGMENT ─────────────────────────────────────────────────────
 
   const outputPath     = path.join(OUTPUT_DIR, `recap-${jobId}.mp4`);

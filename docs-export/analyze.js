@@ -9,6 +9,13 @@ import { spawn } from "node:child_process";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 
+// Legacy fallback threshold (seconds): timestamps before this are treated as
+// opening-credits/logo and dropped in the non-scene-aware fallback path. The
+// primary scene-aware path handles credits via Claude "SKIP" labels instead.
+// Defined here because it was referenced but never declared — a latent
+// ReferenceError that only fires on the legacy fallback path.
+const OPENING_CREDITS_THRESHOLD = 0;
+
 /**
  * Probe a media file with ffprobe; returns the duration in seconds.
  */

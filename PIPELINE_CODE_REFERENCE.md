@@ -1,4 +1,4 @@
-# CineRecap VPS Pipeline — Code Reference (v2.9.5)
+# CineRecap VPS Pipeline — Code Reference (v2.9.6)
 
 **Server path:** `/root/cinerecap-render-server/`  
 **Live URL:** `http://109.123.241.130:4040`  
@@ -817,3 +817,65 @@ in the script — while keeping `claude-sonnet-4-5` (user saw no Opus improvemen
 > over guessing. Recommended P1 follow-up.
 
 `GET /health` reports `version: 2.9.5`.
+
+
+## v2.9.6 — modularization / single-source refactor foundation
+
+Goal: stop the recurring "silent collapse" regressions at the root before adding
+new features. The root causes were (a) **no version control** on the VPS code,
+(b) the file edited from **two sources** (server + Replit), and (c) `node --check`
+**cannot catch ReferenceErrors** — so undefined-symbol edits shipped and collapsed
+renders. Fixed structurally:
+
+### 1. Single source of truth (git)
+- `git init` in `/root/cinerecap-render-server` (was NOT under version control).
+- Hardened `.gitignore` (excludes `.env`, `.env.bak*`, `secrets-backup/`,
+  `*.bak-*`, `node_modules`, `uploads/output/storage/data`, `__pycache__`).
+- Verified no secrets staged; committed the working tree. Now every change is
+  tracked with history + rollback.
+
+### 2. no-undef lint gate (the linchpin)
+- `eslint.config.js` — self-contained flat config, rule `no-undef: error`. Catches
+  exactly the class `node --check` misses.
+- Running it on the live code immediately surfaced **5 latent landmines**, all now
+  fixed:
+  1. `OPENING_CREDITS_THRESHOLD` — referenced, never defined (analyze fallback).
+  2. `fileId` — used in an auto-load block but never defined (should be
+     `basename(sourcePath)`; only avoided because that branch is skipped when the
+     app sends beats).
+  3. `srcDurClip` — declared inside a `catch`, used outside it (CLIP recenter path).
+  4. `_preTrimBeats` — block-scoped in the sync `if`, used in the hook section;
+     only avoided via a `??` short-circuit → would throw on any analyze job with no
+     scenesMap. Hoisted to function scope.
+  5. Dead `if(false)` outro block referencing undefined `_hookTts*` — removed.
+- Gate now **PASSES on all 6 src modules**.
+
+### 3. Single safe deploy path
+- `scripts/check.sh` — `node --check` + eslint `no-undef` on all src (runs in the
+  container where node lives).
+- `scripts/deploy.sh` — gate → `git commit` → `docker compose restart` → `/health`.
+  A failing gate aborts before restart, so a reference error can never reach a
+  render again.
+- `package.json` gains `lint` / `check` scripts + `eslint` devDependency.
+
+### 4. First module extraction (pattern established)
+- `src/lib/candidates.js` — the pure candidate/transcript helpers
+  (`_dedupeCandidates`, `_tokSet`, `_jaccard`, `findTranscriptCandidateForBeat`)
+  extracted from `index.js` and imported back. Behaviour-preserving; validated by
+  the gate (index.js still resolves them via import) + runtime (server starts
+  healthy). This is the safe template for further extraction — and the lint gate
+  makes each future extraction safe (a missing import fails the gate).
+
+Deployed via the new path; `GET /health` reports `version: 2.9.6`.
+
+### Workflow going forward (single source of truth)
+1. Edit `src/` (server or export edits reconciled through git).
+2. `npm run check` (or `scripts/check.sh`) must pass — no `no-undef` errors.
+3. `scripts/deploy.sh "message"` commits + restarts + health-checks.
+4. Roll back instantly with `git revert`/`git checkout` if a change misbehaves.
+
+> Note: the heavy split of the ~6,300-line `runRenderFromIngest` into per-stage
+> modules is deliberately incremental. The guardrails above already neutralize the
+> failure mode that motivated the refactor; each further extraction (hook,
+> visual-match, timeline, mux) can now be done one at a time, each verified by the
+> gate + a render, instead of one risky big-bang rewrite.
