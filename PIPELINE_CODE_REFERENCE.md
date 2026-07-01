@@ -1,0 +1,978 @@
+# CineRecap VPS Pipeline — Code Reference (v2.9.7)
+
+**Server path:** `/root/cinerecap-render-server/`  
+**Live URL:** `http://109.123.241.130:4040`  
+**Exported copies in this repo:** `docs-export/`
+**Latest VPS patch:** v2.7.4 — post-trim hook footage, protected scene locks, Whisper candidate windows, optional Gemini Flash verifier, tail-beat full-MP3 gap fill.
+
+---
+
+## Simple pipeline (what actually runs)
+
+```
+1. POST /upload/movie          → fileId
+2. POST /analyze               → analyzeJobId + beats[] (178 scenes typical)
+3. POST /render-from-ingest    → recap MP4
+```
+
+Your Android app already follows this correctly (confirmed in `api.ts` + `index.tsx`).
+
+---
+
+## Module map (copy-paste source files)
+
+| Module | VPS path | Exported file | Role |
+|--------|----------|---------------|------|
+| **Timeline builder** | `src/beats.js` | `docs-export/beats.js` | `planSyncedRender()`, `buildSyncedTimeline()`, `computeBeatDurations()` |
+| **Scene selection** | `src/scenes.js` | `docs-export/scenes.js` | FFmpeg scene detection, `FRAMES_PER_SCENE=5`, `SCENE_THRESHOLD=0.25` |
+| **Analysis + narration** | `src/analyze.js` | `docs-export/analyze.js` | Claude prompts, `extractFrames()`, `analyzeWithScenes()` |
+| **Beat assembly / mux** | `src/index.js` | `docs-export/beat-mux-excerpt.js` | Per-beat video concat + `_muxVideoWithVoice()` |
+| **Hook generation** | `src/index.js` | `docs-export/hook-generation-excerpt.js` | HOOK-V2 Claude prompt + `sourceBeatIds` |
+| **Timeline sync block** | `src/index.js` | `docs-export/timeline-sync-excerpt.js` | Whisper align, sync score, subdivide |
+| **Gemini verifier** | `src/index.js` | `docs-export/gemini-verifier-excerpt.js` | Whisper/OpenCLIP/Gemini candidate verification |
+| **Thumbnails** | `src/index.js` | `docs-export/thumbnail-excerpt.js` | Real-frame-first thumbnail generation |
+| **Render API** | `src/index.js` | `docs-export/render-route-excerpt.js` | `POST /render-from-ingest` |
+| **FFmpeg helpers** | `src/ffmpeg-args.js` | `docs-export/ffmpeg-args.js` | `buildTrimArgs()`, `buildRenderArgs()`, `setpts` slow-mo |
+| **Music ducking** | `src/music.js` + index.js | `docs-export/music.js` | Mood beds, sidechain compress |
+
+Full render worker: `src/index.js` → `runRenderFromIngest()` (~lines 3300–5600)
+
+---
+
+## Frames Claude analyzes
+
+From `scenes.js`:
+
+```javascript
+export const FRAMES_PER_SCENE = 5;  // start, 25%, mid, 75%, end of each scene
+export const SCENE_THRESHOLD = 0.25; // ~120–180 scenes per 2-hour film
+```
+
+**Total frames sent to Claude** = `min(140, max(8, frameBudget || 60))` for legacy path, OR **~5 × number of detected scenes** for scene-aware path.
+
+Example: 150 detected scenes × 5 frames = **~750 frames** (batched to Claude in groups).
+
+Default `frameBudget` from app/server: **60–140** if scene detection falls back.
+
+---
+
+## Claude model (latest renders)
+
+| Step | Model | Source |
+|------|-------|--------|
+| `/analyze` | **claude-opus-4-5** | `SERVER_ANTHROPIC_MODEL` env / server default |
+| HOOK-V2 text | claude-haiku-4-5 or gpt-4o-mini | fallback in render |
+| Latest analyze job | `GkT1FmH4A1` / `BsAz4bjZ8K` | logs: `claude-opus-4-5` |
+
+**Will Opus fix Hector/Jonathan name swaps?** It already runs Opus for analysis. Name errors are **content accuracy** (transcript grounding), not timing. Opus helps but is not 100% — transcript must match dialogue at that timestamp.
+
+---
+
+## Why fixes seem to break something else
+
+The pipeline has **two separate problems** that look like the same bug:
+
+| Type | Symptom | What server measures |
+|------|---------|---------------------|
+| **Timing sync** | Audio ends before/after video | `SYNC-VALIDATION`, `drift=0.3s` |
+| **Content sync** | Funeral in narration, boxing on screen | NOT measured — sync score can be 100% while content is wrong |
+
+Fixing timing (per-beat TTS, beat mux, Whisper) does **not** fix wrong scene selection or wrong character names.
+
+**Layers that interact:**
+1. Analyze (178 beats, narration, scene windows)
+2. Beat trim (178 → 71) — **drops scenes**
+3. HOOK-V2 prepend — **can show credits if beat < 120s**
+4. CLIP semantic match — can pick wrong window
+5. Chronological sort — reorders beats + audio together
+6. Music ducking — can overpower if bed too loud
+
+Each layer was added to fix a prior issue → new edge cases.
+
+---
+
+## Latest render log summary
+
+| Job | Analyze | Beats | Sync score | Issues logged |
+|-----|---------|-------|------------|---------------|
+| `H9u-xpMSAF` | `BsAz4bjZ8K` Opus | 178→71 | 100% | Whisper partial nulls; hook prepended |
+| `Z9QV1mscWi` | `GkT1FmH4A1` Opus | 178→70 | 100% | 1 beat WARN 0.32s drift |
+
+Server reports **0.3–0.6s timing drift** — not 5–10s.  
+**5–10s perceived drift** = wrong scene for ~2–3 beats accumulating visually.
+
+---
+
+## v2.7.2 / v2.7.3 server fixes (deployed)
+
+1. **HOOK credits fix** — hook beats must be `startSec >= 120s` (no logo/credits footage)
+2. **HOOK lookup** — uses `_preTrimBeats` for stable scene windows
+3. **Beat trim** — protects funeral/death/climax beats from stratified drop
+4. **Music** — default bed `-26dB` (was `-18`), stronger ducking `ratio=12`
+5. **v2.7.1 fixes retained** — analyzeJobId auto-resolve, per-beat TTS, video speed-up in mux
+
+Verify: `GET /health` → `"version": "2.8.9"`
+
+---
+
+## Key functions (quick reference)
+
+### Timeline builder (`beats.js`)
+
+```javascript
+planSyncedRender({ script, scenes, voiceTotalSec, beatTexts, beatDurations })
+  → { timeline, beatDurations, beatTexts }
+
+buildSyncedTimeline(scenes, beatDurations, opts)
+  → [{ startSec, endSec, beatIndex }]  // sub-clips ≤6s each
+```
+
+### Beat assembly (`index.js`)
+
+```
+For each beat:
+  1. Concat sub-clips → beat video (video only)
+  2. GAP-FILL if video shorter than TTS (borrow footage / slow-mo)
+  3. _muxVideoWithVoice(beatVideo, beatTTS) → synced segment
+Concat all segments + optional hook prepend + music duck
+```
+
+### Hook generation (`index.js`)
+
+```
+1. Score beats by importance/emotion (post-trim)
+2. Claude writes hookText + sourceBeatIds[]
+3. Trim footage from those beat windows
+4. TTS hook narration
+5. Mux → prepend to body
+```
+
+---
+
+## Android app checklist (confirmed ✅)
+
+| Check | Status |
+|-------|--------|
+| `POST /render-from-ingest` | ✅ `api.ts:147` |
+| `fileId` | ✅ always sent |
+| `beats` + `analyzeJobId` | ✅ both sent |
+| `targetMinutes` | ✅ dynamic 15–25 min |
+| No `POST /render` | ✅ not used |
+
+---
+
+## Recommended next render test
+
+1. Force fresh analyze: `{ forceRefresh: true }` on `/analyze`
+2. Check logs for: `HOOK-V2 beat #N at Xs < intro floor — skipping`
+3. Check logs for: `BEAT-TRIM: protected key scene kept`
+4. Verify funeral beat narration text matches `startSec` in analyze JSON
+
+---
+
+## Full file copy commands (on VPS)
+
+```bash
+cd /root/cinerecap-render-server
+tar czf cinerecap-pipeline-code.tar.gz src/beats.js src/scenes.js src/analyze.js src/ffmpeg-args.js src/music.js src/index.js
+```
+
+Download `cinerecap-pipeline-code.tar.gz` for complete copy-paste archive.
+
+
+## v2.7.3 additional fixes
+
+- Hoisted `_preTrimBeats` so HOOK-V2 no longer fails with `not defined`.
+- Fixed `srcDurClip` scope so CLIP matching no longer skips with `srcDurClip is not defined`.
+- Enforced intro-safe floor by filtering pre-logo/credits beats before timeline planning.
+- Removed beat-level video speed-up and padded video tail to actual MP3 duration so final words are not cut by `-shortest`.
+- Persisted final `result` metadata (`downloadUrl`, duration, size, hookIncluded, beatsRendered).
+
+
+## v2.7.4 additional fixes
+
+- Hook footage now resolves from the post-trim beat list used to write hook narration, fixing hook narration/video mismatch.
+- Protected story beats (funeral, cemetery, grave, death, shooting, climax, hospital, etc.) are locked against CLIP/text recentering so important visuals are not moved away from their analyzed source windows.
+- Source Whisper transcript cache is loaded during render and used to produce candidate timestamp windows for dialogue-heavy beats.
+- Optional Gemini Flash verifier added: when `GEMINI_API_KEY` is set, the server sends top candidate short clips (analyze/current/OpenCLIP/Whisper) and lets Gemini choose the best visual match.
+- Tail beats use actual MP3 duration for gap-fill so climax/final narration is less likely to play over a frozen last frame.
+- Default TTS speed is slightly slower (`0.95`) unless overridden by app/settings/env.
+
+### Gemini activation
+
+Add to `/root/cinerecap-render-server/.env` and recreate the container:
+
+```bash
+GEMINI_API_KEY=your_google_ai_studio_key
+GEMINI_MODEL=gemini-2.5-flash
+GEMINI_VERIFY_MAX_BEATS=80
+cd /root/cinerecap-render-server && docker compose up -d --force-recreate render
+```
+
+`GET /health` should then show `geminiVerifier: true`.
+
+
+## v2.7.4 SigLIP + Gemini activation
+
+- Gemini key inserted into VPS `.env`; `/health` now reports `geminiVerifier: true`, `geminiModel: gemini-2.5-flash`.
+- Visual sidecar upgraded from OpenCLIP ViT-B/32 to SigLIP via OpenCLIP:
+  - `VISUAL_MODEL_NAME=ViT-SO400M-14-SigLIP2`
+  - `VISUAL_MODEL_PRETRAINED=webli`
+- Dockerfile now installs `transformers`, `sentencepiece`, and `protobuf`, required by SigLIP tokenizer.
+- Container was rebuilt and recreated. Verified inside container:
+
+```json
+{"ok":true,"model":true,"modelName":"ViT-SO400M-14-SigLIP2","pretrained":"webli","jobs":0}
+```
+
+Operational note: first SigLIP startup downloaded/loaded ~5GB model cache and took several minutes; subsequent starts should be faster from `/data/models`.
+
+
+## v2.7.5 fixes after latest render review
+
+Latest reviewed render: `h8NLCAIL99` / analyze `SocpiqYc6E`. Findings:
+
+- SigLIP loaded and embedded 179 frames, but the render did not log direct visual-window application.
+- Gemini reported `verified 80 beats, applied 0`, because candidate construction was too strict/silent.
+- Final beats 80 and 81 had `SYNC-FIX` drift of `1.21s` and `8.48s`, because the gap-fill own-scene re-trim compared against expanded beat end instead of current assembled video duration.
+
+Fixes:
+
+- SigLIP best match is now always retained as a Gemini candidate, even if not directly applied.
+- Direct SigLIP application threshold lowered/configurable: `VISUAL_APPLY_THRESHOLD` default `0.16`.
+- Gemini REST video part payload changed to snake_case (`inline_data`, `mime_type`).
+- Gemini logs now report `attempted`, `applied`, `rejected`, `failed`, and `skipped` counts.
+- Gemini acceptance threshold configurable: `GEMINI_ACCEPT_THRESHOLD` default `0.35`.
+- Final/climax beat gap-fill Step 1 now compares against current assembled video duration, allowing longer own-scene re-trims for final beats.
+- Gap-fill Step 1 now logs successful re-trims.
+
+
+## v2.7.6 Gemini verifier reliability fix
+
+Latest live render `yown2PRCCE` showed the job UI stuck at `Voicing scene 83/83`, but logs confirmed TTS had completed and the render had moved through SigLIP/Gemini. The stale UI message was because the job progress was not updated during the verifier stage.
+
+Findings from `yown2PRCCE`:
+
+- SigLIP embedded 179 frames.
+- Gemini attempted candidate verification but failed/returned no usable choices, so it applied 0 visual changes.
+- Tail-beat gap-fill fix worked: final beats re-trimmed own scene and sync validation finished `81 PASS / 0 WARN / 0 FIX`.
+
+Fixes:
+
+- Gemini request now uses JSON mode (`responseMimeType: application/json`).
+- Gemini thinking disabled for verifier (`thinkingConfig: { thinkingBudget: 0 }`) so output tokens are not consumed by hidden reasoning.
+- Gemini max output raised to 512.
+- Logs now include `no JSON in response` snippets when parsing fails.
+- `GEMINI_VERIFY_MAX_BEATS` lowered to 35 in `.env` to avoid overload/rate instability.
+
+`GET /health` now reports `version: 2.7.6`.
+
+
+## v2.7.7 stream-duration drift fix
+
+User-observed issue: climax video stream ended ~1 minute before narration; player froze on last frame while audio continued.
+
+Measured root cause on `recap-yown2PRCCE.mp4`:
+
+```text
+video stream duration: 1181.93s
+audio stream duration: 1231.33s
+delta: ~49.4s
+```
+
+Segment probe showed each `beat-muxed-*` MP4 had video about 0.28–0.31s longer than audio; across ~80 beats this accumulated and confused the final concat/encode timestamps. The final encode then produced a shorter video stream and longer audio stream.
+
+Fixes:
+
+- `_muxVideoWithVoice()` now hard-clamps each beat segment with `-t <actual MP3 duration>` so each segment's video/audio timelines stay equal.
+- Final encode video filter adds a `tpad` safety guard so the video stream cannot end before the final audio stream.
+- Final encode adds `-t outputDurationSec` to clamp the MP4 to expected concat duration.
+- Post-render ffprobe validation now logs final video/audio stream durations and warns if delta >1s.
+
+`GET /health` now reports `version: 2.7.7`.
+
+
+## v2.7.8 controlled video retiming
+
+User recommendation: to avoid narration drifting into the next scene, retime video to narration where safe.
+
+Fix:
+
+- `_muxVideoWithVoice()` now compares assembled beat video duration to actual beat MP3 duration.
+- If the ratio is within safe bounds (`VIDEO_RETIME_MIN=0.82`, `VIDEO_RETIME_MAX=1.18`), video is retimed with FFmpeg `setpts=PTS/speed`.
+  - ratio < 1.0: video is slowed down to cover narration.
+  - ratio > 1.0: video is sped up to finish with narration.
+- Larger mismatches still use existing gap-fill / tpad fallback to avoid unnatural speed changes.
+- Logs show retimed beats:
+
+```text
+BEAT-RETIME: beat-muxed-... video=12.00s audio=13.00s speed=0.923x
+```
+
+Current env:
+
+```bash
+VIDEO_RETIME_MIN=0.82
+VIDEO_RETIME_MAX=1.18
+```
+
+`GET /health` now reports `version: 2.7.8`.
+
+
+## v2.7.9 analyze retry and no-beats fail-fast
+
+Live render `uQ_VvjDHPb` failed because analyze job `xZY3pxqB2M` fell back after Claude `529 overloaded` and produced `timestamps` but no `beats`. Render then tried to build a beat-mux with no voice files and failed at `buildConcatManifest`.
+
+Fixes:
+
+- `callClaude()` now retries overload/rate-limit/temporary failures up to 4 attempts with backoff.
+- If scene-aware analysis still fails due Claude overload, analyze fails loudly instead of falling back to timestamp-only fixed-frame mode.
+- Analyze now rejects results with no `beats`.
+- Render now fails early with a clear message if no beat-level narration exists: `Analysis incomplete: no beat-level narration found for this movie. Rerun Analyze before rendering.`
+
+`GET /health` now reports `version: 2.7.9`.
+
+
+## v2.8.0 copyright-safe visual mode
+
+User requested copyright-safe transformations but no captions/subtitles.
+
+Enabled by default:
+
+```bash
+COPYRIGHT_SAFE_MODE=true
+COPYRIGHT_SAFE_MAX_CLIP_SEC=3.0
+WATERMARK_TEXT=Plotline Panic
+```
+
+Render behavior:
+
+- Shorter max visual cut duration: `maxClipSec=3.0` when copyright-safe mode is enabled.
+- Final video filter applies visible transformations:
+  - 6% crop/zoom
+  - scale/crop to final canvas
+  - contrast/brightness/saturation/gamma shift
+  - subtle grain/noise
+  - black border/frame
+  - top-left watermark
+- Source audio remains muted in source clips.
+- Captions/subtitles are NOT auto-enabled.
+
+Important: this reduces Content ID risk but cannot guarantee no copyright claim/strike.
+
+`GET /health` now reports `version: 2.8.0`.
+
+
+## v2.8.1 hook and climax safeguards
+
+Additional safeguards after enabling copyright-safe mode:
+
+- `maxClipSec` is now a hard cap even when importance/beatType dynamic cutting is enabled. In copyright-safe mode, high-importance and climax beats get more sub-clips, not longer clips.
+- Hook V2 now expands chosen sourceBeatIds with neighbouring beats under copyright-safe mode, producing more short hook clips instead of a few long clips.
+- Hook clip cap added:
+
+```bash
+COPYRIGHT_SAFE_HOOK_CLIP_SEC=2.5
+```
+
+This preserves hook coverage while staying copyright-safer.
+
+`GET /health` now reports `version: 2.8.1`.
+
+
+## v2.8.2 copyright-safe hoist fix
+
+Latest short render `NaY9wnFIlS` produced ~15 seconds because v2.8.1 referenced `COPYRIGHT_SAFE_MODE` before it was initialized.
+
+Logs showed:
+
+```text
+sync planning failed, falling back to loop align: Cannot access 'COPYRIGHT_SAFE_MODE' before initialization
+HOOK-V2 failed: Cannot access 'COPYRIGHT_SAFE_MODE' before initialization
+BEAT-MUX MAP: 127 sub-clips → 1 body beats
+FINAL A/V durations: video=15.40s audio=15.38s
+```
+
+Fix:
+
+- `COPYRIGHT_SAFE_MODE` and watermark text are now initialized at the top of `runRenderFromIngest()`, before sync planning and hook generation.
+- The duplicate late initialization in final encode was removed.
+
+`GET /health` now reports `version: 2.8.2`.
+
+
+## v2.8.3 hook retention prompt upgrade
+
+Latest full render had good body A/V stream sync but hook quality was weak.
+
+Fixes:
+
+- Hook beat scoring now boosts shock/emotion/action/family-loss/revenge beats.
+- Hook beat scoring penalizes ordinary setup/business/paperwork beats.
+- Hook prompt rewritten to require a high-retention 55-75 word hook focused on surprise, shock, emotion, danger, action, betrayal, revenge, or family loss.
+- Hook prompt now explicitly disallows generic setup and asks for a concrete unanswered question.
+- Hook generation now uses the server's stronger Claude model (`claude-opus-4-5`) instead of Haiku fallback when available.
+- Hook max output increased to 700 tokens.
+
+`GET /health` now reports `version: 2.8.3`.
+
+
+## v2.8.4 body prompt grounding upgrade
+
+User observed wrong character names and relationships in the body narration.
+
+Fixes:
+
+- Removed permissive reliance on model training knowledge when no cast list is provided.
+- Names may now be used only when supported by transcript, extracted character list, on-screen text, or unmistakable dialogue.
+- If a name or relationship is uncertain, Claude is instructed to use a neutral role label such as `the trainer`, `the manager`, `the daughter`, `one of the men`, etc.
+- Added a mandatory `CHARACTER / RELATIONSHIP ACCURACY CONTRACT` to the body prompt.
+- Strengthened attribution rule: no guessing job/relationship/action when multiple characters appear; use `one of them` if ambiguous.
+- Added explicit `NAME SAFETY` rule in narration quality section.
+
+`GET /health` now reports `version: 2.8.4`.
+
+
+## v2.8.5 body-only prompt restoration after app-side overwrite
+
+After app-side YouTube/upload/thumbnail changes, the live server still had most body safeguards, but one Stage-A beat-note prompt still allowed `use your knowledge` for character names when no cast list was provided.
+
+Fix:
+
+- Replaced the remaining permissive beat-note fallback with strict transcript/evidence-based naming.
+- Hook generation and YouTube upload/metadata/thumbnail code were not modified.
+- Verified YouTube routes and hook routes remain present.
+
+`GET /health` now reports `version: 2.8.5`.
+
+
+## v2.8.6 real-frame-first thumbnails
+
+User requested thumbnails from actual movie frames, not generic AI images.
+
+Fixes:
+
+- `/jobs/:jobId/ai-thumbnails` now uses enhanced real frames from the rendered recap as primary source.
+- DALL-E is fallback-only if real-frame extraction fails for a style.
+- Frame styling upgraded for clickable channel-style thumbnails:
+  - close crop / zoom
+  - 1280x720 upscale/crop
+  - stronger contrast/saturation/sharpening
+  - cinematic color grade
+  - vignette/border
+- Styles still supported: `dramatic`, `bold`, `cinematic`.
+
+Logs should now show:
+
+```text
+[ai-thumbnails <job>] real-frame dramatic @ ...s OK
+```
+
+instead of DALL-E-first generation.
+
+`GET /health` now reports `version: 2.8.6`.
+
+
+## v2.8.7 source-beat thumbnail selection
+
+The first real-frame thumbnail patch still selected random scene-change frames from the rendered recap. This produced dark/empty thumbnails without clear hero representation.
+
+Fixes:
+
+- Thumbnail primary source is now the original source movie file when an analyze job/sourceFileId is available.
+- Thumbnail timestamps are selected from high-scoring analyze beats, not random scene changes.
+- Beat scoring prioritizes hero-in-trouble situations:
+  - blood, shot, gun, death, funeral, grave, crash, hospital, grief/loss
+  - fight, brawl, punch, knockout, threat, revenge, Escobar
+  - arena/crowd/cemetery/night/final/climax
+- For each style (`dramatic`, `bold`, `cinematic`), the route tries multiple candidate frames from top beats.
+- Fallback order is now:
+  1. source-frame from analyzed source movie
+  2. render-frame from final recap
+  3. DALL-E fallback only if both real-frame paths fail
+
+Expected logs:
+
+```text
+[ai-thumbnails <job>] source-frame dramatic @ ...s OK
+```
+
+`GET /health` now reports `version: 2.8.7`.
+
+
+## v2.8.8 thumbnail brightness / uniqueness filter
+
+User reported source-frame thumbnails were still too dark and all variants selected the same red/dark source moment.
+
+Fixes:
+
+- Added `measureImageBrightness()` using ffprobe signalstats.
+- Source-frame thumbnail selection now rejects candidates below `THUMB_MIN_BRIGHTNESS=58`.
+- Thumbnail variants are selected sequentially and avoid timestamps within 18s of an already chosen thumbnail.
+- If all bright/unique candidates fail, source-frame fallback still chooses a source frame before using DALL-E.
+- Logs now include brightness values and dark-frame rejection lines.
+
+Expected logs:
+
+```text
+source-frame dramatic @ ... rejected dark brightness=...
+source-frame bold @ ... OK brightness=...
+```
+
+`GET /health` now reports `version: 2.8.8`.
+
+
+## v2.8.9 body candidate helper restoration
+
+Latest render `rifP-Cvw3d` collapsed to one body beat because sync planning failed with `_dedupeCandidates is not defined`. This was a body/render helper regression after app-side/server edits.
+
+Fixes:
+
+- Restored `_dedupeCandidates()` helper.
+- Restored transcript candidate helpers (`_tokSet`, `_jaccard`, `findTranscriptCandidateForBeat`).
+- Hook and YouTube upload/metadata/thumbnail code were left untouched.
+
+`GET /health` now reports `version: 2.8.9` and `youtubeConfigured: true`.
+
+
+## v2.9.3 — ROOT CAUSE of the repeating "39s frozen recap" (structural, not a small patch)
+
+This is the verification the user asked for: *why does fixing one thing keep breaking the body, and is re-uploading needed?*
+
+### What actually happens
+
+The render worker `runRenderFromIngest()` in `src/index.js` wraps **all** of sync
+planning — beat normalisation, BEAT-TRIM, HOOK-V2, CLIP/SigLIP matching, Gemini
+verification, Whisper alignment, scene subdivision, and `planSyncedRender()` — in
+**one ~720-line `try` block** (roughly lines 4217–4941 in the export).
+
+Its `catch` used to do exactly one thing:
+
+```js
+} catch (e) {
+  console.warn(`[render ${jobId}] sync planning failed, falling back to loop align:`, e?.message || e);
+}
+```
+
+So **any** error thrown anywhere in those 720 lines is silently swallowed,
+`syncMode` stays `false`, and the render continues with a degenerate timeline.
+Downstream, BEAT-MUX maps every sub-clip into a **single** beat:
+
+```
+BEAT-MUX MAP: 127 sub-clips → 1 body beats
+```
+
+That one beat is muxed with only the first beat's TTS, so the video is a few
+seconds long while the full narration is frozen on the last frame. That is the
+exact symptom: *"39s → extends to 2.29 min with a still frame and no narration."*
+
+### Why every "fix" breaks something else
+
+The error in the `catch` is almost always a **reference error** introduced when the
+single giant `src/index.js` is edited from two sources (server-side patches **and**
+the Replit/app-side workflow). Confirmed instances from prior logs:
+
+- `Cannot access 'COPYRIGHT_SAFE_MODE' before initialization` (v2.8.2)
+- `_dedupeCandidates is not defined` (v2.8.9)
+- `originalBeatScenes is not defined` (v2.9.1)
+
+Each "small fix" only removed that one undefined symbol. The **silent catch** and
+the **single-source-of-truth violation** were never addressed, so the next edit
+reintroduced a new reference error and the body collapsed again. The variables that
+drive sync (`srcDur`, `safeCeiling`, `voDurs`, `beatTexts`, `safeStart`,
+`useEvenDist`) are all declared **inside** the try block, so the `catch` cannot even
+attempt a proper rebuild — confirming this is structural rot, not a content bug.
+
+### Fix shipped in this commit (scope-safe, minimal, no new reference risk)
+
+1. **Catch no longer hides the error.** It now logs the full message + stack as
+   `SYNC PLANNING THREW …`, sets `_syncPlanFailed`/`_syncPlanError`, and writes the
+   error into the job status message.
+2. **Body-collapse guard before BEAT-MUX.** If a real multi-beat analysis
+   (`beats.length >= 4`) collapses to `<= 1` body beat, the render **aborts with an
+   actionable error** (including the upstream cause) instead of shipping a broken
+   frozen-frame video and wasting a manual upload.
+3. **Partial-collapse warning.** If more than half the beats lose their own window,
+   it logs `PARTIAL BODY COLLAPSE` so a short-but-not-empty recap is explained.
+
+Both guards use only function-scope variables (`beats`, `_beatOrder`, `cleanClips`,
+`jobId`), so the fix itself cannot introduce the class of bug it detects.
+
+### Answering the user's two questions
+
+- **"Should I start from the upload stage?"** — **No.** The source movie and the
+  analyze beats are intact; the failure is purely in render-time sync planning.
+  Re-uploading or re-analyzing will not change the outcome. Only a **re-render**
+  (after the upstream reference error is fixed) is needed.
+- **"Serious issue, verify instead of patching?"** — Verified above: the serious
+  issue is the monolithic silent `try/catch` plus editing one 5,600-line file from
+  two sources. The permanent fix is process + structure, not another symbol patch.
+
+### Permanent structural recommendation (next, once it can be tested)
+
+1. **Single source of truth for `src/index.js`.** Stop editing the render worker
+   from both the server and Replit. Pick one; the other consumes the built artifact.
+2. **Break the 720-line block into small functions** (`normaliseBeats`,
+   `generateHook`, `matchVisuals`, `verifyWithGemini`, `buildPlan`) each with its own
+   `try/catch`, so one failing stage degrades only itself, not the whole body.
+3. **Add a guaranteed even-distribution safety net** in `buildPlan`'s catch (hoist
+   `voDurs`/`beatTexts`/`safeCeiling`/`safeStart` to function scope first) so a
+   thrown matcher still yields a complete, narration-paced body via
+   `buildSyncedTimeline(beats, perBeatDurations)`.
+4. **CI lint gate:** run `node --check src/index.js` (and ideally ESLint
+   `no-undef`) on every deploy so a reference error is caught before it reaches a
+   render.
+
+### CONFIRMED root cause (live logs, job `KO7oTkZ-8s`)
+
+Pulled the actual render logs from the VPS. The collapsed render that produced the
+~30s frozen recap logged exactly:
+
+```text
+[render KO7oTkZ-8s] SYNC: beats=76, voiceFiles=0
+[render KO7oTkZ-8s] SYNC: voiceTotalPre=1135.70s
+[render KO7oTkZ-8s] sync planning failed, falling back to loop align: isProtectedBeatForVisual is not defined
+[render KO7oTkZ-8s] BEAT-MUX MAP: 127 sub-clips → 1 body beats
+```
+
+So the diagnosis was exact:
+
+1. `isProtectedBeatForVisual` was **referenced but never defined** (line 4619),
+   added by a dual-source edit. It threw a `ReferenceError`.
+2. The silent catch swallowed it → `syncMode=false` → body collapsed to **1 beat**.
+3. ~1135s of narration TTS still generated, so the video froze on the last frame
+   while audio kept playing — the exact "30s → 2.29min still frame" symptom.
+4. A **second latent** error was waiting on the very next line: `sourceTranscriptSegments`
+   was also referenced but never defined (would have thrown immediately after #1
+   was fixed — the classic cascade).
+
+### Fix DEPLOYED to the VPS (v2.9.3, verified live)
+
+The live `/root/cinerecap-render-server/src/index.js` was patched and the container
+restarted (`./src` is volume-mounted, so no rebuild needed). `GET /health` now
+reports `version: 2.9.3`. `docs-export/index-vps.js` in this repo is the exact
+deployed file.
+
+Changes applied:
+
+1. **Defined `isProtectedBeatForVisual(beat)`** locally right before its use — a
+   keyword matcher (funeral/death/climax/knockout/etc.) so protected story beats
+   stay anchored to their analyzed window and are not moved by CLIP/SigLIP/Gemini.
+2. **Defined `sourceTranscriptSegments`** by best-effort loading the analyze job's
+   stored Whisper `segments` (defaults to `[]`; `findTranscriptCandidateForBeat`
+   degrades gracefully to `null`), pre-empting the cascade.
+3. **Verbose catch** (`SYNC PLANNING THREW …` + stack + job-status message + flag).
+4. **Body-collapse guard** before BEAT-MUX: aborts loudly when ≥4 beats collapse to
+   ≤1, plus a partial-collapse warning.
+
+> Note: `node --check` (syntax) passes on the broken file — a `ReferenceError` is a
+> *runtime* error. A real `no-undef` lint (e.g. ESLint) is required to catch this
+> class before deploy. This is the recommended CI gate.
+
+### Redeploy procedure (for future edits)
+
+```bash
+cd /root/cinerecap-render-server
+# edit src/index.js, then:
+docker exec cinerecap-render node --check /app/src/index.js   # syntax gate
+docker compose restart render                                 # ./src is volume-mounted
+curl -s localhost:4040/health                                 # confirm version
+```
+
+`GET /health` reports `version: 2.9.3`.
+
+### Verified live (render `ouR-OfMY5l`, full re-render after deploy)
+
+Re-rendered the same movie/analyze job on the patched server. Logs:
+
+```text
+[render ouR-OfMY5l] SYNC: transcript candidates from 0 source segments   ← new code runs, no throw
+[render ouR-OfMY5l] SYNC MODE on: 278 segs, voice=1131.7s
+[render ouR-OfMY5l] SYNC SCORE: 100% overall (76/76 beats perfect ≥95%, 0 beats <80%)
+[render ouR-OfMY5l] BEAT-MUX MAP: 278 sub-clips → 76 body beats          ← was "→ 1 body beat"
+[render ouR-OfMY5l] SYNC-VALIDATION: 75 PASS / 1 WARN / 0 FIX
+[render ouR-OfMY5l] COPYRIGHT_SAFE_MODE: watermark/transform enabled
+```
+
+`ffprobe` on the output:
+
+```text
+video stream duration: 1217.73s  (~20.3 min)
+audio stream duration: 1143.63s  (~19.1 min)
+format duration:       1217.73s
+```
+
+The body no longer collapses: a full ~20-minute recap with 76 body beats and a
+100% pre-render sync score, watermark applied. The earlier identical input had
+produced a ~30s frozen clip.
+
+The video stream is ~74s longer than the audio — investigated and fixed in v2.9.4.
+
+
+## v2.9.4 — verify A/V sync + fix end-of-video frozen frame (hook/body param mismatch)
+
+User asked whether the v2.9.3 ~74s video/audio difference causes drift. Verified
+empirically against render `ouR-OfMY5l` on the live VPS.
+
+### Verification: NO drift in the body
+
+- Per-segment probe of all 76 `beat-muxed-*` segments: each is balanced (worst
+  single-segment |video−audio| = **0.32s**; the small per-beat lead-out does not
+  drift narration).
+- Raw `-c copy` concat of the **body** segments: video **1118.82s** vs audio
+  **1118.56s** → **0.26s total over 18.6 min**. The concat demuxer keeps the
+  streams container-aligned, so the per-beat tails do **not** accumulate.
+- `silencedetect` on the body: no silence ≥1.5s → narration is continuous.
+
+Conclusion: **narration stays matched to the video throughout the body — there is
+no progressive A/V drift.**
+
+### Root cause of the ~74s difference: hook/body parameter mismatch
+
+`ffprobe` of the segments:
+
+```text
+hook segment : 1920x1080  25 fps  time_base 1/12800
+body segments: 1280x720   24 fps  time_base 1/12288
+```
+
+Concatenating segments with **different resolution / fps / timebase** corrupts the
+concat timeline: the joined **video stream under-runs the audio by ~45s**. The old
+final `tpad=stop_duration=120` then froze the last frame to cover it, producing:
+
+- ~45s where the last ~45s of narration plays over a **frozen frame** (confirmed by
+  `freezedetect`: video freezes at ~1098s while narration runs to ~1143.6s), then
+- ~74s of **silent frozen frame** after narration ends (video stream 1217.7s vs
+  audio 1143.6s).
+
+Proof: normalizing the hook to the body spec (1280x720/24fps) made the `-c copy`
+concat balanced — **video 1143.36s vs audio 1143.10s (0.26s)** — no deficit.
+
+### Fix shipped (v2.9.4, deployed to VPS)
+
+1. **Segment normalisation before concat**: probe every muxed segment, find the
+   dominant `WxH@fps` spec (the body), and re-encode any outlier (the hook) to
+   match. Only outliers are re-encoded, so it is cheap. This removes the ~45s
+   video under-run and the frozen-frame-over-narration section.
+2. **Final tail clamp**: `tpad=stop_mode=clone:stop_duration=120` → `=2` (small
+   safety so the last word is never clipped) **plus** restored
+   `-t outputDurationSec` on the final encode, so the MP4 ends right after the last
+   beat's footage instead of holding a frozen frame for ~74s. `outputDurationSec`
+   = Σ muxed-segment durations ≥ narration length, so speech can never be cut.
+
+Net effect: final video length ≈ narration length; footage plays under narration
+the whole way through; no frozen-frame tail.
+
+### Verified live (render `toM2X7wI1I`, full re-render after v2.9.4 deploy)
+
+```text
+[render toM2X7wI1I] SEGMENT-NORM: re-encoded 1 outlier segment(s) → 1280x720@24/1 (dominant) for drift-free concat
+ffprobe final:
+  video stream: 1140.300s
+  audio stream: 1140.288s   → video−audio = 0.012s (12 ms)
+freezedetect (last 90s): no freeze ≥2s
+```
+
+Before (v2.9.3): video 1217.7s vs audio 1143.6s (74s gap + frozen-frame tail).
+After (v2.9.4): **12 ms** difference, no frozen tail, video ends with narration.
+
+`GET /health` reports `version: 2.9.4`.
+
+
+## v2.9.5 — P0: image sharpness + script/name accuracy (Sonnet retained)
+
+### Context
+Source movies here are often sub-1080p (this one is **1280×720/24fps**), so the body
+cannot contain true 1080p detail. The fix is to (a) make the upscale as crisp as
+possible and stop compounding softness, and (b) improve name/relationship accuracy
+in the script — while keeping `claude-sonnet-4-5` (user saw no Opus improvement).
+
+### Image quality (`src/index.js`, final encode)
+- Upscale now uses **Lanczos** (`scale=…:flags=lanczos`) instead of the default
+  bilinear — noticeably sharper 720p→1080p.
+- Added a light **`unsharp`** pass after colour grading (both copyright-safe and
+  plain branches).
+- Reduced copyright grain `noise=alls=6 → 4` (heavy grain over an upscaled soft
+  image looked muddy).
+- Final encoder preset **`ultrafast → veryfast`** and CRF clamped to **≤20** for the
+  delivered file (ultrafast caused visible blocking, worsened by the upscale).
+  Intermediate clips stay ultrafast (they are re-encoded again at the final step).
+  Trade-off: the final encode is somewhat slower; acceptable for background renders.
+
+### Script / name / relationship accuracy (`src/analyze.js`, Stage A)
+- **Cast sheet now merges across ALL Stage-A batches**, not just batch 0.
+  Previously the authoritative character list came only from the first ~15 scenes,
+  so characters introduced later (villains, allies, mid-film family reveals) were
+  missing from the sheet that grounds Stage-B narration → mislabels / name swaps.
+  Now every batch returns characters; they are merged per-name (richest note kept),
+  first-appearance order preserved, capped at 30. Log: `cast sheet: N characters
+  merged across M batch(es)`.
+- The existing CHARACTER/RELATIONSHIP ACCURACY CONTRACT, attribution-precision
+  rules, and transcript grounding (v2.8.4/2.8.5) remain in force.
+
+> Note on the deeper accuracy limit: Whisper has **no speaker diarization**, so the
+> transcript is un-attributed text. Claude must infer who says what from context.
+> The single biggest future accuracy lever is a **real cast list** (e.g. TMDb lookup
+> by title, or user-provided) passed as `movie.cast` — the prompts already prefer it
+> over guessing. Recommended P1 follow-up.
+
+`GET /health` reports `version: 2.9.5`.
+
+
+## v2.9.6 — modularization / single-source refactor foundation
+
+Goal: stop the recurring "silent collapse" regressions at the root before adding
+new features. The root causes were (a) **no version control** on the VPS code,
+(b) the file edited from **two sources** (server + Replit), and (c) `node --check`
+**cannot catch ReferenceErrors** — so undefined-symbol edits shipped and collapsed
+renders. Fixed structurally:
+
+### 1. Single source of truth (git)
+- `git init` in `/root/cinerecap-render-server` (was NOT under version control).
+- Hardened `.gitignore` (excludes `.env`, `.env.bak*`, `secrets-backup/`,
+  `*.bak-*`, `node_modules`, `uploads/output/storage/data`, `__pycache__`).
+- Verified no secrets staged; committed the working tree. Now every change is
+  tracked with history + rollback.
+
+### 2. no-undef lint gate (the linchpin)
+- `eslint.config.js` — self-contained flat config, rule `no-undef: error`. Catches
+  exactly the class `node --check` misses.
+- Running it on the live code immediately surfaced **5 latent landmines**, all now
+  fixed:
+  1. `OPENING_CREDITS_THRESHOLD` — referenced, never defined (analyze fallback).
+  2. `fileId` — used in an auto-load block but never defined (should be
+     `basename(sourcePath)`; only avoided because that branch is skipped when the
+     app sends beats).
+  3. `srcDurClip` — declared inside a `catch`, used outside it (CLIP recenter path).
+  4. `_preTrimBeats` — block-scoped in the sync `if`, used in the hook section;
+     only avoided via a `??` short-circuit → would throw on any analyze job with no
+     scenesMap. Hoisted to function scope.
+  5. Dead `if(false)` outro block referencing undefined `_hookTts*` — removed.
+- Gate now **PASSES on all 6 src modules**.
+
+### 3. Single safe deploy path
+- `scripts/check.sh` — `node --check` + eslint `no-undef` on all src (runs in the
+  container where node lives).
+- `scripts/deploy.sh` — gate → `git commit` → `docker compose restart` → `/health`.
+  A failing gate aborts before restart, so a reference error can never reach a
+  render again.
+- `package.json` gains `lint` / `check` scripts + `eslint` devDependency.
+
+### 4. First module extraction (pattern established)
+- `src/lib/candidates.js` — the pure candidate/transcript helpers
+  (`_dedupeCandidates`, `_tokSet`, `_jaccard`, `findTranscriptCandidateForBeat`)
+  extracted from `index.js` and imported back. Behaviour-preserving; validated by
+  the gate (index.js still resolves them via import) + runtime (server starts
+  healthy). This is the safe template for further extraction — and the lint gate
+  makes each future extraction safe (a missing import fails the gate).
+
+Deployed via the new path; `GET /health` reports `version: 2.9.6`.
+
+### Workflow going forward (single source of truth)
+1. Edit `src/` (server or export edits reconciled through git).
+2. `npm run check` (or `scripts/check.sh`) must pass — no `no-undef` errors.
+3. `scripts/deploy.sh "message"` commits + restarts + health-checks.
+4. Roll back instantly with `git revert`/`git checkout` if a change misbehaves.
+
+> Note: the heavy split of the ~6,300-line `runRenderFromIngest` into per-stage
+> modules is deliberately incremental. The guardrails above already neutralize the
+> failure mode that motivated the refactor; each further extraction (hook,
+> visual-match, timeline, mux) can now be done one at a time, each verified by the
+> gate + a render, instead of one risky big-bang rewrite.
+
+
+## v2.9.7 — TMDb cast lookup (accurate character names/relationships)
+
+The biggest remaining accuracy lever: Whisper has no speaker labels, so Claude
+guesses who says what. A real cast list fixes this.
+
+- New module **`src/lib/tmdb.js`** (`fetchTmdbCast`) — searches TMDb by title(+year),
+  picks the best match, and returns the top-billed **character** names (not actors).
+  Supports both v3 `api_key` and v4 bearer-token auth. Fails soft.
+- Wired into the `/analyze` route: when the app sends no `movie.cast` and
+  `TMDB_API_KEY` is set, the real character list is injected as `movie.cast`. The
+  analyze prompts already prefer a provided cast over guessing, so this flows into
+  Stage-A character notes and Stage-B narration.
+- `TMDB_API_KEY` added to `.env` and to `docker-compose.yml`'s `environment:` list
+  (compose only passes explicitly-declared vars into the container).
+
+Verified live (analyze `thp4OpqVGk`, "Southpaw"):
+
+```text
+[analyze thp4OpqVGk] TMDb cast for "Southpaw": Billy 'The Great' Hope, Maureen Hope,
+Titus 'Tick' Wills, Leila Hope, Jordan Mains, Hoppy, Angela Rivera, Ramone, Jon Jon,
+Miguel 'Magic' Escobar, Mikey, Eli Frost, Gabe, Keith 'Buzzsaw' Brady, Gloria
+```
+
+This is the third `src/lib/` module (after `candidates.js`), continuing the
+incremental modularization. `GET /health` reports `version: 2.9.7`.
+
+
+## v2.9.8 — TMDb full story grounding (plot + genre + themes + pronouns)
+
+Expanded the TMDb integration from cast-only to a full grounding bundle, via a
+single `append_to_response=credits,keywords` request (`fetchTmdbMeta`):
+
+- **Official plot summary (`overview`)** — injected into the story-outline pass and
+  the per-beat script prompt as an *authoritative* source for character
+  relationships and plot facts. Biggest anti-hallucination lever after cast.
+- **Cast with pronouns + lead markers** — `movie.cast` is now e.g.
+  `Billy 'The Great' Hope (male, lead), Maureen Hope (female), Leila Hope (female)…`
+  so narration uses correct he/she and emphasizes protagonists.
+- **Genre** — fills the previously-empty `movie.genre` slot → better tone/pacing.
+- **Keywords/themes** — e.g. `boxing, tragedy, death, father daughter relationship`
+  → passed to the script prompt for tone/emphasis (also useful to hook/thumbnail
+  scoring later).
+- Also fills `movie.director` when absent.
+
+Verified live (analyze `rqsI6iM3SJ`, "Southpaw"):
+
+```text
+TMDb: cast=[Billy 'The Great' Hope, Maureen Hope, Titus 'Tick' Wills, Leila Hope, …]
+    | genre=[Action, Drama]
+    | themes=[sports, fighter, tragedy, death, boxing, father daughter relationship]
+    | overview=455ch
+```
+
+The "father daughter relationship" theme + overview directly ground the
+Billy→Leila (daughter) and Billy→Maureen (wife) relationships that were previously
+guessed wrong. `analyze.js` threads `overview`/`keywords` into
+`buildStoryOutlineMessages` and `buildSceneScriptMessages`.
+
+`GET /health` reports `version: 2.9.8`.
+
+
+## v2.9.9 — make the Gemini verifier actually work (content sync)
+
+Verification found Gemini was **dead weight**: the last render logged
+`GEMINI: attempted=0, skipped=35` — it never made a single call. The function and
+prompt were fine; it was **starved of candidates**. Gemini only runs when a beat has
+≥2 distinct candidate clips, but two of the four candidate sources were dead:
+
+- `siglipCandidateScenes` was declared all-`null` and **never assigned** (the SigLIP
+  match only overwrote `scenes[i]` in place) — a documented v2.7.5 behavior that was
+  lost in an overwrite.
+- Whisper transcript segments were **never persisted** in the analyze result, so the
+  render's `sourceTranscriptSegments` was always empty → transcript candidates null.
+
+So every beat had only [analyze window] + [current window] (identical unless SigLIP
+relocated it) → `<2` → skipped.
+
+Fixes:
+
+- **A. Persist Whisper `segments`** in the analyze result → render builds real
+  transcript candidate windows (`findTranscriptCandidateForBeat`). *(Requires a fresh
+  analyze; older jobs have no segments.)*
+- **B. Retain the SigLIP top match** as an independent `siglipCandidateScenes[i]`
+  whenever it is at least weakly confident and in-region — even when not directly
+  applied to `scenes[i]`. This is the key fix that gives Gemini a real alternative.
+- **C. Threshold tuning**: capture a SigLIP candidate at `VISUAL_APPLY_THRESHOLD`
+  (0.16) while keeping direct-apply at 0.22. New log:
+  `CLIP: semantic windows applied to X/N beats, K SigLIP candidates retained`.
+
+Net: Gemini now compares analyze vs SigLIP vs transcript windows per beat and picks
+the clip whose visible action matches the narration — the content-sync layer (SigLIP
+alone only relocates; it never verifies). Pairs with the TMDb grounding (accurate
+names + accurate footage).
+
+`GET /health` reports `version: 2.9.9`.
