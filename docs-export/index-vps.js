@@ -361,7 +361,7 @@ app.get("/health", (_req, res) => {
 
   res.json({
     ok: true,
-    version: "3.0.3",
+    version: "3.0.4",
     serverTranscription: Boolean(SERVER_OPENAI_KEY),
     serverAnalysis: Boolean(SERVER_ANTHROPIC_KEY),
     serverModel: SERVER_ANTHROPIC_MODEL || null,
@@ -4925,45 +4925,26 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
         }
         // ── END TEXT-TO-TEXT BEAT NOTE MATCHING ──────────────────────────────
 
-        // Intro-safe start: the earliest second of footage that may appear
-        // on-screen. Derived from the first surviving beat so credits,
-        // production logos, and title cards are never drawable even on
-        // reset-passes when the pool is re-swept for long narrations.
-        let safeStart = scenes.length > 0
-          ? Math.max(0, scenes.reduce((mn, s) => Math.min(mn, s.startSec), Infinity))
-          : 0;
-        // Logo-safety floor for feature films: studio logos (Universal, WB, etc.)
-        // and opening title cards can run 60-120s. If the beat analysis places the
-        // first scene before 120s, bump the floor so those frames never appear.
-        // Only applies to feature-length content (>30 min) to avoid cutting real
-        // opening scenes from short films.
-        if (srcDur > 1800) {
-          // 4% of runtime, max 4 min. Southpaw and similar films run opening
-          // credits through 3-4 min; 120s cap was too low and caused credits
-          // to appear as the first body beat after the hook.
-          const logoFloor = Math.min(240, srcDur * 0.04);
-          if (safeStart < logoFloor) {
-            console.log(`[render ${jobId}] SYNC: logo-safety floor raised ${safeStart.toFixed(1)}→${logoFloor.toFixed(1)}s (feature film intro guard)`);
-            safeStart = logoFloor;
-          }
-        }
-        // FIX (v3.0.0): Enforce the logo-safety floor on every beat's scene window.
-        // Previously safeStart was computed but only used as a scan-range hint for
-        // planSyncedRender; beats whose startSec was 0-240s still went through and
-        // produced credits/logo footage in the body. Now any beat window that starts
-        // before the floor is shifted forward so its footage is credits-free.
-        if (safeStart > 0) {
-          let floorApplied = 0;
-          scenes = scenes.map((sc, _i) => {
-            if (Number(sc.startSec) >= safeStart) return sc;
-            const dur = Math.max(0, Number(sc.endSec) - Number(sc.startSec));
-            const newStart = safeStart;
-            const newEnd   = safeStart + dur;
-            floorApplied++;
-            return { ...sc, startSec: newStart, endSec: newEnd };
-          });
-          console.log(`[render ${jobId}] SYNC: intro-skip floor = ${safeStart.toFixed(1)}s (${floorApplied} beats clamped to avoid credits footage)`);
-        }
+        // REVERTED (v3.0.4): the time-based intro-floor that was added in v3.0.0
+        // caused SEVERE visual mismatch — it moved 7 beats to the SAME 240-250s
+        // window while their narrations were about completely different scenes (0s,
+        // 39s, 77s, 116s, 155s, 193s, 232s). buildSyncedTimeline then jumped the
+        // cursor back to 240s for each of those 7 beats, showing near-identical
+        // wrong footage for the first ~4 minutes of story narration. That is far
+        // worse than any credits leak.
+        //
+        // The CORRECT approach for credits: trust Claude's SKIP labels. During
+        // the normalize step above, beats whose narration starts with "SKIP" or
+        // describes studio logos/title cards are already dropped. Any beat that
+        // survived to this point was labelled by Claude as real story content —
+        // its startSec is the timestamp where that story content appears in the
+        // movie. Never relocate that window.
+        //
+        // If a movie genuinely opens with a long credits roll (no story beats
+        // before the floor), Claude will flag those as SKIP and they will never
+        // reach this point. No relocation needed.
+        console.log(`[render ${jobId}] SYNC: using Claude-assigned beat windows (no time-based floor clamping)`);
+        const safeStart = 0; // kept for reference by planSyncedRender opts below
         // Decide distribution mode:
         //   per-beat-audio  → voice files count equals beats count → exact audio durations
         //   even            → mismatch (e.g. 7 files, 44 beats) → equal slice per beat
