@@ -976,3 +976,35 @@ alone only relocates; it never verifies). Pairs with the TMDb grounding (accurat
 names + accurate footage).
 
 `GET /health` reports `version: 2.9.9`.
+
+---
+
+## v3.0.6 — P0 visual sync fixes (scene detection + GSPAN + honest metrics)
+
+Deployed Jul 5 2026. Addresses the root causes of narration/visual mismatch
+identified in render `m_IdyONNjh` review.
+
+### 1. Scene detection no longer discards real cuts for artificial grid
+- `SCENE_THRESHOLD` lowered 0.25 → **0.20**
+- New `detectSceneCutsProgressive()` retries at 0.20 / 0.15 / 0.10 / 0.08
+- Grid fallback only when **<25% of target AND <40 scenes** (was 50% of target —
+  79 real scenes wrongly triggered a 38.7s grid on Southpaw)
+- New `subdivideLongScenes()` splits long real scenes into ~12s chunks instead
+
+### 2. GSPAN absolute-timestamp auto-correction
+- Gemini 2.5 Pro often returns **absolute movie timestamps** despite the prompt
+  asking for clip-relative (0-based) seconds
+- New `_resolveGspanWindow()` accepts both formats; converts absolute → in-span
+  window when values overlap the sent clip span
+- Recovers beats that previously logged `outside span [0,300]` with values like
+  `[323,356]` that were valid absolute positions
+
+### 3. `toFixed` crash guard (render `h-kuNff4k3` BODY COLLAPSE)
+- `plan.beatDurations.map(d => d.toFixed(2))` guarded against `undefined`
+- `syncBeatDurations` filtered to finite positive values only
+
+### 4. Honest logging — duration vs visual match
+- `SYNC SCORE` renamed **`DURATION COVERAGE`** (footage length vs TTS only)
+- New **`VISUAL MATCH (GSPAN)`** line: `applied/attempted` beats localized
+
+`GET /health` reports `version: 3.0.6`.
