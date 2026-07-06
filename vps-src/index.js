@@ -43,6 +43,7 @@ import { promises as fsp } from "node:fs";
 import { transcribeMovie, buildTranscriptBlock } from "./transcribe.js";
 import { planSyncedRender, buildSyncedTimeline } from "./beats.js";
 import { planMusicTimeline, dominantMood } from "./music.js";
+import { ensureMovieIndexed, localizeBeatsWithTwelveLabs, isTwelveLabsEnabled } from "./lib/twelvelabs.js";
 
 const PORT = Number(process.env.PORT || 8787);
 const STORAGE_DIR = process.env.STORAGE_DIR || "/data";
@@ -86,6 +87,10 @@ const SERVER_ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL      || "";
 
 const SERVER_GEMINI_KEY   = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || "";
 const SERVER_GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+
+// Twelve Labs Marengo — primary visual matcher (replaces GSPAN + SigLIP/CLIP).
+const SERVER_TWELVELABS_KEY = process.env.TWELVELABS_API_KEY || "";
+const TWELVELABS_CACHE_DIR = path.join(STORAGE_DIR, "twelvelabs-cache");
 
 if (!AUTH_TOKEN) {
   console.warn("[WARN] AUTH_TOKEN is empty — server is wide open. Set it in .env before exposing publicly.");
@@ -550,7 +555,7 @@ app.get("/health", (_req, res) => {
 
   res.json({
     ok: true,
-    version: "3.0.7",
+    version: "3.1.0",
     serverTranscription: Boolean(SERVER_OPENAI_KEY),
     serverAnalysis: Boolean(SERVER_ANTHROPIC_KEY),
     serverModel: SERVER_ANTHROPIC_MODEL || null,
@@ -585,8 +590,7 @@ app.get("/health", (_req, res) => {
       "ai-thumbnails",      // new in 2.6.0 — DALL-E thumbnail generation via server key
       "translate-transcript", // new in 2.5.0 — Whisper translation endpoint for non-English films
       "uncapped-narration", // new in 2.5.0 — full-length narration, no word-count ceiling
-      "clip-select",        // new in 2.6.0 — CLIP semantic frame matching for clip selection
-      "gemini-verify",      // new in 2.7.4 — Gemini Flash verifies top candidate clips when GEMINI_API_KEY is set
+      "twelvelabs-visual-match", // v3.1.0 — Twelve Labs Marengo text search for beat↔footage sync
       "multi-tts",          // new in 2.7.0 — ttsProvider field selects speechify|openai|elevenlabs|hume
       "storage-api",        // new in 2.7.0 — GET /system/storage, DELETE /system/clear-renders
       "source-download",    // new in 2.7.0 — GET /uploads/:fileId/download
@@ -2209,6 +2213,9 @@ app.post("/analyze", requireAuth, async (req, res) => {
         // Without this file, CLIP embeds frames at wrong timestamps (e.g. frame #372
         // at 8s spacing instead of actual 3050s), the ±15% radius check fails, and
         // zero corrections are applied — CLIP silently does nothing every render.
+        // CLIP/SigLIP sidecar disabled (v3.1.0) — skip frame metadata when off.
+        const _clipSidecarOn = String(process.env.CLIP_SIDECAR_ENABLED || "0").toLowerCase() === "1";
+        if (_clipSidecarOn) {
         try {
           // FIX (SYNC-FIXES #3c): emit EVERY extracted frame with its true per-frame
           // timestamp, not just one midpoint entry per scene. The sidecar's
@@ -2234,6 +2241,7 @@ app.post("/analyze", requireAuth, async (req, res) => {
           console.log(`[analyze ${jobId}] CLIP metadata: ${_clipMeta.length} frames timestamped across ${scenes.length} scenes`);
         } catch (_cmErr) {
           console.warn(`[analyze ${jobId}] CLIP metadata write failed (non-fatal):`, _cmErr?.message);
+        }
         }
 
         // TMDb grounding removed (v3.0.5): TMDb cast/overview lookups were
@@ -4202,11 +4210,10 @@ async function runRenderFromIngest(jobId, {
   const _watermarkText = String(process.env.WATERMARK_TEXT || process.env.DEFAULT_CHANNEL_NAME || "Super Short Summary").replace(/'/g, "\\'").slice(0, 40);
 
   // When the app sends beats directly (bypass path) AND tells us which analyze job
-  // produced them, prime CLIP matching now so semantic frame search can run.
-  // (If auto-load runs below for the no-beats path, it will overwrite this.)
+  // produced them, record analyzeJobId for transcript/beat lookups.
   if (passedAnalyzeJobId && Array.isArray(beats) && beats.length > 0) {
     _analyzeJobId = passedAnalyzeJobId;
-    console.log(`[render ${jobId}] CLIP primed from app-supplied analyzeJobId: ${passedAnalyzeJobId}`);
+    console.log(`[render ${jobId}] analyzeJobId from app: ${passedAnalyzeJobId}`);
   }
 
   // ── CORRUPT TIMESTAMP DETECTION: if the app sends timestamps where >50% are
@@ -4534,7 +4541,7 @@ async function runRenderFromIngest(jobId, {
   // throws, this records the real error so it is never silently hidden behind a
   // degraded "loop align" render. See the body-collapse guard before BEAT-MUX.
   let _syncPlanFailed = false;
-  let _gspanStats = null;
+  let _tlabsStats = null;
   let _syncPlanError = null;
   // Hoisted to function scope (v2.9.6): the HOOK section below references
   // _preTrimBeats, but it was declared with `const` inside the sync-planning
@@ -4693,12 +4700,12 @@ async function runRenderFromIngest(jobId, {
         beats = kept;
 
         // ── NARRATION CONTINUITY REWRITE ────────────────────────────────────
-        // v3.0.7: skip when GSPAN is active — continuity rewrites prose after
+        // v3.1.0: skip when Twelve Labs is active — continuity rewrites prose after
         // analyze assigned scene windows, causing narration to describe different
-        // actions than the footage GSPAN matched. GSPAN needs stable narration.
-        const _gspanActive = process.env.GEMINI_SPAN_LOCALIZATION === "1" && Boolean(SERVER_GEMINI_KEY);
-        if (_gspanActive) {
-          console.log(`[render ${jobId}] NARRATION-CONTINUITY: skipped — GSPAN active (keeping analyze narration for visual matching)`);
+        // actions than the footage Twelve Labs matched.
+        const _twelvelabsActive = isTwelveLabsEnabled() && Boolean(SERVER_TWELVELABS_KEY);
+        if (_twelvelabsActive) {
+          console.log(`[render ${jobId}] NARRATION-CONTINUITY: skipped — Twelve Labs active (keeping analyze narration for visual matching)`);
         } else if (beats.length >= 3 && beats.length <= 150 && (SERVER_ANTHROPIC_KEY || SERVER_GEMINI_KEY)) {
           try {
             const _origNarrations = beats.map((b) => String(b.narration || b.reason || "").trim());
@@ -5088,170 +5095,68 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
         const protectedVisualBeats = beats.map(isProtectedBeatForVisual);
 
 
-        // ── GEMINI 2.5 PRO SPAN LOCALIZATION (primary visual matcher) ────────
-        // Runs across every non-protected beat by default (spanBudget =
-        // scenes.length) — this is the sole active narration↔visual matcher.
-        // Any beat NOT handled here (skipped, rejected, or failed) simply
-        // keeps its Claude-analyzed window; the zero-cost TEXT-MATCH pass
-        // further below gets one more chance at footage-starved/self-
-        // mismatch beats. See .agents/memory/cinerecap-visual-sync-pipeline.md.
-        if (process.env.GEMINI_SPAN_LOCALIZATION === "1") {
-          if (!SERVER_GEMINI_KEY) {
-            console.log(`[render ${jobId}] GSPAN: skipped (GEMINI_API_KEY not set)`);
-          } else {
-            // Full coverage by default. GEMINI_SPAN_MAX_BEATS remains an
-            // optional operator override for cost/latency control (each
-            // beat is a sequential Gemini 2.5 Pro video call).
-            const spanBudget = Math.max(0, Number(process.env.GEMINI_SPAN_MAX_BEATS) || scenes.length);
-            const acceptThresh = Number(process.env.GEMINI_SPAN_ACCEPT || 0.6);
-            const MAX_SPAN_SEC = 300; // cost/payload cap — see localizeBeatSpanWithGeminiPro
-            // Snapshot pre-pass windows so span boundaries reference the
-            // ORIGINAL neighbor windows, never windows already relocated
-            // earlier in this same pass.
-            const _preSpanScenes = scenes.map((sc) => ({ ...sc }));
-            let attemptedSpan = 0, appliedSpan = 0, rejectedSpan = 0, failedSpan = 0, skippedSpan = 0;
-            let apiFailStreak = 0;
-            let _lastAcceptedSpanCenter = -Infinity;
-            // Windows must cover at least this multiple of the narration
-            // length, or downstream buildSyncedTimeline runs out of footage
-            // mid-beat. Matches beats.js's COVERAGE_MIN convention.
-            const COVERAGE_TARGET = 1.2;
-            // Protected (death/funeral/climax/etc.) beats are no longer 100%
-            // excluded from GSPAN — a fully wrong Claude window on one of
-            // these beats previously had zero self-healing path. They stay
-            // eligible but with a stricter confidence bar and a hard cap on
-            // how far a single confident-but-possibly-wrong call can move
-            // them, so a bad guess can't drag a climactic beat's footage to
-            // an unrelated part of the film.
-            const PROTECTED_ACCEPT_THRESH = Math.max(acceptThresh, 0.75);
-            const PROTECTED_MAX_RELOCATE_SEC = 45;
-            for (let i = 0; i < scenes.length && attemptedSpan < spanBudget; i++) {
-              const isProtected = protectedVisualBeats[i];
-              // FIX (2026-07-05): span used to be bounded to [prevBeatEnd,
-              // nextBeatStart] — just the GAP between neighbors. If Claude's
-              // own beat-to-scene assignment already systemically lags by
-              // ~1 beat (this beat's true footage actually sits inside what
-              // Claude assigned to the previous or next beat), the correct
-              // footage was outside the span by construction and GSPAN could
-              // only ever pick from other wrong options. Widen the search to
-              // also cover the full neighboring beats' own windows (still
-              // MAX_SPAN_SEC-capped below, and the chronological monotonic
-              // guard below still prevents result ordering violations).
-              const prevStart = i > 0 ? Number(_preSpanScenes[i - 1].startSec) : 0;
-              const nextEnd = i < _preSpanScenes.length - 1
-                ? Number(_preSpanScenes[i + 1].endSec)
-                : (srcDur || Number(_preSpanScenes[i].endSec) + 60);
-              let spanStart = Math.max(0, Math.min(prevStart, Number(_preSpanScenes[i].startSec)));
-              let spanEnd = Math.max(nextEnd, Number(_preSpanScenes[i].endSec));
-              // Cap span length, centered on the beat's own window, so cost
-              // and payload stay bounded on movies with sparse beat coverage
-              // (wide gaps between beats).
-              if (spanEnd - spanStart > MAX_SPAN_SEC) {
-                const mid = (Number(_preSpanScenes[i].startSec) + Number(_preSpanScenes[i].endSec)) / 2;
-                spanStart = Math.max(spanStart, mid - MAX_SPAN_SEC / 2);
-                spanEnd = Math.min(spanEnd, mid + MAX_SPAN_SEC / 2);
-              }
-              const minSpanNeeded = Math.max(8, Number(voDurs[i]) || 0);
-              if (!(spanEnd - spanStart >= minSpanNeeded)) { skippedSpan++; continue; }
-              attemptedSpan++;
-              const v = await localizeBeatSpanWithGeminiPro({
-                jobId, beatIndex: i, narration: beatTexts[i], sourcePath, spanStart, spanEnd,
+        // ── TWELVE LABS MARENGO VISUAL MATCHING (primary) ────────────────────
+        // Text search per beat against a Marengo-indexed copy of the movie.
+        // GSPAN (Gemini span-localization) and SigLIP/CLIP are disabled — see v3.1.0.
+        if (isTwelveLabsEnabled() && SERVER_TWELVELABS_KEY) {
+          const sourceFileId = path.basename(sourcePath);
+          const _tlLog = (msg) => console.log(typeof msg === "string" ? msg : String(msg));
+          try {
+            await jobStore.update(jobId, { message: "Indexing movie with Twelve Labs Marengo (one-time per file)…" });
+            const indexEntry = await ensureMovieIndexed({
+              apiKey: SERVER_TWELVELABS_KEY,
+              cacheDir: TWELVELABS_CACHE_DIR,
+              sourcePath,
+              fileId: sourceFileId,
+              log: (msg) => {
+                _tlLog(msg);
+                jobStore.update(jobId, { message: msg }).catch(() => {});
+              },
+            });
+            if (indexEntry) {
+              await jobStore.update(jobId, { message: `Twelve Labs: searching ${scenes.length} beats for visual matches…` });
+              const tlResult = await localizeBeatsWithTwelveLabs({
+                jobId,
+                apiKey: SERVER_TWELVELABS_KEY,
+                indexEntry,
+                beatTexts,
+                voDurs,
+                scenes,
+                protectedVisualBeats,
+                srcDur: srcDur || sourceDurationSec || 0,
+                log: _tlLog,
               });
-              if (!v) {
-                failedSpan++;
-                apiFailStreak++;
-                // Circuit breaker: 3 consecutive API-level failures (not
-                // low-confidence rejections) means something is systemically
-                // broken (bad model name, key issue, network) rather than a
-                // per-beat content problem — stop burning time/quota on the
-                // remaining beats and let ALL of them fall back to the
-                // legacy path for the rest of this render.
-                if (apiFailStreak >= 3) {
-                  console.warn(`[render ${jobId}] GSPAN: 3 consecutive failures — aborting span-localization pass for remainder of this render, remaining beats keep their Claude-analyzed windows`);
-                  break;
-                }
-                continue;
-              }
-              apiFailStreak = 0;
-              if (v.contentInvalid) {
-                // API responded but gave an unusable answer (out-of-bounds
-                // window, bad JSON, etc.) — this is a per-beat content
-                // rejection, not evidence the API/network is down, so it
-                // must NOT feed apiFailStreak (already reset above).
-                rejectedSpan++;
-                continue;
-              }
-              const effectiveThresh = isProtected ? PROTECTED_ACCEPT_THRESH : acceptThresh;
-              if (v.confidence < effectiveThresh) { rejectedSpan++; continue; }
-              const center = (v.startSec + v.endSec) / 2;
-              if (isProtected) {
-                const origCenter = (Number(_preSpanScenes[i].startSec) + Number(_preSpanScenes[i].endSec)) / 2;
-                if (Math.abs(center - origCenter) > PROTECTED_MAX_RELOCATE_SEC) {
-                  console.log(`[render ${jobId}] GSPAN beat ${i}: protected-beat relocation of ${Math.abs(center - origCenter).toFixed(1)}s exceeds safety cap (${PROTECTED_MAX_RELOCATE_SEC}s) — rejected`);
-                  rejectedSpan++;
-                  continue;
-                }
-              }
-              // Chronological guard — same forward-progress convention as the
-              // CLIP pass above: never let a confident result jump backward
-              // past a beat already accepted by this same pass.
-              if (center < _lastAcceptedSpanCenter + 0.5) {
-                console.log(`[render ${jobId}] GSPAN beat ${i}: rejected — would break chronological order (center=${center.toFixed(1)}, floor=${_lastAcceptedSpanCenter.toFixed(1)})`);
-                rejectedSpan++;
-                continue;
-              }
-              _lastAcceptedSpanCenter = center;
-              // FIX (2026-07-05): expand a too-narrow accepted window toward
-              // COVERAGE_TARGET, growing symmetrically but staying inside the
-              // original search span, and giving any room one side can't use
-              // to the other side. Keeps focusSec at the ORIGINAL matched
-              // center so buildSyncedTimeline still centers playback on the
-              // semantically-correct moment; the wider bounds just give it
-              // room to serve the narration without bleeding into the next
-              // scene (see beats.js buildSyncedTimeline overflow-guard fix).
-              let finalStart = v.startSec, finalEnd = v.endSec;
-              const need = Math.max(0, Number(voDurs[i]) || 0);
-              const minWidth = need * COVERAGE_TARGET;
-              if (need > 0 && (finalEnd - finalStart) < minWidth) {
-                const wantExtra = minWidth - (finalEnd - finalStart);
-                const roomBefore = finalStart - spanStart;
-                const roomAfter = spanEnd - finalEnd;
-                let growBefore = Math.min(roomBefore, wantExtra / 2);
-                let growAfter = Math.min(roomAfter, wantExtra / 2);
-                const shortfall = wantExtra - growBefore - growAfter;
-                if (shortfall > 0.01) {
-                  growBefore = Math.min(roomBefore, growBefore + shortfall);
-                  growAfter = Math.min(roomAfter, wantExtra - growBefore);
-                }
-                finalStart -= growBefore;
-                finalEnd += growAfter;
-              }
-              scenes[i] = {
-                ...scenes[i],
-                startSec: finalStart,
-                endSec: finalEnd,
-                focusSec: center,
-                reason: `${scenes[i]?.reason || ""} [gspan:${v.confidence.toFixed(2)}]`,
-              };
-              appliedSpan++;
+              scenes = tlResult.scenes;
+              _tlabsStats = tlResult.stats;
+            } else {
+              console.warn(`[render ${jobId}] TLABS: indexing failed — beats keep Claude-assigned windows`);
             }
-            console.log(`[render ${jobId}] GSPAN: attempted=${attemptedSpan}, applied=${appliedSpan}, rejected=${rejectedSpan}, failed=${failedSpan}, skipped=${skippedSpan}`);
-            _gspanStats = { attempted: attemptedSpan, applied: appliedSpan, rejected: rejectedSpan, failed: failedSpan, skipped: skippedSpan };
+          } catch (tlErr) {
+            console.warn(`[render ${jobId}] TLABS: visual matching failed (non-fatal):`, tlErr?.message || tlErr);
           }
+        } else if (!SERVER_TWELVELABS_KEY) {
+          console.log(`[render ${jobId}] TLABS: skipped (TWELVELABS_API_KEY not set — add key to .env when ready)`);
+        } else {
+          console.log(`[render ${jobId}] TLABS: skipped (TWELVELABS_ENABLED=0)`);
         }
-        // ── END GEMINI 2.5 PRO SPAN LOCALIZATION ─────────────────────────────
+        // ── END TWELVE LABS MARENGO VISUAL MATCHING ──────────────────────────
+
+        // GSPAN disabled in v3.1.0 — Twelve Labs is the sole visual matcher.
+        if (process.env.GEMINI_SPAN_LOCALIZATION === "1") {
+          console.log(`[render ${jobId}] GSPAN: disabled (v3.1.0) — Twelve Labs Marengo handles visual matching`);
+        }
 
         // ── TEXT-TO-TEXT BEAT NOTE MATCHING (zero cost, last-resort fallback) ─
         // Uses beat notes Claude already wrote during analyze — no extra API call.
         // Fires on footage-starved beats OR self-mismatch beats (own reason
         // doesn't semantically match own narration — see _textMatchBeatNotes
-        // docs). Skips beats already resolved by GSPAN above.
+        // docs). Skips beats already resolved by Twelve Labs above.
         {
           const _txtResult = _textMatchBeatNotes(beats, voDurs);
           if (_txtResult.applied > 0) {
             scenes = scenes.map((sc, i) => {
-              const _handled = sc.reason && sc.reason.includes('[gspan:');
-              if (_handled) return sc; // GSPAN already handled this beat
+              const _handled = sc.reason && (sc.reason.includes("[tlabs:") || sc.reason.includes("[gspan:"));
+              if (_handled) return sc;
               return _txtResult.scenes[i];
             });
             console.log(
@@ -5278,14 +5183,10 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
           beats = beats.map((b, i) => {
             const sc = scenes[i];
             if (!sc) return b;
-            // GSPAN relocations are tagged `[gspan:...]`, TEXT-MATCH
+            // Twelve Labs relocations are tagged `[tlabs:...]`, TEXT-MATCH
             // relocations are tagged `txt:`. Either means sceneIds are stale
-            // and gap-fill Step 3 must not borrow "adjacent" footage relative
-            // to the OLD (pre-relocation) position. Any new correction pass
-            // added to this pipeline MUST add its own tag to this check —
-            // there is no shared/centralized "was this beat relocated" registry.
             const relocated = typeof sc.reason === "string" &&
-              (sc.reason.includes("txt:") || sc.reason.includes("[gspan:"));
+              (sc.reason.includes("txt:") || sc.reason.includes("[tlabs:") || sc.reason.includes("[gspan:"));
             return {
               ...b,
               startSec: Number(sc.startSec),
@@ -5309,7 +5210,7 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
           }));
           const _focusCount = scenes.filter((s) => Number.isFinite(s.focusSec)).length;
           if (_focusCount > 0) {
-            console.log(`[render ${jobId}] SYNC: ${_focusCount} beat(s) have focusSec — timeline will center on GSPAN-matched moments`);
+            console.log(`[render ${jobId}] SYNC: ${_focusCount} beat(s) have focusSec — timeline will center on Twelve-Labs-matched moments`);
           }
         }
         // ── END PROPAGATE VISUAL-MATCH CORRECTIONS ───────────────────────────
@@ -5488,15 +5389,15 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
           .map(b => `beat${b.i}[tts=${b.ttsDur}s win=${b.win}s → ${b.score}%]`).join(", ");
         console.warn(`[render ${jobId}] LOW COVERAGE BEATS: ${worst}`);
       }
-      if (_gspanStats && _gspanStats.attempted > 0) {
-        const _visualPct = Math.round((_gspanStats.applied / _gspanStats.attempted) * 100);
-        const _gspanTagged = beats.filter((b) => String(b.reason || "").includes("[gspan:")).length;
+      if (_tlabsStats && _tlabsStats.attempted > 0) {
+        const _visualPct = Math.round((_tlabsStats.applied / _tlabsStats.attempted) * 100);
+        const _tlabsTagged = beats.filter((b) => String(b.reason || "").includes("[tlabs:")).length;
         console.log(
-          `[render ${jobId}] VISUAL MATCH (GSPAN): ${_visualPct}% beats localized ` +
-          `(${_gspanStats.applied}/${_gspanStats.attempted} applied, ${_gspanStats.rejected} rejected, ${_gspanTagged} tagged in beats[])`
+          `[render ${jobId}] VISUAL MATCH (TWELVE LABS): ${_visualPct}% beats localized ` +
+          `(${_tlabsStats.applied}/${_tlabsStats.attempted} applied, ${_tlabsStats.rejected} rejected, ${_tlabsTagged} tagged in beats[])`
         );
       } else {
-        console.log(`[render ${jobId}] VISUAL MATCH (GSPAN): not run — beats use Claude-assigned windows only`);
+        console.log(`[render ${jobId}] VISUAL MATCH (TWELVE LABS): not run — beats use Claude-assigned windows only`);
       }
     } catch (_svErr) {
       console.warn(`[render ${jobId}] sync score error:`, _svErr?.message || _svErr);
