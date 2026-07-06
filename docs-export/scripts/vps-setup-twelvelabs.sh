@@ -51,12 +51,11 @@ fi
 echo "== restart container =="
 docker compose up -d --force-recreate render
 
-echo "== install SDK + syntax gate =="
-docker compose exec -T render sh -c 'cd /app && npm install --omit=dev'
+echo "== syntax gate =="
+sleep 5
 docker compose exec -T render node --check src/index.js
 docker compose exec -T render node --check src/lib/twelvelabs.js
 docker compose exec -T render node -e "import('twelvelabs-js').then(() => console.log('twelvelabs-js ok'))"
-docker compose restart render
 
 echo "== health =="
 sleep 12
