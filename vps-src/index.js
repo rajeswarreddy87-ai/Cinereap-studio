@@ -550,7 +550,7 @@ app.get("/health", (_req, res) => {
 
   res.json({
     ok: true,
-    version: "3.0.6",
+    version: "3.0.7",
     serverTranscription: Boolean(SERVER_OPENAI_KEY),
     serverAnalysis: Boolean(SERVER_ANTHROPIC_KEY),
     serverModel: SERVER_ANTHROPIC_MODEL || null,
@@ -4693,15 +4693,13 @@ async function runRenderFromIngest(jobId, {
         beats = kept;
 
         // ── NARRATION CONTINUITY REWRITE ────────────────────────────────────
-        // FIX (2026-07-03): stratified sampling above keeps only ~1 beat per
-        // timeline bucket out of a continuously-authored script (e.g. 48 of
-        // 151 beats). Each kept narration reads fine on its own, but back to
-        // back they lose the connective tissue the original script had — no
-        // "meanwhile", no acknowledgment of time/place jumps — so the recap
-        // feels like disconnected clips instead of one flowing story. One
-        // LLM pass over just the kept narrations (no footage/timing touched,
-        // no re-analyze) adds light bridging phrases between them.
-        if (beats.length >= 3 && beats.length <= 150 && (SERVER_ANTHROPIC_KEY || SERVER_GEMINI_KEY)) {
+        // v3.0.7: skip when GSPAN is active — continuity rewrites prose after
+        // analyze assigned scene windows, causing narration to describe different
+        // actions than the footage GSPAN matched. GSPAN needs stable narration.
+        const _gspanActive = process.env.GEMINI_SPAN_LOCALIZATION === "1" && Boolean(SERVER_GEMINI_KEY);
+        if (_gspanActive) {
+          console.log(`[render ${jobId}] NARRATION-CONTINUITY: skipped — GSPAN active (keeping analyze narration for visual matching)`);
+        } else if (beats.length >= 3 && beats.length <= 150 && (SERVER_ANTHROPIC_KEY || SERVER_GEMINI_KEY)) {
           try {
             const _origNarrations = beats.map((b) => String(b.narration || b.reason || "").trim());
             const _numberedList = _origNarrations
@@ -5301,6 +5299,17 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
           const _relocCount = beats.filter((b) => b._relocated).length;
           if (_relocCount > 0) {
             console.log(`[render ${jobId}] SYNC: propagated ${_relocCount} visual-match relocation(s) into beats[] (gap-fill/hook/sync-score now see corrected windows)`);
+          }
+          // Rebuild scenes[] from corrected beats so focusSec + windows flow into planSyncedRender.
+          scenes = beats.map((b, i) => ({
+            startSec: Number(b.startSec),
+            endSec: Number(b.endSec),
+            reason: scenes[i]?.reason || b.reason || b.narration || "",
+            ...(Number.isFinite(b.focusSec) ? { focusSec: Number(b.focusSec) } : {}),
+          }));
+          const _focusCount = scenes.filter((s) => Number.isFinite(s.focusSec)).length;
+          if (_focusCount > 0) {
+            console.log(`[render ${jobId}] SYNC: ${_focusCount} beat(s) have focusSec — timeline will center on GSPAN-matched moments`);
           }
         }
         // ── END PROPAGATE VISUAL-MATCH CORRECTIONS ───────────────────────────

@@ -1008,3 +1008,23 @@ identified in render `m_IdyONNjh` review.
 - New **`VISUAL MATCH (GSPAN)`** line: `applied/attempted` beats localized
 
 `GET /health` reports `version: 3.0.6`.
+
+---
+
+## v3.0.7 — P1 visual sync (focusSec + narration stability)
+
+Deployed Jul 6 2026. Applied before first render on fresh analyze `W0LdICuN1W`.
+
+### 1. Skip narration continuity when GSPAN is active
+- `NARRATION-CONTINUITY` rewrite skipped when `GEMINI_SPAN_LOCALIZATION=1`
+- Prevents post-trim prose changes from drifting away from GSPAN-matched footage
+
+### 2. focusSec lead-in tuned (30% not 50%)
+- `buildSyncedTimeline` places GSPAN-matched moment ~30% into beat playback
+- Key action appears as narration reaches it, not after describing it
+
+### 3. Rebuild scenes[] after GSPAN propagation
+- Ensures `focusSec` + corrected windows flow into `planSyncedRender`
+- Logs `N beat(s) have focusSec — timeline will center on GSPAN-matched moments`
+
+`GET /health` reports `version: 3.0.7`.
