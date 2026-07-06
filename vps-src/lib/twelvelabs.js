@@ -200,7 +200,6 @@ async function uploadMultipart(apiKey, filePath, filename, totalSize, log) {
     if (completed.length % 10 === 0 || completed.length === totalChunks) {
       log?.(`Twelve Labs: uploaded ${completed.length}/${totalChunks} chunks`);
     }
-    nextBatchStart += batch.length;
   }
 
   const start = Date.now();

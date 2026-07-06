@@ -143,16 +143,31 @@ async function uploadMultipart(apiKey, filePath, filename, totalSize, log) {
 
   const urlMap = new Map((session.upload_urls || []).map((u) => [u.chunk_index, u.url]));
   const completed = [];
-  let nextBatchStart = 1;
+
+  // Initial response often includes only the first ~10 URLs — fetch the rest
+  // using start/count (max 50 per call), not chunk_indexes.
+  async function fetchPresignedUrls(start, count) {
+    const extra = await apiJson(apiKey, "POST", `/assets/multipart-uploads/${uploadId}/presigned-urls`, {
+      start,
+      count,
+    });
+    for (const u of extra?.upload_urls || []) {
+      if (u?.chunk_index && u?.url) urlMap.set(u.chunk_index, u.url);
+    }
+  }
+
+  const initialMax = urlMap.size > 0 ? Math.max(...urlMap.keys()) : 0;
+  if (totalChunks > initialMax) {
+    log?.(`Twelve Labs: requesting presigned URLs for chunks ${initialMax + 1}–${totalChunks}…`);
+    for (let start = initialMax + 1; start <= totalChunks; start += 50) {
+      const count = Math.min(50, totalChunks - start + 1);
+      await fetchPresignedUrls(start, count);
+    }
+  }
 
   async function ensureUrl(chunkIndex) {
     if (urlMap.has(chunkIndex)) return urlMap.get(chunkIndex);
-    const extra = await apiJson(apiKey, "POST", `/assets/multipart-uploads/${uploadId}/presigned-urls`, {
-      chunk_indexes: [chunkIndex],
-    });
-    for (const u of extra?.upload_urls || extra?.urls || []) {
-      urlMap.set(u.chunk_index, u.url);
-    }
+    await fetchPresignedUrls(chunkIndex, 1);
     return urlMap.get(chunkIndex);
   }
 
@@ -185,7 +200,6 @@ async function uploadMultipart(apiKey, filePath, filename, totalSize, log) {
     if (completed.length % 10 === 0 || completed.length === totalChunks) {
       log?.(`Twelve Labs: uploaded ${completed.length}/${totalChunks} chunks`);
     }
-    nextBatchStart += batch.length;
   }
 
   const start = Date.now();

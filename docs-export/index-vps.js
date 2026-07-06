@@ -555,7 +555,7 @@ app.get("/health", (_req, res) => {
 
   res.json({
     ok: true,
-    version: "3.1.0",
+    version: "3.1.2",
     serverTranscription: Boolean(SERVER_OPENAI_KEY),
     serverAnalysis: Boolean(SERVER_ANTHROPIC_KEY),
     serverModel: SERVER_ANTHROPIC_MODEL || null,
@@ -4704,13 +4704,10 @@ async function runRenderFromIngest(jobId, {
         beats = kept;
 
         // ── NARRATION CONTINUITY REWRITE ────────────────────────────────────
-        // v3.1.0: skip when Twelve Labs is active — continuity rewrites prose after
-        // analyze assigned scene windows, causing narration to describe different
-        // actions than the footage Twelve Labs matched.
-        const _twelvelabsActive = isTwelveLabsEnabled() && Boolean(SERVER_TWELVELABS_KEY);
-        if (_twelvelabsActive) {
-          console.log(`[render ${jobId}] NARRATION-CONTINUITY: skipped — Twelve Labs active (keeping analyze narration for visual matching)`);
-        } else if (beats.length >= 3 && beats.length <= 150 && (SERVER_ANTHROPIC_KEY || SERVER_GEMINI_KEY)) {
+        // v3.1.2: always run narration continuity — skipping it caused abrupt
+        // beat-to-beat jumps (user report). Twelve Labs text search tolerates
+        // light bridging clauses; visual matching runs after TTS anyway.
+        if (beats.length >= 3 && beats.length <= 150 && (SERVER_ANTHROPIC_KEY || SERVER_GEMINI_KEY)) {
           try {
             const _origNarrations = beats.map((b) => String(b.narration || b.reason || "").trim());
             const _numberedList = _origNarrations
