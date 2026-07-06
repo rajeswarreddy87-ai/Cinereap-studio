@@ -555,7 +555,7 @@ app.get("/health", (_req, res) => {
 
   res.json({
     ok: true,
-    version: "3.1.2",
+    version: "3.2.0",
     serverTranscription: Boolean(SERVER_OPENAI_KEY),
     serverAnalysis: Boolean(SERVER_ANTHROPIC_KEY),
     serverModel: SERVER_ANTHROPIC_MODEL || null,
@@ -594,7 +594,7 @@ app.get("/health", (_req, res) => {
       "ai-thumbnails",      // new in 2.6.0 — DALL-E thumbnail generation via server key
       "translate-transcript", // new in 2.5.0 — Whisper translation endpoint for non-English films
       "uncapped-narration", // new in 2.5.0 — full-length narration, no word-count ceiling
-      "twelvelabs-visual-match", // v3.1.0 — Twelve Labs Marengo text search for beat↔footage sync
+      "twelvelabs-visual-match", // v3.2.0 — Twelve Labs Marengo via official twelvelabs-js SDK
       "multi-tts",          // new in 2.7.0 — ttsProvider field selects speechify|openai|elevenlabs|hume
       "storage-api",        // new in 2.7.0 — GET /system/storage, DELETE /system/clear-renders
       "source-download",    // new in 2.7.0 — GET /uploads/:fileId/download

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Deploy v3.1.0 + Twelve Labs to VPS over SSH (password from env)."""
+"""Deploy v3.2.0 + Twelve Labs SDK to VPS over SSH (password from env)."""
 import os
 import sys
 import tarfile
@@ -62,6 +62,9 @@ def main():
     files = [
         (WORKSPACE / "vps-src/index.js", "src/index.js"),
         (WORKSPACE / "vps-src/lib/twelvelabs.js", "src/lib/twelvelabs.js"),
+        (WORKSPACE / "docs-export/package.json", "package.json"),
+        (WORKSPACE / "docs-export/package-lock.json", "package-lock.json"),
+        (WORKSPACE / "docs-export/Dockerfile", "Dockerfile"),
         (WORKSPACE / "docs-export/docker-compose.yml", "docker-compose.yml"),
         (WORKSPACE / "docs-export/start.sh", "start.sh"),
         (WORKSPACE / "docs-export/scripts/vps-setup-twelvelabs.sh", "scripts/vps-setup-twelvelabs.sh"),
@@ -87,10 +90,10 @@ def main():
         run(
             client,
             f"cd {remote} && export TWELVELABS_API_KEY='{esc}' && bash scripts/vps-setup-twelvelabs.sh",
-            timeout=900,
+            timeout=1800,
         )
     else:
-        run(client, f"cd {remote} && docker compose up -d --force-recreate render", timeout=300)
+        run(client, f"cd {remote} && docker compose build render && docker compose up -d --force-recreate render", timeout=1800)
 
     out = run(client, "curl -s --max-time 15 http://localhost:4040/health")
     print("=== HEALTH ===")

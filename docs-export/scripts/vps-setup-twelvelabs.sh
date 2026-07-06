@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# One-shot VPS setup: deploy v3.1.0 Twelve Labs + disable GSPAN/SigLIP.
+# One-shot VPS setup: deploy v3.2.0 Twelve Labs SDK + disable GSPAN/SigLIP.
 # Usage (on VPS):
 #   export TWELVELABS_API_KEY='tlk_...'
 #   bash scripts/vps-setup-twelvelabs.sh
@@ -33,7 +33,6 @@ upsert_env "CLIP_SIDECAR_ENABLED" "0"
 
 mkdir -p src/lib storage/twelvelabs-cache
 
-# Copy from repo if files exist alongside docker-compose
 for f in index.js lib/twelvelabs.js; do
   if [ -f "src/$f" ]; then
     echo "  src/$f present"
@@ -45,11 +44,22 @@ if [ -f start.sh ]; then chmod +x start.sh; fi
 echo "== gate =="
 if [ -f scripts/check.sh ]; then bash scripts/check.sh; else node --check src/index.js; fi
 
+echo "== rebuild image (twelvelabs-js SDK) =="
+if docker compose build render; then
+  echo "  image build ok"
+else
+  echo "  WARN: image build failed — will npm install in running container"
+fi
+
 echo "== restart container =="
 docker compose up -d --force-recreate render
 
+echo "== ensure twelvelabs-js in container =="
+docker compose exec -T render sh -c 'cd /app && npm install --omit=dev' || true
+docker compose restart render
+
 echo "== health =="
-sleep 10
-curl -s --max-time 15 http://localhost:4040/health | python3 -m json.tool 2>/dev/null | head -30 || curl -s http://localhost:4040/health | head -c 400
+sleep 12
+curl -s --max-time 15 http://localhost:4040/health | python3 -m json.tool 2>/dev/null | head -35 || curl -s http://localhost:4040/health | head -c 500
 echo
-echo "== done: expect version 3.1.0, twelvelabsConfigured true =="
+echo "== done: expect version 3.2.0, twelvelabsSdk true =="

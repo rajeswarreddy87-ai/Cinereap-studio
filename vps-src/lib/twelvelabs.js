@@ -1,40 +1,22 @@
 /**
  * Twelve Labs Marengo integration — index movie once, search per beat.
- * Replaces GSPAN (Gemini span-localization) and SigLIP/CLIP for visual matching.
+ * Uses the official twelvelabs-js SDK for upload/index/search (multipart handled by SDK).
  */
-import { promises as fs, createReadStream } from "node:fs";
+import { promises as fs } from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
+import { TwelveLabs } from "twelvelabs-js";
 
-const API_BASE = process.env.TWELVELABS_API_BASE || "https://api.twelvelabs.io/v1.3";
-const DIRECT_UPLOAD_MAX = 200 * 1024 * 1024; // 200 MB
 const MULTIPART_UPLOAD_MAX = 4 * 1024 * 1024 * 1024; // 4 GB
 const POLL_INTERVAL_MS = 5000;
 const INDEX_POLL_MAX_MS = 45 * 60 * 1000; // 45 min for long films
-const UPLOAD_CONCURRENCY = 4;
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-async function apiJson(apiKey, method, endpoint, body = null) {
-  const resp = await fetch(`${API_BASE}${endpoint}`, {
-    method,
-    headers: {
-      "x-api-key": apiKey,
-      ...(body ? { "Content-Type": "application/json" } : {}),
-    },
-    body: body ? JSON.stringify(body) : undefined,
-    signal: AbortSignal.timeout(120_000),
-  });
-  const text = await resp.text().catch(() => "");
-  let data = null;
-  try { data = text ? JSON.parse(text) : null; } catch { data = { raw: text }; }
-  if (!resp.ok) {
-    const msg = data?.message || data?.code || text.slice(0, 200) || resp.statusText;
-    throw new Error(`TwelveLabs ${method} ${endpoint}: HTTP ${resp.status} — ${msg}`);
-  }
-  return data;
+function createClient(apiKey) {
+  return new TwelveLabs({ apiKey });
 }
 
 async function fileFingerprint(filePath) {
@@ -70,7 +52,7 @@ async function saveGlobalIndex(cacheDir, data) {
   await fs.writeFile(path.join(cacheDir, "_global.json"), JSON.stringify(data, null, 2), "utf8");
 }
 
-async function ensureSharedIndex(apiKey, cacheDir, log) {
+async function ensureSharedIndex(client, apiKey, cacheDir, log) {
   const envIndex = (process.env.TWELVELABS_INDEX_ID || "").trim();
   if (envIndex) return envIndex;
 
@@ -78,21 +60,21 @@ async function ensureSharedIndex(apiKey, cacheDir, log) {
   if (global?.indexId) return global.indexId;
 
   log?.("Twelve Labs: creating shared Marengo index…");
-  const created = await apiJson(apiKey, "POST", "/indexes", {
-    index_name: `cinerecap-${createHash("sha256").update(apiKey.slice(0, 8)).digest("hex").slice(0, 8)}`,
-    models: [{ model_name: "marengo3.0", model_options: ["visual", "audio"] }],
+  const created = await client.indexes.create({
+    indexName: `cinerecap-${createHash("sha256").update(apiKey.slice(0, 8)).digest("hex").slice(0, 8)}`,
+    models: [{ modelName: "marengo3.0", modelOptions: ["visual", "audio"] }],
   });
-  const indexId = created?._id || created?.id;
+  const indexId = created?.id;
   if (!indexId) throw new Error("TwelveLabs index create returned no id");
   await saveGlobalIndex(cacheDir, { indexId, createdAt: Date.now() });
   log?.(`Twelve Labs: shared index ready (${indexId})`);
   return indexId;
 }
 
-async function waitForAssetReady(apiKey, assetId, log, maxMs = INDEX_POLL_MAX_MS) {
+async function waitForAssetReady(client, assetId, log, maxMs = INDEX_POLL_MAX_MS) {
   const start = Date.now();
   while (Date.now() - start < maxMs) {
-    const asset = await apiJson(apiKey, "GET", `/assets/${assetId}`);
+    const asset = await client.assets.retrieve(assetId);
     if (asset?.status === "ready") return asset;
     if (asset?.status === "failed") throw new Error(`TwelveLabs asset ${assetId} failed`);
     log?.(`Twelve Labs: asset processing (${asset?.status || "pending"})…`);
@@ -101,143 +83,64 @@ async function waitForAssetReady(apiKey, assetId, log, maxMs = INDEX_POLL_MAX_MS
   throw new Error(`TwelveLabs asset ${assetId} timed out`);
 }
 
-async function uploadDirect(apiKey, filePath, filename, log) {
-  log?.("Twelve Labs: direct upload (<200MB)…");
-  const form = new FormData();
-  form.append("method", "direct");
-  form.append("file", new Blob([await fs.readFile(filePath)]), filename);
-  const resp = await fetch(`${API_BASE}/assets`, {
-    method: "POST",
-    headers: { "x-api-key": apiKey },
-    body: form,
-    signal: AbortSignal.timeout(600_000),
-  });
-  const data = await resp.json().catch(() => ({}));
-  if (!resp.ok) throw new Error(`TwelveLabs direct upload: HTTP ${resp.status} — ${data?.message || ""}`);
-  return data?._id || data?.id;
-}
-
-async function readChunk(filePath, offset, length) {
-  const fh = await fs.open(filePath, "r");
-  try {
-    const buf = Buffer.alloc(length);
-    const { bytesRead } = await fh.read(buf, 0, length, offset);
-    return buf.subarray(0, bytesRead);
-  } finally {
-    await fh.close();
-  }
-}
-
-async function uploadMultipart(apiKey, filePath, filename, totalSize, log) {
-  log?.(`Twelve Labs: multipart upload (${(totalSize / 1e9).toFixed(2)} GB)…`);
-  const session = await apiJson(apiKey, "POST", "/assets/multipart-uploads", {
-    filename,
-    type: "video",
-    total_size: totalSize,
-  });
-  const uploadId = session.upload_id;
-  const assetId = session.asset_id;
-  const chunkSize = session.chunk_size;
-  const totalChunks = session.total_chunks;
-  if (!uploadId || !assetId || !chunkSize) throw new Error("TwelveLabs multipart session missing fields");
-
-  const urlMap = new Map((session.upload_urls || []).map((u) => [u.chunk_index, u.url]));
-  const completed = [];
-
-  // Initial response often includes only the first ~10 URLs — fetch the rest
-  // using start/count (max 50 per call), not chunk_indexes.
-  async function fetchPresignedUrls(start, count) {
-    const extra = await apiJson(apiKey, "POST", `/assets/multipart-uploads/${uploadId}/presigned-urls`, {
-      start,
-      count,
-    });
-    for (const u of extra?.upload_urls || []) {
-      if (u?.chunk_index && u?.url) urlMap.set(u.chunk_index, u.url);
-    }
-  }
-
-  const initialMax = urlMap.size > 0 ? Math.max(...urlMap.keys()) : 0;
-  if (totalChunks > initialMax) {
-    log?.(`Twelve Labs: requesting presigned URLs for chunks ${initialMax + 1}–${totalChunks}…`);
-    for (let start = initialMax + 1; start <= totalChunks; start += 50) {
-      const count = Math.min(50, totalChunks - start + 1);
-      await fetchPresignedUrls(start, count);
-    }
-  }
-
-  async function ensureUrl(chunkIndex) {
-    if (urlMap.has(chunkIndex)) return urlMap.get(chunkIndex);
-    await fetchPresignedUrls(chunkIndex, 1);
-    return urlMap.get(chunkIndex);
-  }
-
-  async function uploadOne(chunkIndex) {
-    const offset = (chunkIndex - 1) * chunkSize;
-    const len = Math.min(chunkSize, totalSize - offset);
-    const data = await readChunk(filePath, offset, len);
-    const url = await ensureUrl(chunkIndex);
-    if (!url) throw new Error(`TwelveLabs missing presigned URL for chunk ${chunkIndex}`);
-    const resp = await fetch(url, {
-      method: "PUT",
-      body: data,
-      signal: AbortSignal.timeout(300_000),
-    });
-    if (!resp.ok) throw new Error(`TwelveLabs chunk ${chunkIndex} upload failed: HTTP ${resp.status}`);
-    const etag = resp.headers.get("etag") || resp.headers.get("ETag") || "";
-    return { chunk_index: chunkIndex, proof: etag.replace(/"/g, ""), proof_type: "etag", chunk_size: len };
-  }
-
-  const pending = [];
-  for (let i = 1; i <= totalChunks; i++) pending.push(i);
-
-  while (pending.length > 0) {
-    const batch = pending.splice(0, UPLOAD_CONCURRENCY);
-    const results = await Promise.all(batch.map(uploadOne));
-    completed.push(...results);
-    await apiJson(apiKey, "POST", `/assets/multipart-uploads/${uploadId}`, {
-      completed_chunks: results,
-    });
-    if (completed.length % 10 === 0 || completed.length === totalChunks) {
-      log?.(`Twelve Labs: uploaded ${completed.length}/${totalChunks} chunks`);
-    }
-  }
-
-  const start = Date.now();
-  while (Date.now() - start < INDEX_POLL_MAX_MS) {
-    const status = await apiJson(apiKey, "GET", `/assets/multipart-uploads/${uploadId}`);
-    if (status?.status === "completed") return assetId;
-    if (status?.status === "failed") throw new Error("TwelveLabs multipart upload failed");
-    await sleep(POLL_INTERVAL_MS);
-  }
-  throw new Error("TwelveLabs multipart upload timed out");
-}
-
-async function uploadAsset(apiKey, filePath, log) {
+async function uploadAsset(client, filePath, log) {
   const st = await fs.stat(filePath);
   const filename = path.basename(filePath);
   if (st.size > MULTIPART_UPLOAD_MAX) {
     throw new Error(`File ${(st.size / 1e9).toFixed(2)} GB exceeds TwelveLabs 4GB limit`);
   }
-  if (st.size <= DIRECT_UPLOAD_MAX) {
-    try {
-      return await uploadDirect(apiKey, filePath, filename, log);
-    } catch (e) {
-      log?.(`Twelve Labs: direct upload failed (${e.message}) — trying multipart`);
-    }
-  }
-  return uploadMultipart(apiKey, filePath, filename, st.size, log);
+
+  const maxWorkers = Math.max(1, Number(process.env.TWELVELABS_UPLOAD_WORKERS) || 4);
+  const batchSize = Math.max(1, Number(process.env.TWELVELABS_UPLOAD_BATCH) || 10);
+  let lastLogPct = -1;
+
+  log?.(`Twelve Labs: SDK multipart upload (${(st.size / 1e9).toFixed(2)} GB)…`);
+  const result = await client.multipartUpload.uploadFile(filePath, {
+    filename,
+    fileType: "video",
+    maxWorkers,
+    batchSize,
+    maxRetries: 3,
+    retryDelay: 1.0,
+    progressCallback: (progress) => {
+      const pct = Math.floor(progress.percentage);
+      if (pct >= lastLogPct + 10 || pct === 100) {
+        lastLogPct = pct;
+        log?.(`Twelve Labs: upload ${pct}% (${progress.completedChunks}/${progress.totalChunks} chunks)`);
+      }
+    },
+  });
+
+  const assetId = result?.assetId;
+  if (!assetId) throw new Error("TwelveLabs upload returned no assetId");
+  return assetId;
 }
 
-async function waitForIndexedAsset(apiKey, indexId, indexedAssetId, log) {
+async function waitForIndexedAsset(client, indexId, indexedAssetId, log) {
   const start = Date.now();
   while (Date.now() - start < INDEX_POLL_MAX_MS) {
-    const ia = await apiJson(apiKey, "GET", `/indexes/${indexId}/indexed-assets/${indexedAssetId}`);
+    const ia = await client.indexes.indexedAssets.retrieve(indexId, indexedAssetId);
     if (ia?.status === "ready") return ia;
     if (ia?.status === "failed") throw new Error(`TwelveLabs indexing failed for ${indexedAssetId}`);
     log?.(`Twelve Labs: indexing (${ia?.status || "processing"})…`);
     await sleep(POLL_INTERVAL_MS);
   }
   throw new Error(`TwelveLabs indexing timed out for ${indexedAssetId}`);
+}
+
+async function resolveVideoId(client, indexId, assetId, log) {
+  const pager = await client.indexes.videos.list(indexId, { pageLimit: 50, sortOption: "desc" });
+  for await (const video of pager) {
+    if (video?.assetId === assetId && video?.id) return video.id;
+  }
+  while (pager.hasNextPage()) {
+    await pager.getNextPage();
+    for (const video of pager.data || []) {
+      if (video?.assetId === assetId && video?.id) return video.id;
+    }
+  }
+  log?.(`Twelve Labs: videoId not found via list — using indexed asset id for filter`);
+  return null;
 }
 
 /**
@@ -252,18 +155,19 @@ export async function ensureMovieIndexed({ apiKey, cacheDir, sourcePath, fileId,
     return cached;
   }
 
-  const indexId = await ensureSharedIndex(apiKey, cacheDir, log);
+  const client = createClient(apiKey);
+  const indexId = await ensureSharedIndex(client, apiKey, cacheDir, log);
   log?.(`Twelve Labs: uploading ${path.basename(sourcePath)}…`);
-  const assetId = await uploadAsset(apiKey, sourcePath, log);
-  await waitForAssetReady(apiKey, assetId, log);
+  const assetId = await uploadAsset(client, sourcePath, log);
+  await waitForAssetReady(client, assetId, log);
 
   log?.("Twelve Labs: starting Marengo indexing…");
-  const indexed = await apiJson(apiKey, "POST", `/indexes/${indexId}/indexed-assets`, { asset_id: assetId });
-  const indexedAssetId = indexed?._id || indexed?.id;
+  const indexed = await client.indexes.indexedAssets.create(indexId, { assetId });
+  const indexedAssetId = indexed?.id;
   if (!indexedAssetId) throw new Error("TwelveLabs indexed-asset create returned no id");
 
-  const ready = await waitForIndexedAsset(apiKey, indexId, indexedAssetId, log);
-  const videoId = ready?.video_id || ready?._id || indexedAssetId;
+  await waitForIndexedAsset(client, indexId, indexedAssetId, log);
+  const videoId = (await resolveVideoId(client, indexId, assetId, log)) || indexedAssetId;
 
   const entry = {
     fileId,
@@ -286,31 +190,22 @@ export async function searchBeatMoment({ apiKey, indexId, videoId, narration, sp
   const query = String(narration || "").trim().slice(0, 1800);
   if (!query) return null;
 
-  const form = new FormData();
-  form.append("query_text", query);
-  form.append("index_id", indexId);
-  form.append("search_options", "visual");
-  form.append("search_options", "audio");
-  form.append("search_options", "transcription");
-  form.append("operator", "or");
-  form.append("page_limit", "8");
-  form.append("group_by", "clip");
-  if (videoId) {
-    form.append("filter", JSON.stringify({ id: [videoId] }));
-  }
-
-  const resp = await fetch(`${API_BASE}/search`, {
-    method: "POST",
-    headers: { "x-api-key": apiKey },
-    body: form,
-    signal: AbortSignal.timeout(60_000),
+  const client = createClient(apiKey);
+  const pager = await client.search.query({
+    indexId,
+    queryText: query,
+    searchOptions: ["visual", "audio", "transcription"],
+    operator: "or",
+    pageLimit: 8,
+    groupBy: "clip",
+    ...(videoId ? { filter: JSON.stringify({ id: [videoId] }) } : {}),
   });
-  const data = await resp.json().catch(() => ({}));
-  if (!resp.ok) {
-    throw new Error(`TwelveLabs search: HTTP ${resp.status} — ${data?.message || ""}`);
-  }
 
-  const hits = Array.isArray(data?.data) ? data.data : [];
+  const hits = [];
+  for await (const hit of pager) {
+    hits.push(hit);
+    if (hits.length >= 8) break;
+  }
   if (!hits.length) return null;
 
   const spanLo = Number(spanStart) || 0;

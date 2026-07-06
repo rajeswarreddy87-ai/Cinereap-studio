@@ -56,6 +56,7 @@ services:
       - SEEDR_PASSWORD=${SEEDR_PASSWORD:-}
     volumes:
       - ./src:/app/src
+      - ./start.sh:/app/start.sh
       - ./storage/uploads:/data/uploads
       - ./storage/output:/data/output
       - ./storage/jobs:/data/jobs
