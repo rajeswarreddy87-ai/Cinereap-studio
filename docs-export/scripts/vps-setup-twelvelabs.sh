@@ -41,21 +41,21 @@ done
 
 if [ -f start.sh ]; then chmod +x start.sh; fi
 
-echo "== gate =="
-if [ -f scripts/check.sh ]; then bash scripts/check.sh; else node --check src/index.js; fi
-
 echo "== rebuild image (twelvelabs-js SDK) =="
 if docker compose build render; then
   echo "  image build ok"
 else
-  echo "  WARN: image build failed — will npm install in running container"
+  echo "  WARN: image build failed — will npm install after restart"
 fi
 
 echo "== restart container =="
 docker compose up -d --force-recreate render
 
-echo "== ensure twelvelabs-js in container =="
-docker compose exec -T render sh -c 'cd /app && npm install --omit=dev' || true
+echo "== install SDK + syntax gate =="
+docker compose exec -T render sh -c 'cd /app && npm install --omit=dev'
+docker compose exec -T render node --check src/index.js
+docker compose exec -T render node --check src/lib/twelvelabs.js
+docker compose exec -T render node -e "import('twelvelabs-js').then(() => console.log('twelvelabs-js ok'))"
 docker compose restart render
 
 echo "== health =="
