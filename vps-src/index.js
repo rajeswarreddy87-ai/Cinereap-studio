@@ -555,7 +555,7 @@ app.get("/health", (_req, res) => {
 
   res.json({
     ok: true,
-    version: "3.2.3",
+    version: "3.2.4",
     serverTranscription: Boolean(SERVER_OPENAI_KEY),
     serverAnalysis: Boolean(SERVER_ANTHROPIC_KEY),
     serverModel: SERVER_ANTHROPIC_MODEL || null,
@@ -2159,8 +2159,14 @@ app.post("/analyze", requireAuth, async (req, res) => {
       // caused by the app sending a hard-coded 50).
       const durationScaled = duration > 0 ? Math.round(duration / 40) : 150;
       const appHint = effectiveTargetClipCount || Number(frameBudget) || 0;
-      const targetScenes = Math.max(60, Math.min(350, Math.max(durationScaled, appHint)));
-      console.log(`[analyze ${jobId}] beat target: ${effectiveTargetClipCount} (targetMinutes=${analyzeTargetMinutes || 'unset'})`);
+      // Cap scene count so analyze does not produce 2× the beats a recap can use.
+      // Long films used duration/40 (~180 scenes) then render discarded 60% by
+      // importance sampling — causing press conference → wife shooting jumps.
+      const recapBeatCap = effectiveTargetClipCount > 0
+        ? Math.round(effectiveTargetClipCount * 1.15)
+        : 350;
+      const targetScenes = Math.max(60, Math.min(350, durationScaled, recapBeatCap));
+      console.log(`[analyze ${jobId}] scene target: ${targetScenes} (durationScaled=${durationScaled}, recapCap=${recapBeatCap}, targetMinutes=${analyzeTargetMinutes || 'unset'})`);
       // Use the effective key+model for the active provider (server override
       // wins over app values; Gemini is a drop-in swap for Claude here).
       const claudeApiKey   = providerApiKey;
@@ -4671,19 +4677,21 @@ async function runRenderFromIngest(jobId, {
       const AVG_BEAT_SEC  = Math.max(10, Math.min(25, _estSecPerBeat || 15));
       console.log(`[render ${jobId}] BEAT-TRIM: median narration ${_medianWords.toFixed(0)}w → ${_estSecPerBeat.toFixed(1)}s/beat TTS → using ${AVG_BEAT_SEC.toFixed(1)}s/beat avg`);
       const BEATS_TARGET  = Math.max(40, Math.min(120, Math.round((+targetMinutes || 20) * 60 / AVG_BEAT_SEC)));
-      if (beats.length > BEATS_TARGET) {
+      const _trimMode = String(process.env.BEAT_TRIM_MODE || "chronological").toLowerCase();
+      const _trimOff = String(process.env.BEAT_TRIM_ENABLED ?? "1").toLowerCase() === "0"
+        || _trimMode === "off" || _trimMode === "none";
+      if (!_trimOff && beats.length > BEATS_TARGET) {
         const original = beats.slice();
 
         // ── STRATIFIED SAMPLING ──────────────────────────────────────────────
         // Divide the chronological beat list into BEATS_TARGET equal-sized buckets
-        // and pick the highest-importance beat from each bucket.
+        // and pick one beat from each bucket.
         //
-        // Why stratified instead of pure importance ranking:
-        //   Pure top-N by importance clusters selected beats in exciting mid-film
-        //   sections, leaving the first act and resolution under-represented.
-        //   Stratified sampling guarantees one beat per timeline segment, so every
-        //   part of the movie (opening → midpoint → climax → resolution) is covered
-        //   regardless of where Claude assigned high importance scores.
+        // Mode "chronological" (default): pick the middle beat in each bucket so the
+        // recap walks the story start→end without jumping to the highest-drama moment
+        // in every segment (which caused press conference → wife shooting skips).
+        //
+        // Mode "importance": legacy — highest-importance beat per bucket (jumpy).
         const bucketSize = original.length / BEATS_TARGET;
         const seenRefs   = new Set();
         const kept = Array.from({ length: BEATS_TARGET }, (_, b) => {
@@ -4691,17 +4699,20 @@ async function runRenderFromIngest(jobId, {
           const end    = Math.min(Math.ceil((b + 1) * bucketSize), original.length);
           const bucket = original.slice(start, end);
           if (bucket.length === 0) return null;
-          // Within each bucket prefer the beat with the highest importance score.
-          // Falls back to the first beat in the bucket when no scores are present.
-          const best = bucket.reduce((top, beat) =>
-            +(beat.importance || 0) >= +(top.importance || 0) ? beat : top
-          );
+          let best;
+          if (_trimMode === "importance") {
+            best = bucket.reduce((top, beat) =>
+              +(beat.importance || 0) >= +(top.importance || 0) ? beat : top
+            );
+          } else {
+            best = bucket[Math.floor(bucket.length / 2)];
+          }
           if (seenRefs.has(best)) return null;
           seenRefs.add(best);
           return best;
         }).filter(Boolean);
 
-        console.log(`[render ${jobId}] BEAT-TRIM: ${original.length}→${kept.length} beats (target=${BEATS_TARGET} for ${+targetMinutes || 20}min, stratified)`);
+        console.log(`[render ${jobId}] BEAT-TRIM: ${original.length}→${kept.length} beats (target=${BEATS_TARGET} for ${+targetMinutes || 20}min, mode=${_trimMode})`);
         beats = kept;
 
         // ── NARRATION CONTINUITY REWRITE ────────────────────────────────────
@@ -4778,6 +4789,8 @@ Return JSON only, no markdown, in this exact shape:
           console.log(`[render ${jobId}] NARRATION-CONTINUITY: off (using analyze narration as-is)`);
         }
         // ── END NARRATION CONTINUITY REWRITE ────────────────────────────────
+      } else if (_trimOff && beats.length > BEATS_TARGET) {
+        console.log(`[render ${jobId}] BEAT-TRIM: off — keeping all ${beats.length} beats (target was ${BEATS_TARGET})`);
       } else {
         console.log(`[render ${jobId}] BEAT-TRIM: ${beats.length} beats — under target (${BEATS_TARGET} for ${+targetMinutes || 20}min), keeping all`);
       }
