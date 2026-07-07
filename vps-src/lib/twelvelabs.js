@@ -10,6 +10,7 @@ import { TwelveLabs } from "twelvelabs-js";
 const MULTIPART_UPLOAD_MAX = 4 * 1024 * 1024 * 1024; // 4 GB
 const POLL_INTERVAL_MS = 5000;
 const ASSET_POLL_MAX_MS = 30 * 60 * 1000; // 30 min post-upload asset processing
+const INDEX_IN_PROGRESS = new Set(["pending", "queued", "indexing"]);
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
@@ -158,27 +159,130 @@ async function resolveVideoId(client, indexId, assetId, log) {
   return null;
 }
 
-async function findReadyIndexedAsset(client, indexId, { filename, size }) {
+async function findIndexedAssetsForAssetInIndex(client, indexId, assetId) {
+  const results = [];
   const pager = await client.indexes.indexedAssets.list(indexId, { pageLimit: 50, sortOption: "desc" });
-  const check = (ia) => {
-    if (ia?.status !== "ready" || !ia?.id || !ia?.assetId) return null;
+  const match = (ia) => (ia?.assetId === assetId && ia?.id ? ia : null);
+  for await (const ia of pager) {
+    const hit = match(ia);
+    if (hit) results.push(hit);
+  }
+  while (pager.hasNextPage()) {
+    await pager.getNextPage();
+    for (const ia of pager.data || []) {
+      const hit = match(ia);
+      if (hit) results.push(hit);
+    }
+  }
+  return results;
+}
+
+async function findIndexedAssetsForFile(client, indexId, { filename, size, assetId }) {
+  const results = [];
+  const pager = await client.indexes.indexedAssets.list(indexId, { pageLimit: 50, sortOption: "desc" });
+  const match = (ia) => {
+    if (!ia?.id) return null;
+    if (assetId && ia.assetId === assetId) return ia;
     const meta = ia.systemMetadata || {};
     if (meta.filename !== filename) return null;
     if (size && meta.size && meta.size !== size) return null;
     return ia;
   };
   for await (const ia of pager) {
-    const hit = check(ia);
-    if (hit) return hit;
+    const hit = match(ia);
+    if (hit) results.push(hit);
   }
   while (pager.hasNextPage()) {
     await pager.getNextPage();
     for (const ia of pager.data || []) {
-      const hit = check(ia);
-      if (hit) return hit;
+      const hit = match(ia);
+      if (hit) results.push(hit);
     }
   }
+  return results;
+}
+
+function pickIndexingTarget(entries) {
+  if (!entries.length) return null;
+
+  const ready = entries.filter((e) => e.status === "ready");
+  if (ready.length) {
+    ready.sort((a, b) => String(b.indexedAt || b.updatedAt || "").localeCompare(String(a.indexedAt || a.updatedAt || "")));
+    return { mode: "ready", indexedAsset: ready[0] };
+  }
+
+  const inProgress = entries.filter((e) => INDEX_IN_PROGRESS.has(e.status));
+  if (inProgress.length) {
+    inProgress.sort((a, b) => String(b.createdAt || "").localeCompare(String(a.createdAt || "")));
+    return { mode: "wait", indexedAsset: inProgress[0] };
+  }
+
+  const failed = entries.filter((e) => e.status === "failed");
+  if (failed.length) {
+    failed.sort((a, b) => String(b.createdAt || "").localeCompare(String(a.createdAt || "")));
+    return { mode: "failed", indexedAsset: failed[0] };
+  }
+
   return null;
+}
+
+async function ensureIndexingForAsset({
+  client, indexId, assetId, fileId, fingerprint, cacheDir, log, pollMax,
+}) {
+  const existing = await findIndexedAssetsForAssetInIndex(client, indexId, assetId);
+  const target = pickIndexingTarget(existing);
+
+  if (target?.mode === "ready") {
+    log?.(`Twelve Labs: reusing ready index for asset ${assetId} (${target.indexedAsset.id})`);
+    return target.indexedAsset.id;
+  }
+
+  if (target?.mode === "wait") {
+    log?.(`Twelve Labs: waiting on in-progress index for asset ${assetId} (${target.indexedAsset.id}, ${target.indexedAsset.status}) — not starting duplicate`);
+    await saveCache(cacheDir, fileId, {
+      fileId, fingerprint, indexId, assetId,
+      indexedAssetId: target.indexedAsset.id,
+      status: "indexing",
+      startedAt: Date.now(),
+    });
+    await waitForIndexedAsset(client, indexId, target.indexedAsset.id, log, pollMax);
+    return target.indexedAsset.id;
+  }
+
+  if (target?.mode === "failed") {
+    log?.(`Twelve Labs: prior index for asset ${assetId} failed (${target.indexedAsset.id}) — checking before retry`);
+  } else {
+    log?.("Twelve Labs: starting Marengo indexing…");
+  }
+
+  // Final guard — another render may have started or finished indexing since we last looked.
+  const fresh = pickIndexingTarget(await findIndexedAssetsForAssetInIndex(client, indexId, assetId));
+  if (fresh?.mode === "ready") {
+    log?.(`Twelve Labs: index became ready (${fresh.indexedAsset.id}) — skipping duplicate create`);
+    return fresh.indexedAsset.id;
+  }
+  if (fresh?.mode === "wait") {
+    log?.(`Twelve Labs: index already in progress (${fresh.indexedAsset.id}) — waiting instead of duplicating`);
+    await saveCache(cacheDir, fileId, {
+      fileId, fingerprint, indexId, assetId,
+      indexedAssetId: fresh.indexedAsset.id,
+      status: "indexing",
+      startedAt: Date.now(),
+    });
+    await waitForIndexedAsset(client, indexId, fresh.indexedAsset.id, log, pollMax);
+    return fresh.indexedAsset.id;
+  }
+
+  const indexed = await client.indexes.indexedAssets.create(indexId, { assetId });
+  const indexedAssetId = indexed?.id;
+  if (!indexedAssetId) throw new Error("TwelveLabs indexed-asset create returned no id");
+
+  await saveCache(cacheDir, fileId, {
+    fileId, fingerprint, indexId, assetId, indexedAssetId, status: "indexing", startedAt: Date.now(),
+  });
+
+  await waitForIndexedAsset(client, indexId, indexedAssetId, log, pollMax);
+  return indexedAssetId;
 }
 
 async function finalizeIndexEntry({ client, indexId, fileId, fingerprint, assetId, indexedAssetId, log }) {
@@ -214,6 +318,45 @@ export async function ensureMovieIndexed({ apiKey, cacheDir, sourcePath, fileId,
   const client = createClient(apiKey);
   const indexId = cached?.indexId || await ensureSharedIndex(client, apiKey, cacheDir, log);
 
+  // Check platform for any index state for this file (ready or in-progress).
+  const platformEntries = await findIndexedAssetsForFile(client, indexId, {
+    filename,
+    size: st.size,
+    assetId: cached?.assetId,
+  });
+  const platformTarget = pickIndexingTarget(platformEntries);
+  if (platformTarget?.mode === "ready") {
+    log?.(`Twelve Labs: found existing ready index for ${filename} (${platformTarget.indexedAsset.id})`);
+    const entry = await finalizeIndexEntry({
+      client, indexId, fileId, fingerprint,
+      assetId: platformTarget.indexedAsset.assetId,
+      indexedAssetId: platformTarget.indexedAsset.id,
+      log,
+    });
+    await saveCache(cacheDir, fileId, entry);
+    return entry;
+  }
+  if (platformTarget?.mode === "wait") {
+    log?.(`Twelve Labs: found in-progress index for ${filename} (${platformTarget.indexedAsset.id}) — waiting, not duplicating`);
+    await saveCache(cacheDir, fileId, {
+      fileId, fingerprint, indexId,
+      assetId: platformTarget.indexedAsset.assetId,
+      indexedAssetId: platformTarget.indexedAsset.id,
+      status: "indexing",
+      startedAt: Date.now(),
+    });
+    await waitForIndexedAsset(client, indexId, platformTarget.indexedAsset.id, log, pollMax);
+    const entry = await finalizeIndexEntry({
+      client, indexId, fileId, fingerprint,
+      assetId: platformTarget.indexedAsset.assetId,
+      indexedAssetId: platformTarget.indexedAsset.id,
+      log,
+    });
+    await saveCache(cacheDir, fileId, entry);
+    log?.(`Twelve Labs: in-progress index ready → video ${entry.videoId}`);
+    return entry;
+  }
+
   // Resume in-progress indexing from partial cache (avoids re-upload).
   if (cached?.fingerprint === fingerprint && cached?.indexedAssetId && cached?.assetId) {
     log?.(`Twelve Labs: resuming indexing for ${fileId} (indexed-asset ${cached.indexedAssetId})…`);
@@ -235,35 +378,36 @@ export async function ensureMovieIndexed({ apiKey, cacheDir, sourcePath, fileId,
     }
   }
 
-  // Platform already has a ready index for this file (e.g. prior render timed out).
-  const existing = await findReadyIndexedAsset(client, indexId, { filename, size: st.size });
-  if (existing) {
-    log?.(`Twelve Labs: found existing ready index for ${filename} (${existing.id})`);
-    const entry = await finalizeIndexEntry({
-      client, indexId, fileId, fingerprint,
-      assetId: existing.assetId,
-      indexedAssetId: existing.id,
-      log,
-    });
-    await saveCache(cacheDir, fileId, entry);
-    log?.(`Twelve Labs: using existing index → video ${entry.videoId}`);
-    return entry;
+  // Reuse uploaded asset if a prior attempt left one on the platform (incl. failed index jobs).
+  const knownAssetId = platformEntries.find((e) => e.assetId)?.assetId
+    || cached?.assetId;
+  if (knownAssetId) {
+    try {
+      const asset = await client.assets.retrieve(knownAssetId);
+      if (asset?.status === "ready") {
+        log?.(`Twelve Labs: reusing uploaded asset ${knownAssetId} (skip re-upload)`);
+        const indexedAssetId = await ensureIndexingForAsset({
+          client, indexId, assetId: knownAssetId, fileId, fingerprint, cacheDir, log, pollMax,
+        });
+        const entry = await finalizeIndexEntry({
+          client, indexId, fileId, fingerprint, assetId: knownAssetId, indexedAssetId, log,
+        });
+        await saveCache(cacheDir, fileId, entry);
+        log?.(`Twelve Labs: indexed ${fileId} → video ${entry.videoId}`);
+        return entry;
+      }
+    } catch (e) {
+      log?.(`Twelve Labs: could not reuse asset ${knownAssetId} (${e?.message || e}) — uploading fresh`);
+    }
   }
 
   log?.(`Twelve Labs: uploading ${filename}…`);
   const assetId = await uploadAsset(client, sourcePath, log);
   await waitForAssetReady(client, assetId, log);
 
-  log?.("Twelve Labs: starting Marengo indexing…");
-  const indexed = await client.indexes.indexedAssets.create(indexId, { assetId });
-  const indexedAssetId = indexed?.id;
-  if (!indexedAssetId) throw new Error("TwelveLabs indexed-asset create returned no id");
-
-  await saveCache(cacheDir, fileId, {
-    fileId, fingerprint, indexId, assetId, indexedAssetId, status: "indexing", startedAt: Date.now(),
+  const indexedAssetId = await ensureIndexingForAsset({
+    client, indexId, assetId, fileId, fingerprint, cacheDir, log, pollMax,
   });
-
-  await waitForIndexedAsset(client, indexId, indexedAssetId, log, pollMax);
   const entry = await finalizeIndexEntry({
     client, indexId, fileId, fingerprint, assetId, indexedAssetId, log,
   });
