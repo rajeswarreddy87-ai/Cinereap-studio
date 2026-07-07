@@ -285,29 +285,6 @@ async function ensureIndexingForAsset({
   return indexedAssetId;
 }
 
-async function findReadyIndexedAsset(client, indexId, { filename, size }) {
-  const pager = await client.indexes.indexedAssets.list(indexId, { pageLimit: 50, sortOption: "desc" });
-  const check = (ia) => {
-    if (ia?.status !== "ready" || !ia?.id || !ia?.assetId) return null;
-    const meta = ia.systemMetadata || {};
-    if (meta.filename !== filename) return null;
-    if (size && meta.size && meta.size !== size) return null;
-    return ia;
-  };
-  for await (const ia of pager) {
-    const hit = check(ia);
-    if (hit) return hit;
-  }
-  while (pager.hasNextPage()) {
-    await pager.getNextPage();
-    for (const ia of pager.data || []) {
-      const hit = check(ia);
-      if (hit) return hit;
-    }
-  }
-  return null;
-}
-
 async function finalizeIndexEntry({ client, indexId, fileId, fingerprint, assetId, indexedAssetId, log }) {
   const videoId = (await resolveVideoId(client, indexId, assetId, log)) || indexedAssetId;
   const entry = {
@@ -494,14 +471,15 @@ export async function localizeBeatsWithTwelveLabs({
   log,
 }) {
   const maxBeats = Math.max(0, Number(process.env.TWELVELABS_MAX_BEATS) || scenes.length);
-  const maxRank = Math.max(1, Number(process.env.TWELVELABS_MAX_RANK) || 3);
+  const maxRank = Math.max(1, Number(process.env.TWELVELABS_MAX_RANK) || 6);
   const minWindowSec = Math.max(6, Number(process.env.TWELVELABS_MIN_WINDOW_SEC) || 8);
+  const protectMaxReloc = Math.max(15, Number(process.env.TWELVELABS_PROTECT_MAX_RELOC_SEC) || 90);
+  const chronoSlackSec = Math.max(0, Number(process.env.TWELVELABS_CHRONO_SLACK_SEC) || 15);
   const COVERAGE_TARGET = 1.2;
   const MAX_SPAN_SEC = 300;
 
   const _preSpanScenes = scenes.map((sc) => ({ ...sc }));
   let attempted = 0, applied = 0, rejected = 0, failed = 0, skipped = 0;
-  let _lastAcceptedCenter = -Infinity;
   const outScenes = scenes.map((sc) => ({ ...sc }));
   const searchDelayMs = Math.max(0, Number(process.env.TWELVELABS_SEARCH_DELAY_MS) || 250);
 
@@ -543,18 +521,22 @@ export async function localizeBeatsWithTwelveLabs({
       const center = v.center;
       if (isProtected) {
         const origCenter = (Number(_preSpanScenes[i].startSec) + Number(_preSpanScenes[i].endSec)) / 2;
-        if (Math.abs(center - origCenter) > 45) {
+        if (Math.abs(center - origCenter) > protectMaxReloc) {
           log?.(`[render ${jobId}] TLABS beat ${i}: protected relocation ${Math.abs(center - origCenter).toFixed(1)}s — rejected`);
           rejected++;
           continue;
         }
       }
-      if (center < _lastAcceptedCenter + 0.5) {
-        log?.(`[render ${jobId}] TLABS beat ${i}: chronological guard — rejected`);
+      // Compare to previous beat's footage position (Claude or TL), not last TL-only accept.
+      const prevCenter = i > 0
+        ? (Number(outScenes[i - 1].focusSec)
+          || (Number(outScenes[i - 1].startSec) + Number(outScenes[i - 1].endSec)) / 2)
+        : 0;
+      if (center < prevCenter - chronoSlackSec) {
+        log?.(`[render ${jobId}] TLABS beat ${i}: chronological guard (${center.toFixed(1)}s < prev ${prevCenter.toFixed(1)}s) — rejected`);
         rejected++;
         continue;
       }
-      _lastAcceptedCenter = center;
 
       let finalStart = v.startSec;
       let finalEnd = v.endSec;

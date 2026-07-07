@@ -555,7 +555,7 @@ app.get("/health", (_req, res) => {
 
   res.json({
     ok: true,
-    version: "3.2.1",
+    version: "3.2.3",
     serverTranscription: Boolean(SERVER_OPENAI_KEY),
     serverAnalysis: Boolean(SERVER_ANTHROPIC_KEY),
     serverModel: SERVER_ANTHROPIC_MODEL || null,
@@ -4705,9 +4705,10 @@ async function runRenderFromIngest(jobId, {
         beats = kept;
 
         // ── NARRATION CONTINUITY REWRITE ────────────────────────────────────
-        // v3.1.2: always run narration continuity — skipping it caused abrupt
-        // beat-to-beat jumps (user report). Twelve Labs text search tolerates
-        // light bridging clauses; visual matching runs after TTS anyway.
+        // Off by default — preserves analyze/Replit narration verbatim.
+        // Set NARRATION_CONTINUITY_ENABLED=1 to add light transition bridging.
+        const _contEnabled = String(process.env.NARRATION_CONTINUITY_ENABLED ?? "0").toLowerCase();
+        if (_contEnabled === "1" || _contEnabled === "true") {
         if (beats.length >= 3 && beats.length <= 150 && (SERVER_ANTHROPIC_KEY || SERVER_GEMINI_KEY)) {
           try {
             const _origNarrations = beats.map((b) => String(b.narration || b.reason || "").trim());
@@ -4772,6 +4773,9 @@ Return JSON only, no markdown, in this exact shape:
           } catch (contErr) {
             console.warn(`[render ${jobId}] NARRATION-CONTINUITY: skipped (non-fatal):`, contErr?.message || contErr);
           }
+        }
+        } else {
+          console.log(`[render ${jobId}] NARRATION-CONTINUITY: off (using analyze narration as-is)`);
         }
         // ── END NARRATION CONTINUITY REWRITE ────────────────────────────────
       } else {
@@ -5194,6 +5198,7 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
               startSec: Number(sc.startSec),
               endSec: Number(sc.endSec),
               ...(Number.isFinite(sc.focusSec) ? { focusSec: sc.focusSec } : {}),
+              ...(typeof sc.reason === "string" && sc.reason ? { reason: sc.reason } : {}),
               // sceneIds are stale after relocation — gap-fill Step 3 must not
               // borrow "adjacent" scenes relative to the OLD location.
               ...(relocated ? { sceneIds: [], _relocated: true } : {}),
