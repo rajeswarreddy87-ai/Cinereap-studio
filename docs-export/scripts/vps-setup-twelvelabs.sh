@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# One-shot VPS setup: deploy v3.2.0 Twelve Labs SDK + disable GSPAN/SigLIP.
+# Usage (on VPS):
+#   export TWELVELABS_API_KEY='tlk_...'
+#   bash scripts/vps-setup-twelvelabs.sh
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+ROOT="$(pwd)"
+
+if [ -z "${TWELVELABS_API_KEY:-}" ]; then
+  echo "ERROR: set TWELVELABS_API_KEY before running this script."
+  exit 1
+fi
+
+ENV_FILE="${ENV_FILE:-$ROOT/.env}"
+touch "$ENV_FILE"
+
+upsert_env() {
+  local key="$1" val="$2"
+  if grep -q "^${key}=" "$ENV_FILE" 2>/dev/null; then
+    sed -i "s|^${key}=.*|${key}=${val}|" "$ENV_FILE"
+  else
+    echo "${key}=${val}" >> "$ENV_FILE"
+  fi
+}
+
+echo "== updating .env =="
+upsert_env "TWELVELABS_API_KEY" "$TWELVELABS_API_KEY"
+upsert_env "TWELVELABS_ENABLED" "1"
+upsert_env "GEMINI_SPAN_LOCALIZATION" "0"
+upsert_env "CLIP_SIDECAR_ENABLED" "0"
+
+mkdir -p src/lib storage/twelvelabs-cache
+
+for f in index.js lib/twelvelabs.js; do
+  if [ -f "src/$f" ]; then
+    echo "  src/$f present"
+  fi
+done
+
+if [ -f start.sh ]; then chmod +x start.sh; fi
+
+echo "== rebuild image (twelvelabs-js SDK) =="
+if docker compose build render; then
+  echo "  image build ok"
+else
+  echo "  WARN: image build failed — will npm install after restart"
+fi
+
+echo "== restart container =="
+docker compose up -d --force-recreate render
+
+echo "== syntax gate =="
+sleep 5
+docker compose exec -T render node --check src/index.js
+docker compose exec -T render node --check src/lib/twelvelabs.js
+docker compose exec -T render node -e "import('twelvelabs-js').then(() => console.log('twelvelabs-js ok'))"
+
+echo "== health =="
+sleep 12
+curl -s --max-time 15 http://localhost:4040/health | python3 -m json.tool 2>/dev/null | head -35 || curl -s http://localhost:4040/health | head -c 500
+echo
+echo "== done: expect version 3.2.0, twelvelabsSdk true =="
