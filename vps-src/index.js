@@ -555,7 +555,7 @@ app.get("/health", (_req, res) => {
 
   res.json({
     ok: true,
-    version: "3.2.0",
+    version: "3.2.1",
     serverTranscription: Boolean(SERVER_OPENAI_KEY),
     serverAnalysis: Boolean(SERVER_ANTHROPIC_KEY),
     serverModel: SERVER_ANTHROPIC_MODEL || null,

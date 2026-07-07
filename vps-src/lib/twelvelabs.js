@@ -9,7 +9,7 @@ import { TwelveLabs } from "twelvelabs-js";
 
 const MULTIPART_UPLOAD_MAX = 4 * 1024 * 1024 * 1024; // 4 GB
 const POLL_INTERVAL_MS = 5000;
-const INDEX_POLL_MAX_MS = 45 * 60 * 1000; // 45 min for long films
+const ASSET_POLL_MAX_MS = 30 * 60 * 1000; // 30 min post-upload asset processing
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
@@ -17,6 +17,15 @@ function sleep(ms) {
 
 function createClient(apiKey) {
   return new TwelveLabs({ apiKey });
+}
+
+/** Marengo indexing for a ~2h film can take 2–3h; default 3h, overridable via env. */
+function indexPollMaxMs(fileSizeBytes = 0) {
+  const env = Number(process.env.TWELVELABS_INDEX_POLL_MAX_MS);
+  if (Number.isFinite(env) && env > 0) return env;
+  const base = 180 * 60 * 1000; // 3 hours
+  if (fileSizeBytes > 1.5e9) return Math.max(base, 210 * 60 * 1000); // 3.5h for 1.5GB+
+  return base;
 }
 
 async function fileFingerprint(filePath) {
@@ -71,7 +80,7 @@ async function ensureSharedIndex(client, apiKey, cacheDir, log) {
   return indexId;
 }
 
-async function waitForAssetReady(client, assetId, log, maxMs = INDEX_POLL_MAX_MS) {
+async function waitForAssetReady(client, assetId, log, maxMs = ASSET_POLL_MAX_MS) {
   const start = Date.now();
   while (Date.now() - start < maxMs) {
     const asset = await client.assets.retrieve(assetId);
@@ -116,16 +125,22 @@ async function uploadAsset(client, filePath, log) {
   return assetId;
 }
 
-async function waitForIndexedAsset(client, indexId, indexedAssetId, log) {
+async function waitForIndexedAsset(client, indexId, indexedAssetId, log, maxMs) {
+  const pollMax = maxMs || indexPollMaxMs();
   const start = Date.now();
-  while (Date.now() - start < INDEX_POLL_MAX_MS) {
+  let polls = 0;
+  while (Date.now() - start < pollMax) {
     const ia = await client.indexes.indexedAssets.retrieve(indexId, indexedAssetId);
     if (ia?.status === "ready") return ia;
     if (ia?.status === "failed") throw new Error(`TwelveLabs indexing failed for ${indexedAssetId}`);
-    log?.(`Twelve Labs: indexing (${ia?.status || "processing"})…`);
+    polls++;
+    if (polls === 1 || polls % 12 === 0) {
+      const elapsedMin = Math.round((Date.now() - start) / 60000);
+      log?.(`Twelve Labs: indexing (${ia?.status || "processing"})… ${elapsedMin}m elapsed`);
+    }
     await sleep(POLL_INTERVAL_MS);
   }
-  throw new Error(`TwelveLabs indexing timed out for ${indexedAssetId}`);
+  throw new Error(`TwelveLabs indexing timed out for ${indexedAssetId} after ${Math.round(pollMax / 60000)}m`);
 }
 
 async function resolveVideoId(client, indexId, assetId, log) {
@@ -143,32 +158,31 @@ async function resolveVideoId(client, indexId, assetId, log) {
   return null;
 }
 
-/**
- * Ensure the movie is uploaded and indexed. Returns cache entry or null on failure.
- */
-export async function ensureMovieIndexed({ apiKey, cacheDir, sourcePath, fileId, log }) {
-  if (!apiKey) return null;
-  const fingerprint = await fileFingerprint(sourcePath);
-  const cached = await loadCache(cacheDir, fileId);
-  if (cached?.fingerprint === fingerprint && cached?.indexId && cached?.videoId) {
-    log?.(`Twelve Labs: cache hit for ${fileId} (video ${cached.videoId})`);
-    return cached;
+async function findReadyIndexedAsset(client, indexId, { filename, size }) {
+  const pager = await client.indexes.indexedAssets.list(indexId, { pageLimit: 50, sortOption: "desc" });
+  const check = (ia) => {
+    if (ia?.status !== "ready" || !ia?.id || !ia?.assetId) return null;
+    const meta = ia.systemMetadata || {};
+    if (meta.filename !== filename) return null;
+    if (size && meta.size && meta.size !== size) return null;
+    return ia;
+  };
+  for await (const ia of pager) {
+    const hit = check(ia);
+    if (hit) return hit;
   }
+  while (pager.hasNextPage()) {
+    await pager.getNextPage();
+    for (const ia of pager.data || []) {
+      const hit = check(ia);
+      if (hit) return hit;
+    }
+  }
+  return null;
+}
 
-  const client = createClient(apiKey);
-  const indexId = await ensureSharedIndex(client, apiKey, cacheDir, log);
-  log?.(`Twelve Labs: uploading ${path.basename(sourcePath)}…`);
-  const assetId = await uploadAsset(client, sourcePath, log);
-  await waitForAssetReady(client, assetId, log);
-
-  log?.("Twelve Labs: starting Marengo indexing…");
-  const indexed = await client.indexes.indexedAssets.create(indexId, { assetId });
-  const indexedAssetId = indexed?.id;
-  if (!indexedAssetId) throw new Error("TwelveLabs indexed-asset create returned no id");
-
-  await waitForIndexedAsset(client, indexId, indexedAssetId, log);
+async function finalizeIndexEntry({ client, indexId, fileId, fingerprint, assetId, indexedAssetId, log }) {
   const videoId = (await resolveVideoId(client, indexId, assetId, log)) || indexedAssetId;
-
   const entry = {
     fileId,
     fingerprint,
@@ -178,8 +192,83 @@ export async function ensureMovieIndexed({ apiKey, cacheDir, sourcePath, fileId,
     videoId,
     indexedAt: Date.now(),
   };
+  return entry;
+}
+
+/**
+ * Ensure the movie is uploaded and indexed. Returns cache entry or null on failure.
+ */
+export async function ensureMovieIndexed({ apiKey, cacheDir, sourcePath, fileId, log }) {
+  if (!apiKey) return null;
+  const fingerprint = await fileFingerprint(sourcePath);
+  const st = await fs.stat(sourcePath);
+  const filename = path.basename(sourcePath);
+  const pollMax = indexPollMaxMs(st.size);
+
+  const cached = await loadCache(cacheDir, fileId);
+  if (cached?.fingerprint === fingerprint && cached?.indexId && cached?.videoId) {
+    log?.(`Twelve Labs: cache hit for ${fileId} (video ${cached.videoId})`);
+    return cached;
+  }
+
+  const client = createClient(apiKey);
+  const indexId = cached?.indexId || await ensureSharedIndex(client, apiKey, cacheDir, log);
+
+  // Resume in-progress indexing from partial cache (avoids re-upload).
+  if (cached?.fingerprint === fingerprint && cached?.indexedAssetId && cached?.assetId) {
+    log?.(`Twelve Labs: resuming indexing for ${fileId} (indexed-asset ${cached.indexedAssetId})…`);
+    try {
+      const ready = await waitForIndexedAsset(client, indexId, cached.indexedAssetId, log, pollMax);
+      if (ready?.status === "ready") {
+        const entry = await finalizeIndexEntry({
+          client, indexId, fileId, fingerprint,
+          assetId: cached.assetId,
+          indexedAssetId: cached.indexedAssetId,
+          log,
+        });
+        await saveCache(cacheDir, fileId, entry);
+        log?.(`Twelve Labs: resumed index ready → video ${entry.videoId}`);
+        return entry;
+      }
+    } catch (e) {
+      log?.(`Twelve Labs: resume failed (${e?.message || e}) — checking platform index…`);
+    }
+  }
+
+  // Platform already has a ready index for this file (e.g. prior render timed out).
+  const existing = await findReadyIndexedAsset(client, indexId, { filename, size: st.size });
+  if (existing) {
+    log?.(`Twelve Labs: found existing ready index for ${filename} (${existing.id})`);
+    const entry = await finalizeIndexEntry({
+      client, indexId, fileId, fingerprint,
+      assetId: existing.assetId,
+      indexedAssetId: existing.id,
+      log,
+    });
+    await saveCache(cacheDir, fileId, entry);
+    log?.(`Twelve Labs: using existing index → video ${entry.videoId}`);
+    return entry;
+  }
+
+  log?.(`Twelve Labs: uploading ${filename}…`);
+  const assetId = await uploadAsset(client, sourcePath, log);
+  await waitForAssetReady(client, assetId, log);
+
+  log?.("Twelve Labs: starting Marengo indexing…");
+  const indexed = await client.indexes.indexedAssets.create(indexId, { assetId });
+  const indexedAssetId = indexed?.id;
+  if (!indexedAssetId) throw new Error("TwelveLabs indexed-asset create returned no id");
+
+  await saveCache(cacheDir, fileId, {
+    fileId, fingerprint, indexId, assetId, indexedAssetId, status: "indexing", startedAt: Date.now(),
+  });
+
+  await waitForIndexedAsset(client, indexId, indexedAssetId, log, pollMax);
+  const entry = await finalizeIndexEntry({
+    client, indexId, fileId, fingerprint, assetId, indexedAssetId, log,
+  });
   await saveCache(cacheDir, fileId, entry);
-  log?.(`Twelve Labs: indexed ${fileId} → video ${videoId}`);
+  log?.(`Twelve Labs: indexed ${fileId} → video ${entry.videoId}`);
   return entry;
 }
 
