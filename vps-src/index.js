@@ -560,7 +560,7 @@ app.get("/health", (_req, res) => {
 
   res.json({
     ok: true,
-    version: "3.3.1",
+    version: "4.0.0",
     serverTranscription: Boolean(SERVER_OPENAI_KEY),
     serverAnalysis: Boolean(SERVER_ANTHROPIC_KEY),
     serverModel: SERVER_ANTHROPIC_MODEL || null,
@@ -600,7 +600,7 @@ app.get("/health", (_req, res) => {
       "ai-thumbnails",      // new in 2.6.0 — DALL-E thumbnail generation via server key
       "translate-transcript", // new in 2.5.0 — Whisper translation endpoint for non-English films
       "uncapped-narration", // new in 2.5.0 — full-length narration, no word-count ceiling
-      "twelvelabs-visual-match", // v3.2.0 — Twelve Labs Marengo via official twelvelabs-js SDK
+      "locked-windows",     // v4.0.0 — construction-based sync: footage cut from the exact analyzed scene windows, no visual search
       "multi-tts",          // new in 2.7.0 — ttsProvider field selects speechify|openai|elevenlabs|hume
       "storage-api",        // new in 2.7.0 — GET /system/storage, DELETE /system/clear-renders
       "source-download",    // new in 2.7.0 — GET /uploads/:fileId/download
@@ -2205,26 +2205,9 @@ app.post("/analyze", requireAuth, async (req, res) => {
         // when yt-dlp produced an HLS-merged MP4 with a wrong moov duration.
         const effectiveDuration = (sceneDuration > 0) ? sceneDuration : duration;
 
-        // Start Pegasus split-index in parallel with Claude analysis for feature films (> 60 min).
-        // The analyze job will NOT complete until chapters are available — stored as a promise
-        // and awaited below after Claude finishes. Both parts index simultaneously inside
-        // splitAndIndexWithPegasus via Promise.all, halving the per-part wait time.
-        if (effectiveDuration > 3600 && SERVER_TWELVELABS_KEY) {
-          console.log(`[analyze ${jobId}] PEGASUS-SPLIT: starting split-index (${effectiveDuration.toFixed(0)}s) in parallel with Claude analysis…`);
-          _pegasusSplitPromise = splitAndIndexWithPegasus({
-            apiKey: SERVER_TWELVELABS_KEY,
-            cacheDir: TWELVELABS_CACHE_DIR,
-            fileId,
-            filePath,
-            duration: effectiveDuration,
-            log: (msg) => {
-              console.log(`[analyze ${jobId}] ${msg}`);
-              jobStore.update(jobId, { message: msg }).catch(() => {});
-            },
-          }).catch((e) => {
-            console.warn(`[analyze ${jobId}] PEGASUS-SPLIT: failed (non-fatal): ${e?.message}`);
-          });
-        }
+        // v4.0.0 LOCKED-WINDOWS: Pegasus split-indexing removed. Narration is
+        // authored FROM the analyzed scene frames, so footage location is known
+        // by construction — no video-search index is needed at render time.
 
         if (!scenes || scenes.length < 6) throw new Error(`only ${scenes ? scenes.length : 0} scenes detected`);
         if (await isJobSuperseded(jobId)) { console.log(`[analyze ${jobId}] superseded after scene detection — aborting before AI calls`); return; }
@@ -4561,21 +4544,10 @@ async function runRenderFromIngest(jobId, {
                 let resolvedEnd = _ceilAL > 0
                   ? Math.min(lastSc.endSec, _ceilAL) : lastSc.endSec;
 
-                // ChatGPT pipeline: confidence < 0.7 → expand window to adjacent scenes.
-                // Low confidence means Claude is uncertain the narration matches this footage;
-                // a larger pool gives buildSyncedTimeline better clip options to choose from.
-                const conf = Number.isFinite(Number(b.confidence)) ? Number(b.confidence) : 1.0;
-                if (conf < 0.7 && _scenesMap) {
-                  const lastUsedId = b.sceneIds[b.sceneIds.length - 1];
-                  const expandIds = [lastUsedId + 1, lastUsedId + 2].filter((id) => _scenesMap.has(id));
-                  for (const eid of expandIds) {
-                    const esc = _scenesMap.get(eid);
-                    if (esc) resolvedEnd = Math.max(resolvedEnd, _ceilAL > 0 ? Math.min(esc.endSec, _ceilAL) : esc.endSec);
-                  }
-                  if (expandIds.length > 0) {
-                    console.log(`[render ${jobId}] FIX-B: beat ${i} confidence=${conf.toFixed(2)} < 0.7 — expanded window +${expandIds.length} adjacent scenes`);
-                  }
-                }
+                // v4.0.0 LOCKED-WINDOWS: no low-confidence expansion into adjacent
+                // scenes. The beat window is exactly the detected scene(s) whose
+                // frames Claude was looking at when it wrote this narration —
+                // expanding it pulls in footage the narration never described.
 
                 _sceneIdsResolved.count++;
                 return {
@@ -4918,13 +4890,20 @@ Return JSON only, no markdown, in this exact shape:
     // Mismatch between narration and footage is structurally impossible.
     if (HOOK_V2 && Array.isArray(beats) && beats.length >= 5 && (SERVER_ANTHROPIC_KEY || SERVER_OPENAI_KEY)) {
       try {
-        // Step 1: score each beat
+        // v4.0.0: hard credits floor for hook footage. Any beat whose window
+        // starts inside the first HOOK_MIN_START_SEC of the film is excluded
+        // from the hook candidate pool AND from Claude's returned sourceBeatIds
+        // — studio logos / opening titles can never appear in the cold open.
+        const HOOK_MIN_START_SEC = Math.max(0, Number(process.env.HOOK_MIN_START_SEC) || 120);
+        const _hv2PastCredits = (idx) => Number(beats[idx]?.startSec || 0) >= HOOK_MIN_START_SEC;
+
+        // Step 1: score each beat (credits-region beats excluded)
         const _hv2Scored = beats.map((b, i) => {
           const imp = +(b.importance    || 0);
           const emo = +(b.emotionScore  || imp);
           const sur = +(b.surpriseScore || imp);
           return { _idx: i, hookScore: imp * 0.60 + emo * 0.30 + sur * 0.10 };
-        });
+        }).filter(({ _idx }) => _hv2PastCredits(_idx));
 
         // Step 2: top 8 by hookScore, restore chronological order.
         // FIX: Beats sent from the app often lack importance/emotionScore/surpriseScore
@@ -5020,9 +4999,11 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
           } catch {}
           if (_hv2Json?.hookText) {
             _hookText = String(_hv2Json.hookText).trim();
-            // Validate returned beat IDs against actual beats array bounds
+            // Validate returned beat IDs against actual beats array bounds AND
+            // the credits floor (Claude occasionally references beats outside
+            // the offered list — never let those pull logo/title footage).
             const _rawIds = Array.isArray(_hv2Json.sourceBeatIds)
-              ? _hv2Json.sourceBeatIds.map(Number).filter(n => Number.isFinite(n) && n >= 0 && n < beats.length)
+              ? _hv2Json.sourceBeatIds.map(Number).filter(n => Number.isFinite(n) && n >= 0 && n < beats.length && _hv2PastCredits(n))
               : [];
             _hookV2BeatIds = _rawIds.length > 0 ? _rawIds : _hv2Top.map(x => x._idx);
             console.log(`[render ${jobId}] HOOK-V2: "${_hookText.slice(0, 70)}..." sourceBeatIds=[${_hookV2BeatIds.join(",")}]`);
@@ -5193,19 +5174,26 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
               return { ...b, slowFactor: ratio };
             }
 
-            // Severe mismatch (>30% short): slow-mo would be too obvious.
-            // Expand the footage window by borrowing from the next 1-2 beats instead.
-            // Safe because the forward cursor is monotonic — adjacent beats simply
-            // advance past any borrowed frames.
+            // v4.0.0 LOCKED-WINDOWS: severe mismatch (>30% short). Extend ONLY
+            // into the unclaimed gap between this beat's window end and the NEXT
+            // beat's window start — that is contiguous continuation of the same
+            // scene region and belongs to no other beat. Never borrow the next
+            // beats' own windows (that showed their footage under this beat's
+            // narration — the old "wrong scene" bug). Any remaining shortfall is
+            // covered by slow-mo (≥0.70×) plus the mux hold-frame tail.
             const targetEnd = Number(b.startSec) + tts * 1.2;
-            const nextEnd = i + 1 < beats.length ? Number(beats[i + 1].endSec) : safeCeiling;
-            const farEnd  = i + 2 < beats.length ? Number(beats[i + 2].endSec) : nextEnd;
-            const newEnd = Math.min(targetEnd, Math.max(nextEnd, farEnd), safeCeiling || targetEnd + 60);
-            if (newEnd > Number(b.endSec) + 0.5) {
-              expanded++;
-              return { ...b, endSec: newEnd };
+            const nextStart = i + 1 < beats.length ? Number(beats[i + 1].startSec) : (safeCeiling || targetEnd);
+            const newEnd = Math.min(targetEnd, Math.max(Number(b.endSec), nextStart), safeCeiling || targetEnd);
+            const grew = newEnd > Number(b.endSec) + 0.5;
+            const newWin = Math.max(0, newEnd - Number(b.startSec));
+            const newRatio = tts > 0 ? newWin / tts : 1;
+            if (grew) expanded++;
+            if (newRatio < 1.05) {
+              // Still short after gap extension — add capped slow-mo on top.
+              slowMo++;
+              return { ...b, ...(grew ? { endSec: newEnd } : {}), slowFactor: Math.max(0.70, Math.min(1, newRatio)) };
             }
-            return b;
+            return grew ? { ...b, endSec: newEnd } : b;
           });
           const parts = [];
           if (expanded > 0) parts.push(`${expanded} window-expanded`);
@@ -5219,312 +5207,22 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
         let scenes = beats.map((b) => ({ startSec: Number(b.startSec), endSec: Number(b.endSec), reason: b.reason || b.narration || "" }));
         const beatTexts = beats.map((b) => (typeof b.narration === "string" ? b.narration : ""));
 
-        // Protected story beats (death/funeral/climax/etc.) stay anchored to
-        // their analyzed window and are NOT moved by any visual-matching pass.
-        const isProtectedBeatForVisual = (b) => {
-          const _t = String((b && (b.narration || b.reason)) || "").toLowerCase();
-          if (!_t) return false;
-          return /\b(funeral|cemetery|grave|burial|coffin|casket|death|dies|died|dead|killed|kill|murder|shot|shoot|gun|blood|hospital|coma|dying|overdose|suicide|grief|mourn|cry|tears|climax|final\s*(fight|round|bout)|championship|knockout|crash|accident)\b/i.test(_t);
-        };
-        const protectedVisualBeats = beats.map(isProtectedBeatForVisual);
-
-
-        // ── TWELVE LABS MARENGO VISUAL MATCHING (primary) ────────────────────
-        // Text search per beat against a Marengo-indexed copy of the movie.
-        // GSPAN (Gemini span-localization) and SigLIP/CLIP are disabled — see v3.1.0.
-
-        /**
-         * Rebase beat windows that landed in the opening credits section to the
-         * correct story chapters detected by Pegasus. Only beats whose midpoint
-         * sits before creditThreshold are rebased; all others are left unchanged.
-         * Matching is by keyword overlap between beat narration and chapter summaries,
-         * with a mild chronological bias so earlier beats prefer earlier chapters.
-         */
-        function rebaseBeatWindowsWithChapters(beatsArr, chapters, movDur) {
-          if (!Array.isArray(chapters) || chapters.length === 0) return beatsArr;
-          const CRED_RE = /credit|title\s*card|production\s*compan|studio\s*logo|opening\s*title/i;
-          const storyChapters = chapters.filter((c) => !CRED_RE.test(`${c.title} ${c.summary}`));
-          if (storyChapters.length === 0) return beatsArr;
-          const storyStartSec = storyChapters[0].start;
-          const creditThreshold = Math.min(storyStartSec + 60, movDur * 0.12);
-          let rebased = 0;
-          const out = beatsArr.map((beat, bi) => {
-            const beatMid = (Number(beat.startSec) + Number(beat.endSec)) / 2;
-            if (beatMid >= creditThreshold) return beat;
-            const narr = (beat.narration || beat.reason || "").toLowerCase();
-            const beatTokens = narr.match(/\b\w{4,}\b/g) || [];
-            let bestCh = storyChapters[0];
-            let bestScore = -1;
-            storyChapters.forEach((ch, ci) => {
-              const chText = `${ch.title} ${ch.summary}`.toLowerCase();
-              const chToks = chText.match(/\b\w{4,}\b/g) || [];
-              const hits = beatTokens.filter((t) => chToks.includes(t)).length;
-              const chronoBias = 1 - (bi / beatsArr.length) * (ci / storyChapters.length) * 0.3;
-              const score = beatTokens.length > 0 ? (hits / beatTokens.length) * chronoBias : 0;
-              if (score > bestScore) { bestScore = score; bestCh = ch; }
-            });
-            rebased++;
-            console.log(`[render ${jobId}] PEGASUS-REBASE: beat ${bi} credits-window → chapter "${bestCh.title}" (${bestCh.start.toFixed(0)}-${bestCh.end.toFixed(0)}s)`);
-            return { ...beat, startSec: bestCh.start, endSec: bestCh.end };
-          });
-          if (rebased > 0) console.log(`[render ${jobId}] PEGASUS-REBASE: rebased ${rebased} credit-window beat(s) to story chapters`);
-          return out;
-        }
-
-        if (isTwelveLabsEnabled() && SERVER_TWELVELABS_KEY) {
-          const sourceFileId = path.basename(sourcePath);
-          const _tlLog = (msg) => console.log(typeof msg === "string" ? msg : String(msg));
-          try {
-            await jobStore.update(jobId, { message: "Indexing movie with Twelve Labs Marengo (one-time per file)…" });
-            const indexEntry = await ensureMovieIndexed({
-              apiKey: SERVER_TWELVELABS_KEY,
-              cacheDir: TWELVELABS_CACHE_DIR,
-              sourcePath,
-              fileId: sourceFileId,
-              log: (msg) => {
-                _tlLog(msg);
-                jobStore.update(jobId, { message: msg }).catch(() => {});
-              },
-            });
-            if (indexEntry) {
-              // ── PEGASUS SIDECAR ─────────────────────────────────────────────
-              // For feature films (> 60 min): read the split chapters cached by
-              // the analyze step's background task and rebase any credit-window
-              // beats BEFORE Marengo search so the search lands on the correct
-              // region of the film.
-              // For short films (≤ 60 min): use the single-index Pegasus path.
-              const _pegLog = (msg) => console.log(typeof msg === "string" ? msg : String(msg));
-              let _pegChapters = null;
-              const _movDur = srcDur || sourceDurationSec || 0;
-              try {
-                if (_movDur > 3600) {
-                  // Feature film — read split chapters cache (written by analyze-time background task)
-                  const _splitCachePath = path.join(TWELVELABS_CACHE_DIR, `${sourceFileId}-pegasus-split.json`);
-                  const _splitCached = await fsp.readFile(_splitCachePath, "utf8").then(JSON.parse).catch(() => null);
-                  if (Array.isArray(_splitCached?.combinedChapters) && _splitCached.combinedChapters.length > 0) {
-                    _pegChapters = _splitCached.combinedChapters;
-                    console.log(`[render ${jobId}] PEGASUS-SPLIT: using ${_pegChapters.length} cached chapters`);
-                  } else {
-                    console.log(`[render ${jobId}] PEGASUS-SPLIT: chapters not yet ready — split-index started at analyze time, will be available next render`);
-                  }
-                } else {
-                  // Short film — single-index Pegasus path
-                  const _pegCachePath = path.join(TWELVELABS_CACHE_DIR, `${sourceFileId}-pegasus.json`);
-                  const _pegCached = await fsp.readFile(_pegCachePath, "utf8").then(JSON.parse).catch(() => null);
-                  if (_pegCached?.pegasusIndexId && _pegCached?.pegasusVideoId) {
-                    _pegChapters = await getPegasusChapters({
-                      apiKey: SERVER_TWELVELABS_KEY,
-                      videoId: _pegCached.pegasusVideoId,
-                      cacheDir: TWELVELABS_CACHE_DIR,
-                      fileId: sourceFileId,
-                      log: _pegLog,
-                    });
-                  } else {
-                    console.log(`[render ${jobId}] PEGASUS: starting background Pegasus indexing (chapters ready next render)…`);
-                    ensurePegasusIndexed({
-                      apiKey: SERVER_TWELVELABS_KEY,
-                      cacheDir: TWELVELABS_CACHE_DIR,
-                      fileId: sourceFileId,
-                      assetId: indexEntry.assetId,
-                      log: _pegLog,
-                    }).catch((e) => console.warn(`[render ${jobId}] PEGASUS: background indexing failed: ${e?.message}`));
-                  }
-                }
-                if (_pegChapters) scenes = rebaseBeatWindowsWithChapters(scenes, _pegChapters, _movDur);
-              } catch (_pegErr) {
-                console.warn(`[render ${jobId}] PEGASUS: sidecar error (non-fatal): ${_pegErr?.message}`);
-              }
-              // ── END PEGASUS SIDECAR ─────────────────────────────────────────
-
-              await jobStore.update(jobId, { message: `Twelve Labs: searching ${scenes.length} beats for visual matches…` });
-
-              // ── CLIP TIER-D: pre-embed frames into sidecar before beat search ──
-              // When CLIP_SIDECAR_ENABLED=1, load the analyze-phase JPEG frames
-              // from frames-{_analyzeJobId}/ into the Python ViT-B-32 sidecar so
-              // Tier D can call /match per-beat without re-embedding every call.
-              // /embed-job is idempotent — safe to call even if already cached.
-              let _clipSidecarActive = null; // non-null only if embed succeeded
-              const _clipEnabled = String(process.env.CLIP_SIDECAR_ENABLED || "0").toLowerCase() === "1";
-              if (_clipEnabled && _analyzeJobId) {
-                try {
-                  let _clipFramesDir = path.join(UPLOADS_DIR, `frames-${_analyzeJobId}`);
-                  let _clipFrameFiles = (await fsp.readdir(_clipFramesDir).catch(() => [])).filter((f) => f.endsWith(".jpg")).sort();
-                  if (_clipFrameFiles.length === 0) {
-                    console.log(`[render ${jobId}] CLIP-D: no frames in frames-${_analyzeJobId}/ — Tier D unavailable`);
-                  } else {
-                    const _metaPath = path.join(_clipFramesDir, "clip-metadata.json");
-                    let _clipFrames;
-                    try {
-                      const _metaItems = JSON.parse(await fsp.readFile(_metaPath, "utf8"));
-                      _clipFrames = _metaItems.filter((m) => m.file && m.timeSec > 0).map((m) => ({ path: path.join(_clipFramesDir, m.file), timeSec: m.timeSec }));
-                      console.log(`[render ${jobId}] CLIP-D: metadata loaded — ${_clipFrames.length} timestamped frames`);
-                    } catch {
-                      const _srcDurForClip = srcDur || sourceDurationSec || 0;
-                      const _step = _srcDurForClip > 0 ? _srcDurForClip / (_clipFrameFiles.length + 1) : 0;
-                      _clipFrames = _step > 0 ? _clipFrameFiles.map((f, fi) => ({ path: path.join(_clipFramesDir, f), timeSec: _step * (fi + 1) })) : [];
-                      console.log(`[render ${jobId}] CLIP-D: no metadata — even-spaced timestamps (${_clipFrames.length} frames)`);
-                    }
-                    const _CLIP_CAP = 350;
-                    if (_clipFrames.length > _CLIP_CAP) {
-                      const _byScene = new Map();
-                      for (const f of _clipFrames) { const k = f.sceneIndex ?? -1; if (!_byScene.has(k)) _byScene.set(k, []); _byScene.get(k).push(f); }
-                      const _sub = [];
-                      for (const g of _byScene.values()) {
-                        if (g.length <= 2) { _sub.push(...g); continue; }
-                        const lo = Math.floor(g.length * 0.25), hi = Math.floor(g.length * 0.75);
-                        _sub.push(g[lo]); if (hi !== lo) _sub.push(g[hi]);
-                      }
-                      console.log(`[render ${jobId}] CLIP-D: ${_clipFrames.length} frames > cap ${_CLIP_CAP} — subsampled to ${_sub.length}`);
-                      _clipFrames = _sub;
-                    }
-                    if (_clipFrames.length > 0) {
-                      const _embedTimeoutMs = Math.min(1_800_000, Math.max(300_000, _clipFrames.length * 800));
-                      const _embedAc = new AbortController();
-                      const _embedTimer = setTimeout(() => _embedAc.abort(), _embedTimeoutMs);
-                      try {
-                        const _embedResp = await fetch(`${CLIP_SIDECAR_URL}/embed-job`, {
-                          method: "POST",
-                          headers: { "Content-Type": "application/json" },
-                          body: JSON.stringify({ jobId: _analyzeJobId, frames: _clipFrames }),
-                          signal: _embedAc.signal,
-                        });
-                        clearTimeout(_embedTimer);
-                        if (_embedResp.ok) {
-                          const _embedData = await _embedResp.json();
-                          if (_embedData.frames > 0) {
-                            _clipSidecarActive = _analyzeJobId;
-                            console.log(`[render ${jobId}] CLIP-D: /embed-job OK — ${_embedData.frames} frames embedded (cached=${_embedData.cached})`);
-                          } else {
-                            console.warn(`[render ${jobId}] CLIP-D: /embed-job returned 0 frames — Tier D disabled`);
-                          }
-                        } else {
-                          console.warn(`[render ${jobId}] CLIP-D: /embed-job HTTP ${_embedResp.status} — Tier D disabled`);
-                        }
-                      } catch (_embedErr) {
-                        clearTimeout(_embedTimer);
-                        console.warn(`[render ${jobId}] CLIP-D: /embed-job error (non-fatal): ${_embedErr?.message}`);
-                      }
-                    }
-                  }
-                } catch (_clipSetupErr) {
-                  console.warn(`[render ${jobId}] CLIP-D: setup error (non-fatal): ${_clipSetupErr?.message}`);
-                }
-              }
-              // ── END CLIP TIER-D pre-embed ──────────────────────────────────────
-
-              const tlResult = await localizeBeatsWithTwelveLabs({
-                jobId,
-                apiKey: SERVER_TWELVELABS_KEY,
-                anthropicApiKey: SERVER_ANTHROPIC_KEY, // VSO conversion + vision verification
-                sourcePath,
-                clipSidecarUrl: _clipSidecarActive ? CLIP_SIDECAR_URL : null,
-                clipAnalyzeJobId: _clipSidecarActive || null,
-                indexEntry,
-                beatTexts,
-                voDurs,
-                scenes,
-                protectedVisualBeats,
-                srcDur: srcDur || sourceDurationSec || 0,
-                pegasusChapters: _pegChapters || [],
-                transcriptSegments,
-                whisperWords: transcriptWords,   // Fix A — word-level timestamps for search anchoring
-                log: _tlLog,
-              });
-              scenes = tlResult.scenes;
-              _tlabsStats = tlResult.stats;
-              _tlabsBeatLog = tlResult.beatLog || [];
-            } else {
-              console.warn(`[render ${jobId}] TLABS: indexing failed — beats keep Claude-assigned windows`);
-            }
-          } catch (tlErr) {
-            console.warn(`[render ${jobId}] TLABS: visual matching failed (non-fatal):`, tlErr?.message || tlErr);
-          }
-        } else if (!SERVER_TWELVELABS_KEY) {
-          console.log(`[render ${jobId}] TLABS: skipped (TWELVELABS_API_KEY not set — add key to .env when ready)`);
-        } else {
-          console.log(`[render ${jobId}] TLABS: skipped (TWELVELABS_ENABLED=0)`);
-        }
-        // ── END TWELVE LABS MARENGO VISUAL MATCHING ──────────────────────────
-
-        // GSPAN disabled in v3.1.0 — Twelve Labs is the sole visual matcher.
-        if (process.env.GEMINI_SPAN_LOCALIZATION === "1") {
-          console.log(`[render ${jobId}] GSPAN: disabled (v3.1.0) — Twelve Labs Marengo handles visual matching`);
-        }
-
-        // ── TEXT-TO-TEXT BEAT NOTE MATCHING (zero cost, last-resort fallback) ─
-        // Uses beat notes Claude already wrote during analyze — no extra API call.
-        // Fires on footage-starved beats OR self-mismatch beats (own reason
-        // doesn't semantically match own narration — see _textMatchBeatNotes
-        // docs). Skips beats already resolved by Twelve Labs above.
-        {
-          const _txtResult = _textMatchBeatNotes(beats, voDurs);
-          if (_txtResult.applied > 0) {
-            scenes = scenes.map((sc, i) => {
-              const _handled = sc.reason && (sc.reason.includes("[tlabs:") || sc.reason.includes("[gspan:"));
-              if (_handled) return sc;
-              return _txtResult.scenes[i];
-            });
-            console.log(
-              `[render ${jobId}] TEXT-MATCH: re-centred ${_txtResult.applied} beat(s) ` +
-              `(footage-starved and/or self-mismatch) using note similarity — ${_txtResult.log.slice(0, 5).join(', ')}` +
-              (_txtResult.log.length > 5 ? ` (+${_txtResult.log.length - 5} more)` : '')
-            );
-          }
-        }
-        // ── END TEXT-TO-TEXT BEAT NOTE MATCHING ──────────────────────────────
-
-        // ── PROPAGATE VISUAL-MATCH CORRECTIONS INTO beats[] ──────────────────
-        // FIX (SYNC-FIXES #6): CLIP and TEXT-MATCH above only updated the local
-        // `scenes[]` array. Three later consumers still read the ORIGINAL,
-        // uncorrected `beats[]` windows: gap-fill Steps 1 & 3 (re-trim extension
-        // footage from beats[i].startSec/sceneIds), HOOK-V2 footage
-        // extraction/logging, and computeSyncScore(). Once Fix 3 revives the
-        // safety net and corrections actually apply, skipping this propagation
-        // would make the MAIN footage come from the corrected location while the
-        // gap-fill TAIL comes from the old wrong location — a hard visual jump
-        // to unrelated footage mid-beat. Merge corrections back so every later
-        // consumer operates on the SAME windows the timeline renders.
-        if (Array.isArray(beats) && beats.length === scenes.length) {
-          beats = beats.map((b, i) => {
-            const sc = scenes[i];
-            if (!sc) return b;
-            // Twelve Labs relocations are tagged `[tlabs:...]`, TEXT-MATCH
-            // relocations are tagged `txt:`. Either means sceneIds are stale
-            const relocated = typeof sc.reason === "string" &&
-              (sc.reason.includes("txt:") || sc.reason.includes("[tlabs:") || sc.reason.includes("[gspan:"));
-            return {
-              ...b,
-              startSec: Number(sc.startSec),
-              endSec: Number(sc.endSec),
-              ...(Number.isFinite(sc.focusSec) ? { focusSec: sc.focusSec } : {}),
-              ...(typeof sc.reason === "string" && sc.reason ? { reason: sc.reason } : {}),
-              // MULTI-EVENT: carry discrete vision-verified sub-clip windows
-              // (see twelvelabs.js) through to planSyncedRender/buildSyncedTimeline.
-              ...(Array.isArray(sc.subWindows) && sc.subWindows.length > 1 ? { subWindows: sc.subWindows } : {}),
-              // sceneIds are stale after relocation — gap-fill Step 3 must not
-              // borrow "adjacent" scenes relative to the OLD location.
-              ...(relocated ? { sceneIds: [], _relocated: true } : {}),
-            };
-          });
-          const _relocCount = beats.filter((b) => b._relocated).length;
-          if (_relocCount > 0) {
-            console.log(`[render ${jobId}] SYNC: propagated ${_relocCount} visual-match relocation(s) into beats[] (gap-fill/hook/sync-score now see corrected windows)`);
-          }
-          // Rebuild scenes[] from corrected beats so focusSec + windows flow into planSyncedRender.
-          scenes = beats.map((b, i) => ({
-            startSec: Number(b.startSec),
-            endSec: Number(b.endSec),
-            reason: scenes[i]?.reason || b.reason || b.narration || "",
-            ...(Number.isFinite(b.focusSec) ? { focusSec: Number(b.focusSec) } : {}),
-            // MULTI-EVENT: carry subWindows through the rebuild too.
-            ...(Array.isArray(b.subWindows) && b.subWindows.length > 1 ? { subWindows: b.subWindows } : {}),
-          }));
-          const _focusCount = scenes.filter((s) => Number.isFinite(s.focusSec)).length;
-          if (_focusCount > 0) {
-            console.log(`[render ${jobId}] SYNC: ${_focusCount} beat(s) have focusSec — timeline will center on Twelve-Labs-matched moments`);
-          }
-        }
-        // ── END PROPAGATE VISUAL-MATCH CORRECTIONS ───────────────────────────
+        // ── LOCKED-WINDOWS (v4.0.0) — construction-based sync ────────────────
+        // The narration for every beat was written by Claude WHILE looking at
+        // frames extracted from that beat's detected scene window. The mapping
+        // narration → footage location is therefore correct BY CONSTRUCTION.
+        // All render-time visual search / relocation stages are removed:
+        //   • Twelve Labs Marengo per-beat search      (v3.1.0–v3.3.1)
+        //   • Pegasus chapter REBASE / NARROW           (v3.3.x — was assigning
+        //     "Opening Titles"/logo chapters to body beats: a credits source)
+        //   • Vision verification loop                  (nothing to verify)
+        //   • CLIP ViT-B-32 Tier-D sidecar              (was subsampling 460→2 frames)
+        //   • TEXT-MATCH beat-note relocation
+        //   • GSPAN Gemini span localization
+        // Footage is cut ONLY from each beat's own analyzed scene window.
+        // Deficits are handled by gentle slow-mo and the mux hold-frame tail —
+        // never by showing another scene's footage.
+        console.log(`[render ${jobId}] LOCKED-WINDOWS: footage locked to analyzed scene windows for ${scenes.length} beats (no visual search)`);
 
         // ── OVERLAP TRIM: resolve adjacent-beat window collisions ─────────────
         // When Twelve Labs relocates a beat backward in time (chronological
@@ -5748,6 +5446,10 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
           // applies dynamic cut timing (2.5s for transitional, 5.0s for climax).
           beatImportances: Array.isArray(beats) ? beats.map((b) => b.importance ?? null) : undefined,
           beatTypes: Array.isArray(beats) ? beats.map((b) => b.beatType ?? null) : undefined,
+          // v4.0.0 LOCKED-WINDOWS: never borrow adjacent scenes in the coverage
+          // pre-pass and never wrap the cursor to another part of the film —
+          // footage deficits hold the last frame instead of showing wrong scenes.
+          lockWindows: true,
         });
         if (Array.isArray(plan.timeline) && plan.timeline.length > 0) {
           const _durLog = (Array.isArray(plan.beatDurations) ? plan.beatDurations : [])
@@ -5808,16 +5510,10 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
           .map(b => `beat${b.i}[tts=${b.ttsDur}s win=${b.win}s → ${b.score}%]`).join(", ");
         console.warn(`[render ${jobId}] LOW COVERAGE BEATS: ${worst}`);
       }
-      if (_tlabsStats && _tlabsStats.attempted > 0) {
-        const _visualPct = Math.round((_tlabsStats.applied / _tlabsStats.attempted) * 100);
-        const _tlabsTagged = beats.filter((b) => String(b.reason || "").includes("[tlabs:")).length;
-        console.log(
-          `[render ${jobId}] VISUAL MATCH (TWELVE LABS): ${_visualPct}% beats localized ` +
-          `(${_tlabsStats.applied}/${_tlabsStats.attempted} applied, ${_tlabsStats.rejected} rejected, ${_tlabsTagged} tagged in beats[])`
-        );
-      } else {
-        console.log(`[render ${jobId}] VISUAL MATCH (TWELVE LABS): not run — beats use Claude-assigned windows only`);
-      }
+      console.log(
+        `[render ${jobId}] VISUAL MATCH: locked-windows — footage cut from the exact ` +
+        `analyzed scene windows (${_sv.n} beats, matched by construction, no search)`
+      );
     } catch (_svErr) {
       console.warn(`[render ${jobId}] sync score error:`, _svErr?.message || _svErr);
     }
@@ -5980,7 +5676,9 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
         _hv2TtsProvider === "hume"       ? (SERVER_HUME_VOICE || "Kora") :
         _hv2TtsProvider === "openai"     ? "onyx" : SERVER_SPEECHIFY_VOICE
       );
-      const _hv2TtsSpeed = (settings && settings.ttsSpeed) || 1.0;
+      // v4.0.0: hook narration runs slightly hotter than the body (cold-open
+      // urgency). Capped at 1.2 which is the provider-safe ceiling.
+      const _hv2TtsSpeed = Math.min(1.2, (((settings && settings.ttsSpeed) || 1.0) * Number(process.env.HOOK_TTS_SPEED_MULT || 1.05)));
 
       // Generate TTS for hook narration
       const _hv2TtsRes = await generatePerBeatTTS(
@@ -5996,25 +5694,56 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
       const _hv2VoiceDur  = await probeDurationSec(_hv2TtsPath);
       console.log(`[render ${jobId}] HOOK-V2 TTS: ${_hv2VoiceDur.toFixed(2)}s — id=${_hv2TtsFileId}`);
 
-      // Trim one clip per sourceBeatId (chronological order preserved by selectHookBeats)
+      // ── v4.0.0 FAST-CUT HOOK FOOTAGE ────────────────────────────────────
+      // Professional cold-open pacing: 1.8–2.5s cuts (vs 3–6s in the body).
+      // Cycle through the source beats, each pass slicing from progressively
+      // deeper offsets inside that beat's OWN window (locked-windows: hook
+      // footage also never leaves the beats the hook text references).
+      // The plan totals voiceDur ± one cut, so hook video ≈ hook audio with
+      // no long tail clip.
+      const HOOK_CUT_SEC = Math.min(2.5, Math.max(1.5, Number(process.env.HOOK_CUT_SEC) || 2.2));
+      const _hv2Segs = [];
+      {
+        const _hv2Wins = _hookV2BeatIds
+          .map((beatIdx) => {
+            const hBeat = beats[beatIdx];
+            if (!hBeat) { console.warn(`[render ${jobId}] HOOK-V2 beat #${beatIdx} not found — skipping`); return null; }
+            const ws = Number(hBeat.startSec || 0);
+            const we = Number(hBeat.endSec || 0);
+            if (!(we - ws >= 0.8)) { console.warn(`[render ${jobId}] HOOK-V2 beat #${beatIdx} too short — skipping`); return null; }
+            return { beatIdx, ws, we, offset: 0 };
+          })
+          .filter(Boolean);
+        if (_hv2Wins.length === 0) throw new Error("All HOOK-V2 beat windows invalid");
+        let _planned = 0;
+        let _guard = 0;
+        while (_planned < _hv2VoiceDur - 0.15 && _guard < 60) {
+          _guard++;
+          let _took = false;
+          for (const w of _hv2Wins) {
+            if (_planned >= _hv2VoiceDur - 0.15) break;
+            const segStart = w.ws + w.offset;
+            const room = w.we - segStart;
+            if (room < 0.8) continue; // window used up for this pass
+            const segLen = Math.min(HOOK_CUT_SEC, room, Math.max(0.8, _hv2VoiceDur - _planned));
+            _hv2Segs.push({ beatIdx: w.beatIdx, startSec: segStart, endSec: segStart + segLen });
+            w.offset += segLen;
+            _planned += segLen;
+            _took = true;
+          }
+          if (!_took) break; // all windows exhausted — mux hold-frame covers the rest
+        }
+        console.log(`[render ${jobId}] HOOK-V2 FAST-CUT: ${_hv2Segs.length} cuts (~${HOOK_CUT_SEC.toFixed(1)}s each) planned=${_planned.toFixed(2)}s voice=${_hv2VoiceDur.toFixed(2)}s from beats [${[..._hv2Segs.reduce((s, g) => s.add(g.beatIdx), new Set())].join(",")}]`);
+      }
+
       const _hv2ClipPaths = [];
       const _hv2ClipDurs  = [];
-      // Each clip gets an equal share of the voice duration so all clips are
-      // visible in the final hook. Without this cap, expanded beat windows
-      // (30-40s each) make the merged hook video far longer than the TTS;
-      // the downstream muxer only shows the first clip's worth of footage.
-      const _hv2PerClipMax = Math.max(2.0, _hv2VoiceDur / _hookV2BeatIds.length);
-      for (let _ci = 0; _ci < _hookV2BeatIds.length; _ci++) {
-        const beatIdx = _hookV2BeatIds[_ci];
-        const hBeat   = beats[beatIdx];
-        if (!hBeat) { console.warn(`[render ${jobId}] HOOK-V2 beat #${beatIdx} not found — skipping`); continue; }
-        const hStart = Number(hBeat.startSec || 0);
-        const hEnd   = Math.min(Number(hBeat.endSec || 0), hStart + _hv2PerClipMax);
-        if (hEnd - hStart < 0.5) { console.warn(`[render ${jobId}] HOOK-V2 beat #${beatIdx} too short — skipping`); continue; }
+      for (let _ci = 0; _ci < _hv2Segs.length; _ci++) {
+        const seg = _hv2Segs[_ci];
         const hClipPath = path.join(UPLOADS_DIR, `hookv2-clip-${jobId}-${_ci}.mp4`);
         await new Promise((res) => {
           const ff = spawn("ffmpeg", buildTrimArgs({
-            inputPath: sourcePath, startSec: hStart, endSec: hEnd,
+            inputPath: sourcePath, startSec: seg.startSec, endSec: seg.endSec,
             outputPath: hClipPath, reencode: true,
           }), { stdio: "ignore" });
           const t = setTimeout(() => { try { ff.kill("SIGKILL"); } catch {} res(); }, 60_000);
@@ -6022,43 +5751,38 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
           ff.on("error", () => { clearTimeout(t); res(); });
         });
         if (_hv2ClipPaths[_hv2ClipPaths.length - 1] === hClipPath) {
-          _hv2ClipDurs.push(await probeDurationSec(hClipPath).catch(() => hEnd - hStart));
+          _hv2ClipDurs.push(await probeDurationSec(hClipPath).catch(() => seg.endSec - seg.startSec));
         }
       }
       if (_hv2ClipPaths.length === 0) throw new Error("All HOOK-V2 clip trims failed");
 
-      // Duration matching: adjust last clip so footage ≈ voice ± 0.25s
-      const _hv2FootageDurRaw = _hv2ClipDurs.reduce((a, b) => a + b, 0);
-      const _hv2Diff = _hv2VoiceDur - _hv2FootageDurRaw;
-      if (Math.abs(_hv2Diff) > 0.25) {
-        const lastBeatIdx = _hookV2BeatIds[_hookV2BeatIds.length - 1];
-        const lastBeat    = beats[lastBeatIdx];
-        const lastClipPath = _hv2ClipPaths[_hv2ClipPaths.length - 1];
-        if (lastBeat) {
-          const lStart      = Number(lastBeat.startSec || 0);
-          const lCurDur     = _hv2ClipDurs[_hv2ClipDurs.length - 1];
-          const lTargetDur  = Math.max(0.5, lCurDur + _hv2Diff);
-          // Cap extension to just before the next beat to avoid bleeding into body
-          const nextBeat    = beats[lastBeatIdx + 1];
-          const lMaxEnd     = nextBeat
-            ? Math.min(Number(nextBeat.startSec) - 0.1, lStart + lTargetDur)
-            : lStart + lTargetDur;
-          const lNewEnd     = Math.max(lStart + 0.5, Math.min(lMaxEnd, lStart + lTargetDur));
-          const adjPath     = path.join(UPLOADS_DIR, `hookv2-adj-${jobId}.mp4`);
-          let adjOk = false;
-          await new Promise((res) => {
-            const ff = spawn("ffmpeg", buildTrimArgs({
-              inputPath: sourcePath, startSec: lStart, endSec: lNewEnd,
-              outputPath: adjPath, reencode: true,
-            }), { stdio: "ignore" });
-            const t = setTimeout(() => { try { ff.kill("SIGKILL"); } catch {} res(); }, 60_000);
-            ff.on("close", (code) => { clearTimeout(t); adjOk = (code === 0); res(); });
-            ff.on("error", () => { clearTimeout(t); res(); });
-          });
-          if (adjOk) {
-            try { await fs.unlink(lastClipPath); } catch {}
-            _hv2ClipPaths[_hv2ClipPaths.length - 1] = adjPath;
-            _hv2ClipDurs[_hv2ClipDurs.length - 1] = await probeDurationSec(adjPath).catch(() => lTargetDur);
+      // Duration matching: extend the LAST cut within its own beat window so
+      // footage ≈ voice ± 0.25s (never bleeds into other scenes).
+      {
+        const _hv2FootageDurRaw = _hv2ClipDurs.reduce((a, b) => a + b, 0);
+        const _hv2Diff = _hv2VoiceDur - _hv2FootageDurRaw;
+        const lastSeg = _hv2Segs[Math.min(_hv2Segs.length, _hv2ClipPaths.length) - 1];
+        const lastBeat = lastSeg ? beats[lastSeg.beatIdx] : null;
+        if (_hv2Diff > 0.25 && lastSeg && lastBeat) {
+          const lNewEnd = Math.min(Number(lastBeat.endSec || 0), lastSeg.endSec + _hv2Diff);
+          if (lNewEnd > lastSeg.endSec + 0.1) {
+            const lastClipPath = _hv2ClipPaths[_hv2ClipPaths.length - 1];
+            const adjPath = path.join(UPLOADS_DIR, `hookv2-adj-${jobId}.mp4`);
+            let adjOk = false;
+            await new Promise((res) => {
+              const ff = spawn("ffmpeg", buildTrimArgs({
+                inputPath: sourcePath, startSec: lastSeg.startSec, endSec: lNewEnd,
+                outputPath: adjPath, reencode: true,
+              }), { stdio: "ignore" });
+              const t = setTimeout(() => { try { ff.kill("SIGKILL"); } catch {} res(); }, 60_000);
+              ff.on("close", (code) => { clearTimeout(t); adjOk = (code === 0); res(); });
+              ff.on("error", () => { clearTimeout(t); res(); });
+            });
+            if (adjOk) {
+              try { await fs.unlink(lastClipPath); } catch {}
+              _hv2ClipPaths[_hv2ClipPaths.length - 1] = adjPath;
+              _hv2ClipDurs[_hv2ClipDurs.length - 1] = await probeDurationSec(adjPath).catch(() => lNewEnd - lastSeg.startSec);
+            }
           }
         }
       }

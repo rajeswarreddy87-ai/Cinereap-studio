@@ -271,6 +271,11 @@ export function buildSyncedTimeline(scenes, beatDurations, opts = {}) {
   // The forward cursor is strictly monotonic so adjacent beats simply advance
   // past any borrowed section — no duplicate footage within one beat.
   const workScenes = scenes.map((sc, i) => {
+    // LOCKED-WINDOWS (v4.0.0): never borrow footage from adjacent scenes. The
+    // window IS the scene whose frames the narration was written from —
+    // expanding it shows footage the narration never described. Deficits are
+    // handled downstream (slow-mo + mux hold-frame tail).
+    if (opts.lockWindows) return sc;
     // MULTI-EVENT (2026-07-10): beats with subWindows carry several discrete,
     // independently vision-verified clip locations rather than one
     // continuous window — the single-window borrow-from-neighbor coverage
@@ -378,6 +383,14 @@ export function buildSyncedTimeline(scenes, beatDurations, opts = {}) {
     while (need >= minSegSec) {
       // Wrap check: if cursor is at or past the ceiling, stagger re-entry.
       if (cursor >= ceiling - minSegSec) {
+        if (opts.lockWindows) {
+          // LOCKED-WINDOWS: never wrap to another part of the film. Hold the
+          // last frame (mux tpad tail) for the remaining narration instead of
+          // showing footage from an unrelated scene.
+          console.warn(`[buildSyncedTimeline] beat ${beatIndex}: reached source ceiling ${need.toFixed(1)}s short — holding last frame (lockWindows, no wrap)`);
+          need = 0;
+          break;
+        }
         if (wrapCount >= WRAP_OFFSETS.length) {
           // Exhausted all wrap passes — stop to avoid infinite looping footage.
           console.warn(`[buildSyncedTimeline] max wraps (${WRAP_OFFSETS.length}) reached at beat ${beatIndex}; stopping`);
@@ -499,7 +512,7 @@ function round3(n) { return Math.round(n * 1000) / 1000; }
  * @param {number[]} [args.beatImportances]   per-beat importance scores (1-10) for dynamic cut timing
  * @returns {{ timeline: Array, beatDurations: number[], beatTexts: string[] }}
  */
-export function planSyncedRender({ script, scenes, voiceTotalSec, beatTexts, beatDurations: beatDurationsOverride, useEvenDistribution, minBeatSec, sourceDurationSec, sourceStartSec, maxClipSec, beatImportances, beatTypes }) {
+export function planSyncedRender({ script, scenes, voiceTotalSec, beatTexts, beatDurations: beatDurationsOverride, useEvenDistribution, minBeatSec, sourceDurationSec, sourceStartSec, maxClipSec, beatImportances, beatTypes, lockWindows }) {
   const n = Array.isArray(scenes) ? scenes.length : 0;
   let durations;
 
@@ -528,6 +541,7 @@ export function planSyncedRender({ script, scenes, voiceTotalSec, beatTexts, bea
     maxClipSec: Number.isFinite(maxClipSec) ? maxClipSec : MAX_CUT_SEC,
     beatImportances: Array.isArray(beatImportances) ? beatImportances : undefined,
     beatTypes: Array.isArray(beatTypes) ? beatTypes : undefined,
+    lockWindows: Boolean(lockWindows),
   });
   return { timeline, beatDurations: durations, beatTexts: texts };
 }
