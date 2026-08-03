@@ -1760,23 +1760,48 @@ app.post("/ingest/torrent", requireAuth, async (req, res) => {
         if (!authData.access_token) throw new Error("Seedr login failed — check SEEDR_USERNAME and SEEDR_PASSWORD.");
         seedrToken = authData.access_token;
 
-        // 2b-2: Clear ALL existing Seedr content first (free up the 2 GB)
+        // Helper: Seedr V1 "resource.php" API — func= dispatch with the same
+        // OAuth token. FIX (2026-08-03): Seedr removed POST /api/folder/add_torrent
+        // (HTTP 404 {"status_code":404}) — add/delete/fetch-link now go through
+        // /oauth_test/resource.php which is the endpoint their own clients use.
+        // GET /api/folder (listing) still works and is kept for polling.
+        const seedrRes = async (func, params = {}) => {
+          const res = await fetch(`${SEEDR_API}/oauth_test/resource.php?access_token=${encodeURIComponent(seedrToken)}`, {
+            method: "POST",
+            headers: { "Content-Type": "application/x-www-form-urlencoded" },
+            body: new URLSearchParams({ func, ...params }).toString(),
+            signal: AbortSignal.timeout(30000),
+          });
+          const text = await res.text();
+          if (!res.ok) throw new Error(`Seedr ${func} → HTTP ${res.status}: ${text.slice(0, 200)}`);
+          try { return JSON.parse(text); } catch { return {}; }
+        };
+
+        // 2b-2: Clear ALL existing Seedr content first (free up the 2 GB).
+        // list_contents also exposes stuck in-progress torrents, which the old
+        // /api/folder listing did not — clear those too or they hold quota.
         await jobStore.update(jobId, { progress: 0.04, message: "Clearing Seedr storage space…" });
-        const existing = await seedrFetch("GET", "/api/folder");
-        for (const folder of existing.folders || []) {
-          await seedrFetch("DELETE", `/api/folder/${folder.id}`).catch(() => {});
-        }
-        for (const file of existing.files || []) {
-          await seedrFetch("DELETE", `/api/file/${file.id}`).catch(() => {});
+        const existing = await seedrRes("list_contents").catch(() => ({}));
+        const _seedrDeleteArr = [
+          ...(existing.folders  || []).map((f) => ({ type: "folder",  id: f.id })),
+          ...(existing.files    || []).map((f) => ({ type: "file",    id: f.id })),
+          ...(existing.torrents || []).map((t) => ({ type: "torrent", id: t.id })),
+        ];
+        if (_seedrDeleteArr.length > 0) {
+          await seedrRes("delete", { delete_arr: JSON.stringify(_seedrDeleteArr) }).catch(() => {});
+          console.log(`[ingest/torrent] Seedr cleanup: removed ${_seedrDeleteArr.length} item(s) (folders/files/stale torrents)`);
         }
 
         // 2b-3: Send the magnet/torrent to Seedr
         await jobStore.update(jobId, { progress: 0.05, message: "Sending torrent to Seedr.cc…" });
-        const addBody = resolvedMag.startsWith("magnet:")
-          ? { magnet_link: resolvedMag }
-          : { url: resolvedMag };
-        const addData = await seedrFetch("POST", "/api/folder/add_torrent", addBody);
-        if (addData.error) throw new Error(`Seedr rejected the torrent: ${addData.error}. The file may exceed the 2 GB free limit.`);
+        const addParams = resolvedMag.startsWith("magnet:")
+          ? { torrent_magnet: resolvedMag }
+          : { torrent_url: resolvedMag };
+        const addData = await seedrRes("add_torrent", addParams);
+        if (!(addData.success === true || addData.result === true)) {
+          const reason = addData.error || (typeof addData.result === "string" ? addData.result : JSON.stringify(addData).slice(0, 120));
+          throw new Error(`Seedr rejected the torrent: ${reason}. The file may exceed the 2 GB free limit.`);
+        }
 
         // 2b-4: Poll until Seedr has downloaded the torrent (folder + files appear)
         await jobStore.update(jobId, { progress: 0.07, message: "Seedr.cc is downloading the torrent…" });
@@ -1814,7 +1839,10 @@ app.post("/ingest/torrent", requireAuth, async (req, res) => {
           .filter((f) => VIDEO_EXTS_RE.test(f.name || ""))
           .sort((a, b) => (b.size || 0) - (a.size || 0));
         const chosen = videoFiles[0] || seedrFiles.sort((a, b) => (b.size || 0) - (a.size || 0))[0];
-        const downloadUrl = chosen.download_url || chosen.url;
+        // FIX (2026-08-03): folder-detail file entries no longer carry
+        // download_url/url. Ask for a signed CDN link via func=fetch_file.
+        const _fetched = await seedrRes("fetch_file", { folder_file_id: String(chosen.id) });
+        const downloadUrl = _fetched.url || chosen.download_url || chosen.url;
         if (!downloadUrl) throw new Error("Seedr: no download URL found for the video file.");
 
         // 2b-6: Download from Seedr CDN → VPS via aria2c (with auth header)
@@ -1856,7 +1884,7 @@ app.post("/ingest/torrent", requireAuth, async (req, res) => {
         });
 
         // 2b-7: Auto-delete from Seedr immediately (frees 2 GB for next download)
-        await seedrFetch("DELETE", `/api/folder/${seedrFolderId}`).catch(() => {});
+        await seedrRes("delete", { delete_arr: JSON.stringify([{ type: "folder", id: seedrFolderId }]) }).catch(() => {});
         console.log(`[ingest/torrent] Seedr folder ${seedrFolderId} deleted — 2 GB freed`);
 
         // 2b-8: Rename to stable fileId
