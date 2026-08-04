@@ -3866,6 +3866,47 @@ async function generatePerBeatTTS(jobId, beats, apiKey, opts = {}) {
   // Sequential is more reliable and actually faster when retries are eliminated.
   const CONCURRENCY = 1;
 
+  // ── PROVIDER FALLBACK CHAIN (v4.0.1) ────────────────────────────────────────
+  // FIX (2026-08-04, render ZCpxSS9H_f): Speechify ran out of credits (HTTP 402)
+  // and ALL 47 beats were silence-padded, producing a 53-minute video with no
+  // narration. Billing/auth failures (401/402/403) are FATAL for a provider —
+  // retrying is pointless. Instead, switch every remaining beat to the next
+  // provider that has a server key configured.
+  const _chain = [
+    { id: provider, key: apiKey, voice },
+    ...[
+      { id: "speechify",  key: SERVER_SPEECHIFY_KEY,  voice: SERVER_SPEECHIFY_VOICE || "dominic" },
+      { id: "elevenlabs", key: SERVER_ELEVENLABS_KEY, voice: SERVER_ELEVENLABS_VOICE || "JBFqnCBsd6RMkjVDRZzb" },
+      { id: "openai",     key: SERVER_OPENAI_KEY,     voice: "onyx" },
+      { id: "hume",       key: SERVER_HUME_KEY,       voice: SERVER_HUME_VOICE || "Kora" },
+    ].filter((p) => p.id !== provider && p.key),
+  ];
+  let _chainIdx = 0;
+  const _FATAL_RE = /HTTP (401|402|403)\b|payment_required|insufficient credits|unauthorized|invalid.{0,10}key|quota/i;
+  const _chainExhausted = () => _chainIdx >= _chain.length;
+  // ttsCall: try the active provider; on a FATAL error advance the chain and
+  // retry the same text once per remaining provider. Non-fatal errors throw
+  // normally (handled by the per-phase retry logic).
+  const _ttsCall = async (text, ttsPath) => {
+    for (;;) {
+      if (_chainExhausted()) throw new Error(`all TTS providers exhausted (last: ${_chain[_chain.length - 1]?.id})`);
+      const p = _chain[_chainIdx];
+      try {
+        return await _ttsWithCache(p.id, p.key, p.voice, speed, text, ttsPath, opts.voiceSettings || {});
+      } catch (err) {
+        if (_FATAL_RE.test(String(err?.message || ""))) {
+          console.warn(`[render ${jobId}] PER-BEAT TTS: provider "${p.id}" FATAL (${String(err.message).slice(0, 100)}) — switching to next provider`);
+          _chainIdx++;
+          if (!_chainExhausted()) {
+            console.log(`[render ${jobId}] PER-BEAT TTS: falling back to provider "${_chain[_chainIdx].id}"`);
+            continue;
+          }
+        }
+        throw err;
+      }
+    }
+  };
+
   // Ensure the persistent TTS cache dir exists before any phase runs.
   await fs.mkdir(TTS_CACHE_DIR, { recursive: true }).catch(() => {});
 
@@ -3883,7 +3924,7 @@ async function generatePerBeatTTS(jobId, beats, apiKey, opts = {}) {
         const ttsId = `${jobId}-tts-beat-${String(i).padStart(3, "0")}.mp3`;
         const ttsPath = path.join(UPLOADS_DIR, ttsId);
         try {
-          const { cacheHit } = await _ttsWithCache(provider, apiKey, voice, speed, text, ttsPath, opts.voiceSettings || {});
+          const { cacheHit } = await _ttsCall(text, ttsPath);
           if (cacheHit) _cacheHits++;
           const dur = await probeDurationSec(ttsPath);
           if (dur < 0.05) throw new Error("zero-length output");
@@ -3900,7 +3941,9 @@ async function generatePerBeatTTS(jobId, beats, apiKey, opts = {}) {
   }
 
   // ── Phase 2: Sequential retry for failed clips (3 attempts, exp backoff) ────
-  for (const [i] of [...failed]) {
+  // Skipped entirely when every provider hit a fatal billing/auth error —
+  // retrying dead providers just wastes minutes.
+  for (const [i] of _chainExhausted() ? [] : [...failed]) {
     const text = _buildTtsText(beats[i]);
     if (!text) continue;
     const ttsId = `${jobId}-tts-beat-${String(i).padStart(3, "0")}.mp3`;
@@ -3908,7 +3951,7 @@ async function generatePerBeatTTS(jobId, beats, apiKey, opts = {}) {
     for (let attempt = 0; attempt < 3; attempt++) {
       await new Promise((r) => setTimeout(r, (attempt + 1) * 3000));
       try {
-        const { cacheHit } = await _ttsWithCache(provider, apiKey, voice, speed, text, ttsPath, opts.voiceSettings || {});
+        const { cacheHit } = await _ttsCall(text, ttsPath);
         if (cacheHit) _cacheHits++;
         const dur = await probeDurationSec(ttsPath);
         if (dur < 0.05) throw new Error("zero-length");
@@ -3918,12 +3961,13 @@ async function generatePerBeatTTS(jobId, beats, apiKey, opts = {}) {
         break;
       } catch (err) {
         failed.set(i, String(err.message));
+        if (_chainExhausted()) break;
       }
     }
   }
 
   // ── Phase 3: Truncated text (first 200 chars) for still-failed clips ────────
-  for (const [i] of [...failed]) {
+  for (const [i] of _chainExhausted() ? [] : [...failed]) {
     const fullText = _buildTtsText(beats[i]);
     if (!fullText) continue;
     const shortText = fullText.slice(0, 200).replace(/\s+\S*$/, "").trim() + "\u2026";
@@ -3932,7 +3976,7 @@ async function generatePerBeatTTS(jobId, beats, apiKey, opts = {}) {
     const ttsPath = path.join(UPLOADS_DIR, ttsId);
     await new Promise((r) => setTimeout(r, 2000));
     try {
-      const { cacheHit } = await _ttsWithCache(provider, apiKey, voice, speed, shortText, ttsPath, opts.voiceSettings || {});
+      const { cacheHit } = await _ttsCall(shortText, ttsPath);
       if (cacheHit) _cacheHits++;
       const dur = await probeDurationSec(ttsPath);
       if (dur < 0.05) throw new Error("zero-length");
@@ -3945,18 +3989,36 @@ async function generatePerBeatTTS(jobId, beats, apiKey, opts = {}) {
   }
   console.log(`[render ${jobId}] PER-BEAT TTS: ${_cacheHits}/${beats.length} beats served from cache (${beats.length - _cacheHits} fresh API calls)`);
 
+  // ── FAIL-LOUD GUARD (v4.0.1) ────────────────────────────────────────────────
+  // If more than 30% of narrated beats have no voice, the output would be a
+  // mostly-silent video (53-minute silent render, 2026-08-04). Abort with an
+  // actionable error instead of shipping garbage. The HOOK-V2 caller wraps this
+  // in its own try/catch, so a dead hook TTS just skips the hook gracefully.
+  const _narratedCount = beats.filter((b) => _buildTtsText(b)).length;
+  if (_narratedCount > 0 && failed.size > _narratedCount * 0.3) {
+    const firstErr = [...failed.values()][0] || "unknown error";
+    throw new Error(
+      `TTS failed for ${failed.size}/${_narratedCount} beats — aborting render instead of producing a silent video. ` +
+      `First error: ${firstErr.slice(0, 160)}. Check TTS provider credits/keys (tried: ${_chain.slice(0, _chainIdx + 1).map((p) => p.id).join(" → ")}).`
+    );
+  }
+
   // ── Phase 4: ffmpeg silence for truly unrecoverable clips ───────────────────
+  // FIX (v4.0.1): silence duration = word-count estimate (~2.5 words/sec,
+  // clamped 3–40s), NOT the beat's footage window. Window-sized silence made
+  // one beat "narrate" 726s of nothing and stretched the whole recap.
   for (const [i, errMsg] of failed) {
-    const winDur = Math.max(1, Number(beats[i].endSec || 0) - Number(beats[i].startSec || 0));
+    const _words = _buildTtsText(beats[i]).split(/\s+/).filter(Boolean).length;
+    const silDur = Math.max(3, Math.min(40, _words / 2.5));
     const silId = `${jobId}-tts-beat-${String(i).padStart(3, "0")}.mp3`;
     const silPath = path.join(UPLOADS_DIR, silId);
-    console.warn(`[render ${jobId}] PER-BEAT TTS: beat-${i} silence-padded (${winDur.toFixed(1)}s) — ${errMsg}`);
+    console.warn(`[render ${jobId}] PER-BEAT TTS: beat-${i} silence-padded (${silDur.toFixed(1)}s, word-count est) — ${errMsg}`);
     try {
-      await _generateSilenceMp3(silPath, winDur);
-      const dur = await probeDurationSec(silPath).catch(() => winDur);
+      await _generateSilenceMp3(silPath, silDur);
+      const dur = await probeDurationSec(silPath).catch(() => silDur);
       results[i] = { id: silId, duration: dur, _silence: true };
     } catch {
-      results[i] = { id: silId, duration: winDur, _silence: true };
+      results[i] = { id: silId, duration: silDur, _silence: true };
     }
   }
 
@@ -5716,6 +5778,8 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
         { ttsProvider: _hv2TtsProvider, ttsVoice: _hv2TtsVoice, ttsSpeed: _hv2TtsSpeed },
       );
       if (!(_hv2TtsRes.length > 0 && _hv2TtsRes[0].id)) throw new Error("HOOK-V2 TTS returned no file");
+      // v4.0.1: a silence-padded hook is a ~1s mute blip — worse than no hook.
+      if (_hv2TtsRes[0]._silence || _hv2TtsRes[0]._skip) throw new Error("HOOK-V2 TTS unavailable (provider failure) — skipping hook");
 
       const _hv2TtsFileId = _hv2TtsRes[0].id;
       const _hv2TtsPath   = path.join(UPLOADS_DIR, _hv2TtsFileId);
