@@ -297,13 +297,21 @@ export function buildTrimArgs({ inputPath, startSec, endSec, outputPath, reencod
       args.push("-vf", `setpts=${(1 / speedFactor).toFixed(5)}*PTS`);
     }
     args.push("-movflags", "+faststart");
+    // FIX (2026-08-06): -t placed after -i is an OUTPUT option — it caps the
+    // OUTPUT duration, not the input read window. With setpts slow-mo the
+    // output is raw/speedFactor long, so capping at the raw duration silently
+    // (a) cancelled the intended lengthening and (b) dropped the last
+    // (1-speedFactor) fraction of the clip's frames. Every "slow-mo" in
+    // production was a no-op (log: "slow-mo 0.80x → 19.2s" on a 19.1s clip).
+    // Scale the output cap by 1/speedFactor so slowed clips keep all frames
+    // and reach their intended duration.
+    const _outDur = applySlowMo ? (endSec - startSec) / speedFactor : (endSec - startSec);
+    args.push("-t", _outDur.toFixed(3));
   } else {
     // Fast lossless copy (keyframe-aligned, less accurate).
     args.push("-c", "copy", "-an", "-avoid_negative_ts", "make_zero");
+    args.push("-t", (endSec - startSec).toFixed(3));
   }
-  // Output-side duration limit: -t controls the INPUT read window.
-  // When setpts is applied, FFmpeg outputs raw_duration / speedFactor automatically.
-  args.push("-t", (endSec - startSec).toFixed(3));
   args.push(outputPath);
   return args;
 }

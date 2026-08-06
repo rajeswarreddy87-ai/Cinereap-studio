@@ -5249,10 +5249,13 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
         {
           let expanded = 0;
           let slowMo = 0;
-          beats = beats.map((b, i) => {
+          let backExtended = 0;
+          const _adq = beats.slice();
+          for (let i = 0; i < _adq.length; i++) {
+            const b = _adq[i];
             const win = Math.max(0, Number(b.endSec) - Number(b.startSec));
             const tts = Number(voDurs[i]) || 0;
-            if (tts <= 0 || win >= tts * 1.05) return b; // window ≥105% TTS — OK
+            if (tts <= 0 || win >= tts * 1.05) continue; // window ≥105% TTS — OK
             const ratio = win / tts;
 
             if (ratio >= 0.70) {
@@ -5261,7 +5264,8 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
               // equals the TTS length exactly — no scene-borrowing needed.
               // Looks cinematic; ratio < 0.70 would feel unnaturally sluggish.
               slowMo++;
-              return { ...b, slowFactor: ratio };
+              _adq[i] = { ...b, slowFactor: ratio };
+              continue;
             }
 
             // v4.0.0 LOCKED-WINDOWS: severe mismatch (>30% short). Extend ONLY
@@ -5269,25 +5273,59 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
             // beat's window start — that is contiguous continuation of the same
             // scene region and belongs to no other beat. Never borrow the next
             // beats' own windows (that showed their footage under this beat's
-            // narration — the old "wrong scene" bug). Any remaining shortfall is
-            // covered by slow-mo (≥0.70×) plus the mux hold-frame tail.
+            // narration — the old "wrong scene" bug).
             const targetEnd = Number(b.startSec) + tts * 1.2;
-            const nextStart = i + 1 < beats.length ? Number(beats[i + 1].startSec) : (safeCeiling || targetEnd);
+            const nextStart = i + 1 < _adq.length ? Number(_adq[i + 1].startSec) : (safeCeiling || targetEnd);
             const newEnd = Math.min(targetEnd, Math.max(Number(b.endSec), nextStart), safeCeiling || targetEnd);
             const grew = newEnd > Number(b.endSec) + 0.5;
-            const newWin = Math.max(0, newEnd - Number(b.startSec));
-            const newRatio = tts > 0 ? newWin / tts : 1;
             if (grew) expanded++;
-            if (newRatio < 1.05) {
-              // Still short after gap extension — add capped slow-mo on top.
-              slowMo++;
-              return { ...b, ...(grew ? { endSec: newEnd } : {}), slowFactor: Math.max(0.70, Math.min(1, newRatio)) };
+            let newStart = Number(b.startSec);
+            let newWin = Math.max(0, newEnd - newStart);
+
+            // v4.0.2 BACKWARD EXTENSION (render ohrbb51X87): analyze sometimes
+            // clusters several long-narration beats 3–10s apart, leaving a beat
+            // with e.g. a 6s window for 27s of narration → a long frozen frame.
+            // Pull the window START earlier into the PREVIOUS beat's UNUSED
+            // footage tail. Safe because: (a) the previous beat only consumes
+            // ~its own TTS-length of source seconds from its window start (we
+            // keep a +1s pad past that), and (b) OVERLAP-TRIM below re-assigns
+            // the tail formally so no footage is shown twice. Lead-in footage
+            // of the same contiguous region is professionally acceptable —
+            // a 15s freeze is not.
+            if (newWin < tts * 1.05 && i > 0) {
+              const prev = _adq[i - 1];
+              const prevTts = Number(voDurs[i - 1]) || 0;
+              const prevStart = Number(prev.startSec);
+              const prevWin = Math.max(0, Number(prev.endSec) - prevStart);
+              // Source seconds prev actually consumes ≤ its TTS length (slow-mo
+              // shows FEWER source seconds per output second, never more).
+              const prevUsedEnd = prevStart + Math.min(prevWin, prevTts) + 1.0;
+              const wantStart = newEnd - tts * 1.2;
+              const backStart = Math.max(0, prevUsedEnd, wantStart);
+              if (backStart < newStart - 0.5) {
+                newStart = backStart;
+                newWin = newEnd - newStart;
+                backExtended++;
+              }
             }
-            return grew ? { ...b, endSec: newEnd } : b;
-          });
+
+            const newRatio = tts > 0 ? newWin / tts : 1;
+            const changes = {};
+            if (grew) changes.endSec = newEnd;
+            if (newStart < Number(b.startSec) - 0.5) changes.startSec = newStart;
+            if (newRatio < 1.05) {
+              // Still short after both extensions — capped slow-mo on top; the
+              // mux hold-frame tail covers whatever remains.
+              slowMo++;
+              changes.slowFactor = Math.max(0.70, Math.min(1, newRatio));
+            }
+            _adq[i] = { ...b, ...changes };
+          }
+          beats = _adq;
           const parts = [];
-          if (expanded > 0) parts.push(`${expanded} window-expanded`);
-          if (slowMo > 0)   parts.push(`${slowMo} time-stretched (slow-mo, ratio ≥70%)`);
+          if (expanded > 0)     parts.push(`${expanded} window-expanded`);
+          if (backExtended > 0) parts.push(`${backExtended} back-extended into prev beat's unused tail`);
+          if (slowMo > 0)       parts.push(`${slowMo} time-stretched (slow-mo, ratio ≥70%)`);
           if (parts.length > 0) {
             console.log(`[render ${jobId}] SYNC: window-adequacy: ${parts.join(', ')}`);
           }

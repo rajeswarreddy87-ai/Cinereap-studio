@@ -1157,15 +1157,21 @@ export function buildSceneScriptMessages({ movie, channelName, beats, characters
       storyOutline.map((a) => `  ${a.act} [${a.startSec}–${a.endSec}s] ${a.characters?.join(", ") || ""}: ${a.summary} (tone: ${a.tone || "dramatic"})`).join("\n") + "\n\n"
     : "";
   // List the beats WITH their index + timecode so Claude returns narration per beat, in order.
-  // No word cap here — narration length is determined by story content;
-  // per-beat Speechify TTS generates clips that match actual spoken length.
+  // v4.0.2 WORD BUDGET (render ohrbb51X87): narration length must be roughly
+  // proportional to the beat's available footage span, or the render is forced
+  // into long frozen frames (e.g. 27s narration on a 6s scene window). Budget
+  // ≈ span-to-next-beat × 2.3 words/sec, clamped 25–80 words. The span is
+  // measured to the NEXT beat's start (the render expands windows the same way).
   // Fix D: embed per-beat windowed dialogue directly in the beat list so
   // Stage B can only reference what was actually spoken at each beat's timestamp,
   // rather than reading ahead in the full 2-hour transcript and narrating events
   // that haven't appeared on screen yet.
   const beatText = beats && beats.length
-    ? beats.map((b) => {
-        let line = `- index ${b.index} @ [${b.t}] (${b.startSec.toFixed(1)}-${b.endSec.toFixed(1)}s): ${b.note || "(no note)"}`;
+    ? beats.map((b, bi) => {
+        const nextStart = bi + 1 < beats.length ? Number(beats[bi + 1].startSec) : Number(b.endSec) + 60;
+        const spanSec = Math.max(Number(b.endSec) - Number(b.startSec), nextStart - Number(b.startSec));
+        const wordBudget = Math.max(25, Math.min(80, Math.round(spanSec * 2.3)));
+        let line = `- index ${b.index} @ [${b.t}] (${b.startSec.toFixed(1)}-${b.endSec.toFixed(1)}s, narration budget ≤${wordBudget} words): ${b.note || "(no note)"}`;
         if (Array.isArray(segments) && segments.length > 0) {
           const dlg = transcriptForWindow(segments, b.startSec - 5, b.endSec + 5, 350);
           if (dlg) line += `\n  Dialogue: "${dlg}"`;
@@ -1258,6 +1264,11 @@ export function buildSceneScriptMessages({ movie, channelName, beats, characters
         `moments in detail. Write as many words as the story requires — do NOT rush, truncate, or skip scenes to ` +
         `hit a time target. A complete recap of a 2-hour film naturally needs 3000-5000+ spoken words; use however ` +
         `many words it takes to tell the whole story properly. ` +
+        `PER-BEAT WORD BUDGET (mandatory — narration is spoken over that beat's own footage): each beat line ` +
+        `above shows "narration budget ≤N words". Stay within it. N is sized to how much footage that scene ` +
+        `actually has — exceeding it forces the video to freeze-frame while your narration keeps talking. ` +
+        `If a beat's events need more words than its budget, move the extra detail to a LATER beat that ` +
+        `covers the follow-up footage. ` +
         `TRANSCRIPT GROUNDING (mandatory): every sentence must be grounded in the actual dialogue transcript. ` +
         `If the transcript shows character X saying Y at timestamp T, the beat covering T must reference ` +
         `that dialogue. Never invent events the transcript does not support. Never skip or gloss over ` +
