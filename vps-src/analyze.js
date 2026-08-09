@@ -974,8 +974,11 @@ export function buildNarrationRepairMessages({ scene, note, narration, maxWords 
   return [{ role: "user", content }];
 }
 
-export function buildContinuityMessages({ beats, characters, previousEnding = "", nextOpening = "" }) {
+export function buildContinuityMessages({ beats, characters, storyOutline = [], previousEnding = "", nextOpening = "" }) {
   const cast = (characters || []).map((c) => `- ${c.name}: ${c.note}`).join("\n");
+  const outline = (storyOutline || []).map((a) =>
+    `- ${a.act || "Story"} [${a.startSec ?? "?"}-${a.endSec ?? "?"}s]: ${a.summary || ""}`
+  ).join("\n");
   const rows = (beats || []).map((b) => {
     const maxWords = Math.max(6, Math.min(45, Math.floor((Number(b.endSec) - Number(b.startSec)) * 2.05)));
     return `${b.index} | MAX ${maxWords} WORDS | VISIBLE NOTE: ${b.reason} | CURRENT: ${b.narration}`;
@@ -988,6 +991,9 @@ export function buildContinuityMessages({ beats, characters, previousEnding = ""
 CANONICAL CHARACTERS:
 ${cast}
 
+STORY OUTLINE:
+${outline}
+
 ${previousEnding ? `PREVIOUS BATCH ENDING: ${previousEnding}\n` : ""}
 ${nextOpening ? `NEXT BATCH OPENING (context only): ${nextOpening}\n` : ""}
 BEATS:
@@ -999,7 +1005,9 @@ RULES:
 3. Make each beat continue naturally from the previous one. Add only a short truthful time/location/causal bridge when needed.
 4. Use canonical proper names for recurring principals from their first appearance. Never use "a man", "the man",
    "a blonde woman", "the older man", or similar generic labels for a named main character.
-5. Resolve note/transcript aliases to canonical names by role and chronology. Do not invent names for truly minor unnamed people.
+5. Resolve note/transcript aliases and generic labels to canonical names using the story outline, role, timestamp,
+   and adjacent beats. When the protagonist or another named principal is clearly the person shown, replace the generic label.
+   Do not invent names for truly minor unnamed people.
 6. Stay within each MAX word budget. Complete sentences, active present tense, no headings or meta-commentary.
 
 Return JSON only:
@@ -1874,7 +1882,7 @@ export async function analyzeWithScenes({
         provider,
         apiKey,
         model,
-        messages: buildContinuityMessages({ beats: batch, characters, previousEnding, nextOpening }),
+        messages: buildContinuityMessages({ beats: batch, characters, storyOutline, previousEnding, nextOpening }),
         maxTokens: Math.max(1600, batch.length * 100),
         jsonMode: true,
       });
