@@ -1,0 +1,70 @@
+# Deploy the render server with: docker compose up -d
+#
+# Environment variables you should set in a sibling .env file:
+#   AUTH_TOKEN=...           required, the bearer token your phone uses
+#   PUBLIC_URL=https://...   required if exposing through a reverse proxy
+#   YT_CLIENT_ID=...         optional, only if you want direct YouTube upload
+#   YT_CLIENT_SECRET=...
+#   YT_REFRESH_TOKEN=...     get this via `npm run yt:auth` once
+#
+# Storage volumes are bind-mounted next to this file so you can back them up.
+services:
+  render:
+    build: .
+    image: cinerecap-render-server:latest
+    container_name: cinerecap-render
+    restart: unless-stopped
+    ports:
+      - "4040:8787"
+    environment:
+      - AUTH_TOKEN=${RENDER_AUTH_TOKEN}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - ANTHROPIC_MODEL=${ANTHROPIC_MODEL:-}
+      - SPEECHIFY_API_KEY=${SPEECHIFY_API_KEY:-}
+      - SPEECHIFY_VOICE_ID=${SPEECHIFY_VOICE_ID:-}
+      - ELEVENLABS_API_KEY=${ELEVENLABS_API_KEY:-}
+      - ELEVENLABS_VOICE_ID=${ELEVENLABS_VOICE_ID:-}
+      - HUME_API_KEY=${HUME_API_KEY:-}
+      - HUME_VOICE_NAME=${HUME_VOICE_NAME:-}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - GEMINI_MODEL=${GEMINI_MODEL:-gemini-2.5-flash}
+      - GEMINI_SPAN_LOCALIZATION=${GEMINI_SPAN_LOCALIZATION:-0}
+      - TWELVELABS_API_KEY=${TWELVELABS_API_KEY:-}
+      - TWELVELABS_ENABLED=${TWELVELABS_ENABLED:-1}
+      - TWELVELABS_INDEX_ID=${TWELVELABS_INDEX_ID:-}
+      - TWELVELABS_MAX_BEATS=${TWELVELABS_MAX_BEATS:-}
+      - TWELVELABS_MAX_RANK=${TWELVELABS_MAX_RANK:-6}
+      - TWELVELABS_PROTECT_MAX_RELOC_SEC=${TWELVELABS_PROTECT_MAX_RELOC_SEC:-300}
+      - TWELVELABS_CHRONO_SLACK_SEC=${TWELVELABS_CHRONO_SLACK_SEC:-5}
+      - NARRATION_CONTINUITY_ENABLED=${NARRATION_CONTINUITY_ENABLED:-0}
+      - BEAT_TRIM_MODE=${BEAT_TRIM_MODE:-hybrid}
+      - BEAT_TRIM_ENABLED=${BEAT_TRIM_ENABLED:-1}
+      - TWELVELABS_MIN_WINDOW_SEC=${TWELVELABS_MIN_WINDOW_SEC:-8}
+      - TWELVELABS_SEARCH_DELAY_MS=${TWELVELABS_SEARCH_DELAY_MS:-250}
+      - TWELVELABS_INDEX_POLL_MAX_MS=${TWELVELABS_INDEX_POLL_MAX_MS:-}
+      - CLIP_SIDECAR_ENABLED=${CLIP_SIDECAR_ENABLED:-0}
+      - GEMINI_VERIFY_MAX_BEATS=${GEMINI_VERIFY_MAX_BEATS:-80}
+      - VIDEO_RETIME_MIN=${VIDEO_RETIME_MIN:-0.82}
+      - VIDEO_RETIME_MAX=${VIDEO_RETIME_MAX:-1.18}
+      - COPYRIGHT_SAFE_MODE=${COPYRIGHT_SAFE_MODE:-true}
+      - COPYRIGHT_SAFE_MAX_CLIP_SEC=${COPYRIGHT_SAFE_MAX_CLIP_SEC:-3.0}
+      - COPYRIGHT_SAFE_HOOK_CLIP_SEC=${COPYRIGHT_SAFE_HOOK_CLIP_SEC:-2.5}
+      - WATERMARK_TEXT=${WATERMARK_TEXT:-Plotline Panic}
+      - THUMB_MIN_BRIGHTNESS=${THUMB_MIN_BRIGHTNESS:-58}
+      - PUBLIC_URL=${RENDER_PUBLIC_URL:-}
+      - YT_CLIENT_ID=${YT_CLIENT_ID:-}
+      - YT_CLIENT_SECRET=${YT_CLIENT_SECRET:-}
+      - YT_REFRESH_TOKEN=${YT_REFRESH_TOKEN:-}
+      - YT_DLP_COOKIES_FILE=/data/cookies/cookies.txt
+      - REAL_DEBRID_API_KEY=${REAL_DEBRID_API_KEY:-}
+      - SEEDR_USERNAME=${SEEDR_USERNAME:-}
+      - SEEDR_PASSWORD=${SEEDR_PASSWORD:-}
+    volumes:
+      - ./src:/app/src
+      - ./start.sh:/app/start.sh
+      - ./storage/uploads:/data/uploads
+      - ./storage/output:/data/output
+      - ./storage/jobs:/data/jobs
+      - ./storage/cookies:/data/cookies
+      - ./storage/twelvelabs-cache:/data/twelvelabs-cache
