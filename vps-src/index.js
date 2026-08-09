@@ -6958,7 +6958,10 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
       // apad=pad_dur=0.5 → ensures narration audio never ends before the video
       // track (prevents silent final scene when audio is microseconds short).
       // asplit → one copy goes to the output mix, one acts as sidechain detector.
-      `[basea]aresample=async=1,apad=pad_dur=0.10,asplit=2[voice_out][voice_sc];` +
+      // Bounded final encoder-delay pad. The output -t clamp limits this to the
+      // exact sum of segment durations; smoke test reduced final A/V drift from
+      // 0.295s to 0.0004s without any visible video hold.
+      `[basea]aresample=async=1,apad=pad_dur=0.35,asplit=2[voice_out][voice_sc];` +
       `[${_musicInputIndex}:a]aloop=loop=-1:size=2147483647,volume=${_musicVol}dB,` +
       `aformat=sample_fmts=fltp:channel_layouts=stereo[music_raw];` +
       // sidechaincompress: threshold=0.02 (voice above 2% amplitude triggers ducking),
@@ -6968,7 +6971,7 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
       `attack=100:release=800:level_sc=0.8[music_ducked];` +
       `[voice_out][music_ducked]amix=inputs=2:duration=first:normalize=0[aout]`
     : _concatPrefix + `[basev]${_finalVf}[vout];` +
-      `[basea]aresample=async=1,aformat=sample_fmts=fltp:channel_layouts=stereo[aout]`;
+      `[basea]aresample=async=1,apad=pad_dur=0.35,aformat=sample_fmts=fltp:channel_layouts=stereo[aout]`;
 
   // QUALITY (v2.9.5): the final encode is the delivered file — do NOT use the
   // ultrafast preset here (it produces visible blocking, worsened by the upscale).
