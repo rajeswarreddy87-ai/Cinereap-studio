@@ -4359,6 +4359,9 @@ async function runRenderFromIngest(jobId, {
   let transcriptSegments = [];
   // Fix A — word-level timestamps for Marengo search anchoring.
   let transcriptWords = [];
+  // Canonical cast + relationship notes from v5 analyze. Render-time
+  // narration fitting must preserve these identities while shortening text.
+  let canonicalCharacters = [];
 
   // ── AUTO-LOAD BEATS: when the render arrives with no beats and no voice files
   // (app did not generate TTS), scan the jobs store for the most recently
@@ -4387,6 +4390,7 @@ async function runRenderFromIngest(jobId, {
         beats = bestJob.result.beats;
         transcriptSegments = Array.isArray(bestJob.result.segments) ? bestJob.result.segments : [];
         transcriptWords = Array.isArray(bestJob.result.words) ? bestJob.result.words : [];
+        canonicalCharacters = Array.isArray(bestJob.result.characters) ? bestJob.result.characters : [];
         console.log(`[render ${jobId}] AUTO-LOAD: ${beats.length} beats from analyze job (${sourceFileId})${transcriptSegments.length ? `, ${transcriptSegments.length} transcript segments` : ""}${transcriptWords.length ? `, ${transcriptWords.length} word timestamps` : ""}`);
         await jobStore.update(jobId, {
           progress: 6,
@@ -4701,6 +4705,7 @@ async function runRenderFromIngest(jobId, {
         if (Number(_slJob.result.targetMinutes) > 0) {
           targetMinutes = Number(_slJob.result.targetMinutes);
         }
+        canonicalCharacters = Array.isArray(_slJob.result.characters) ? _slJob.result.characters : canonicalCharacters;
         const _sl = _slJob?.result?.scenesList;
         if (Array.isArray(_sl) && _sl.length > 0) {
           const _slMap = new Map(_sl.map((s) => [Number(s.index), s]));
@@ -5299,31 +5304,63 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
             throw new Error(`PRO-QC cannot refit ${failures.length} beats: TTS provider configuration unavailable`);
           }
           console.log(`[render ${jobId}] NARRATION-FIT round ${round}: rewriting ${failures.length} overlong beat(s)`);
+          const relationshipTerms = [
+            "wife", "husband", "father", "mother", "son", "daughter",
+            "brother", "sister", "parent", "child", "partner", "family",
+          ];
           const rows = failures.map((x) => {
             const beat = beats[x.i];
             const words = String(beat.narration || "").trim().split(/\s+/).filter(Boolean);
             const proportional = Math.floor(words.length * x.ratio * 0.88);
             const windowBudget = Math.floor(x.win * 1.55);
             const maxWords = Math.max(2, Math.min(proportional || 2, windowBudget || 2));
+            const sourceText = `${beat.narration || ""} ${beat.reason || ""}`.toLowerCase();
+            const protectedNames = canonicalCharacters
+              .map((c) => String(c?.name || "").trim())
+              .filter(Boolean)
+              .filter((name) => {
+                const first = name.split(/\s+/)[0].toLowerCase();
+                return new RegExp(`\\b${first.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "i").test(sourceText);
+              });
+            const protectedRelationships = relationshipTerms.filter((term) =>
+              new RegExp(`\\b${term}\\b`, "i").test(sourceText)
+            );
             return {
               slot: x.i,
               beatId: beat.beatId || `beat-${x.i}`,
               maxWords,
               note: String(beat.reason || "").slice(0, 180),
               narration: String(beat.narration || "").slice(0, 900),
+              previous: String(beats[x.i - 1]?.narration || "").slice(-220),
+              next: String(beats[x.i + 1]?.narration || "").slice(0, 220),
+              protectedNames,
+              protectedRelationships,
             };
           });
+          const canonicalCastText = canonicalCharacters
+            .map((c) => `${c.name}: ${c.note}`)
+            .join("; ");
           const fitPrompt =
 `Shorten movie-recap narration so measured speech fits each scene's exact moving footage.
 Preserve only the visible event and essential plot fact. Use complete, natural sentences.
-Do not add facts, dialogue, introductions, transitions, or commentary.
+Do not add facts, dialogue, introductions, or commentary. Preserve the existing truthful transition when possible.
+Character identity and relationship facts are immutable.
+
+CANONICAL CAST:
+${canonicalCastText || "(not available)"}
 
 BEATS:
-${rows.map((r) => `${r.slot} | ${r.beatId} | MAX ${r.maxWords} WORDS | NOTE: ${r.note} | CURRENT: ${r.narration}`).join("\n")}
+${rows.map((r) =>
+  `${r.slot} | ${r.beatId} | MAX ${r.maxWords} WORDS | ` +
+  `MUST KEEP NAMES: ${r.protectedNames.join(", ") || "none"} | ` +
+  `MUST KEEP RELATIONSHIPS: ${r.protectedRelationships.join(", ") || "none"} | ` +
+  `PREVIOUS: ${r.previous || "none"} | CURRENT: ${r.narration} | NEXT: ${r.next || "none"} | NOTE: ${r.note}`
+).join("\n")}
 
 Return JSON only:
 {"beats":[{"slot":0,"narration":"..."}]}
-Return every slot exactly once and obey each MAX word count.`;
+Return every slot exactly once. Keep protected names/relationships. Maintain continuity with PREVIOUS/NEXT.
+Obey each MAX word count.`;
           const fitProvider = SERVER_ANTHROPIC_KEY ? "claude" : "gemini";
           const fitText = await callLLM({
             provider: fitProvider,
@@ -5373,7 +5410,23 @@ Return every slot exactly once and obey each MAX word count.`;
                 `for max ${row.maxWords}; accepting provisionally for measured TTS check`
               );
             }
-            beats[row.slot] = { ...beats[row.slot], narration };
+            const lower = narration.toLowerCase();
+            const missingNames = row.protectedNames.filter((name) => {
+              const first = name.split(/\s+/)[0].toLowerCase();
+              return !new RegExp(`\\b${first.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "i").test(lower);
+            });
+            const missingRelationships = row.protectedRelationships.filter((term) =>
+              !new RegExp(`\\b${term}\\b`, "i").test(lower)
+            );
+            if (missingNames.length > 0 || missingRelationships.length > 0) {
+              console.warn(
+                `[render ${jobId}] NARRATION-FIT beat ${row.slot}: rewrite dropped protected facts ` +
+                `(names=${missingNames.join(",") || "none"}, relationships=${missingRelationships.join(",") || "none"}); ` +
+                `keeping original for next fit round`
+              );
+            } else {
+              beats[row.slot] = { ...beats[row.slot], narration };
+            }
           }
 
           const fitBeats = rows.map((r) => beats[r.slot]);
