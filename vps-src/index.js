@@ -5617,11 +5617,15 @@ Return every slot exactly once and obey each MAX word count.`;
               plannedByBeat[bi] += Math.max(0, Number(seg.endSec) - Number(seg.startSec));
             }
           }
-          const preflightFailures = voDurs.map((tts, i) => ({
-            i,
-            tts: Number(tts) || 0,
-            video: plannedByBeat[i] || 0,
-          })).filter((x) => x.tts - x.video > 0.15);
+          const preflightFailures = voDurs.map((tts, i) => {
+            const speed = Number(beats[i]?.slowFactor) > 0 ? Number(beats[i].slowFactor) : 1;
+            const sourceVideo = plannedByBeat[i] || 0;
+            return {
+              i,
+              tts: Number(tts) || 0,
+              video: sourceVideo / speed,
+            };
+          }).filter((x) => x.tts - x.video > 0.15);
           if (preflightFailures.length > 0) {
             const sample = preflightFailures.slice(0, 10)
               .map((x) => `beat${x.i}[planned=${x.video.toFixed(2)}s tts=${x.tts.toFixed(2)}s]`)
