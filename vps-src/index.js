@@ -88,6 +88,7 @@ const SERVER_ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL      || "";
 
 const SERVER_GEMINI_KEY   = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || "";
 const SERVER_GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+const PRO_SEMANTIC_QC_PROVIDER = String(process.env.PRO_SEMANTIC_QC_PROVIDER || "claude").toLowerCase();
 
 
 if (!AUTH_TOKEN) {
@@ -595,7 +596,7 @@ app.get("/health", (_req, res) => {
       "uncapped-narration", // new in 2.5.0 — full-length narration, no word-count ceiling
       "deterministic-beat-manifest", // v5.0.0 — immutable server beat/scene identity; LLM writes text only
       "pts-safe-concat",     // v5.0.0 — PTS-reset filter concat with exact rational FPS
-      "gemini-qc",           // v5.0.0 — optional low-confidence semantic QC, never timestamp relocation
+      "multimodal-semantic-qc", // v5.0.0 — Claude/Gemini score-only QC, never timestamp relocation
       "multi-tts",          // new in 2.7.0 — ttsProvider field selects speechify|openai|elevenlabs|hume
       "storage-api",        // new in 2.7.0 — GET /system/storage, DELETE /system/clear-renders
       "source-download",    // new in 2.7.0 — GET /uploads/:fileId/download
@@ -2274,10 +2275,12 @@ app.post("/analyze", requireAuth, async (req, res) => {
             transcriptBlock,
             narrationLang,
             targetClipCount: effectiveTargetClipCount,
-            semanticQcEnabled: Boolean(SERVER_GEMINI_KEY) &&
+            semanticQcEnabled: Boolean(SERVER_GEMINI_KEY || effectiveAnthropicKey) &&
               String(process.env.PRO_SEMANTIC_QC_ENABLED ?? "1").toLowerCase() !== "0",
-            qcApiKey: SERVER_GEMINI_KEY,
-            qcModel: process.env.PRO_SEMANTIC_QC_MODEL || SERVER_GEMINI_MODEL,
+            qcProvider: PRO_SEMANTIC_QC_PROVIDER === "gemini" ? "gemini" : "claude",
+            qcApiKey: PRO_SEMANTIC_QC_PROVIDER === "gemini" ? SERVER_GEMINI_KEY : effectiveAnthropicKey,
+            qcModel: process.env.PRO_SEMANTIC_QC_MODEL ||
+              (PRO_SEMANTIC_QC_PROVIDER === "gemini" ? SERVER_GEMINI_MODEL : effectiveAnthropicModel),
           });
         } catch (providerErr) {
           // FIX (2026-07-03): Gemini free tier sporadically hard-blocks whole
@@ -2307,10 +2310,12 @@ app.post("/analyze", requireAuth, async (req, res) => {
               transcriptBlock,
               narrationLang,
               targetClipCount: effectiveTargetClipCount,
-              semanticQcEnabled: Boolean(SERVER_GEMINI_KEY) &&
+              semanticQcEnabled: Boolean(SERVER_GEMINI_KEY || effectiveAnthropicKey) &&
                 String(process.env.PRO_SEMANTIC_QC_ENABLED ?? "1").toLowerCase() !== "0",
-              qcApiKey: SERVER_GEMINI_KEY,
-              qcModel: process.env.PRO_SEMANTIC_QC_MODEL || SERVER_GEMINI_MODEL,
+              qcProvider: PRO_SEMANTIC_QC_PROVIDER === "gemini" ? "gemini" : "claude",
+              qcApiKey: PRO_SEMANTIC_QC_PROVIDER === "gemini" ? SERVER_GEMINI_KEY : effectiveAnthropicKey,
+              qcModel: process.env.PRO_SEMANTIC_QC_MODEL ||
+                (PRO_SEMANTIC_QC_PROVIDER === "gemini" ? SERVER_GEMINI_MODEL : effectiveAnthropicModel),
             });
           } else {
             throw providerErr;
@@ -7113,7 +7118,7 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
     qc: {
       pipelineVersion: "5.0.0",
       sourceWindowPolicy: "strict",
-      visualSemanticQc: "gemini-score-only",
+      visualSemanticQc: `${PRO_SEMANTIC_QC_PROVIDER}-score-only`,
       avDriftSec: Number(_avDriftSec.toFixed(4)),
       durationDriftSec: Number(_expectedDriftSec.toFixed(4)),
       frozenIntervals: 0,

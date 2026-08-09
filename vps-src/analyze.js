@@ -923,7 +923,8 @@ export function buildValidationMessages({ movie, scenes, noteByIndex }) {
 }
 
 /**
- * v5 independent semantic QC. Gemini reviews the same approved scene frames
+ * v5 independent semantic QC. A separate multimodal review pass examines the
+ * same approved scene frames
  * against the finished narration, but can only score/reject — it never chooses
  * timestamps or relocates footage.
  */
@@ -1472,7 +1473,7 @@ export function parseSceneScriptResponse(rawText) {
 export async function analyzeWithScenes({
   apiKey, model, provider = "claude", movie, channelName, scenes, segments = [], transcriptBlock = "", narrationLang = "English",
   overview = "", keywords = "",
-  semanticQcEnabled = false, qcApiKey = "", qcModel = "gemini-2.5-flash",
+  semanticQcEnabled = false, qcProvider = "claude", qcApiKey = "", qcModel = "claude-sonnet-4-5",
 }) {
   if (!scenes || scenes.length === 0) throw new Error("analyzeWithScenes: no scenes provided");
 
@@ -1716,7 +1717,7 @@ export async function analyzeWithScenes({
     return Boolean(text.trim()) && !CREDITS_LABEL_RE.test(text);
   });
 
-  // ── v5 PASS 4: independent Gemini semantic QC (score-only) ───────────────
+  // ── v5 PASS 4: independent multimodal semantic QC (score-only) ───────────
   // This replaces search/relocation systems such as Twelve Labs. The mapping
   // stays deterministic; Gemini may only approve or reject the authored beat.
   const semanticQc = [];
@@ -1729,7 +1730,7 @@ export async function analyzeWithScenes({
       for (let i = 0; i < sceneSubset.length; i += QC_BATCH) {
         const batch = sceneSubset.slice(i, i + QC_BATCH);
         const qcText = await callLLM({
-          provider: "gemini",
+          provider: qcProvider,
           apiKey: qcApiKey,
           model: qcModel,
           messages: buildNarrationQcMessages({ scenes: batch, narrationByIndex }),
@@ -1797,7 +1798,8 @@ export async function analyzeWithScenes({
       rejected = semanticQc.filter((q) => !q.ok || q.score < 0.65);
     }
     console.log(
-      `[analyzeWithScenes] GEMINI-QC: ${semanticQc.length - rejected.length}/${semanticQc.length} beats passed semantic visual QC`
+      `[analyzeWithScenes] ${qcProvider.toUpperCase()}-QC: ` +
+      `${semanticQc.length - rejected.length}/${semanticQc.length} beats passed semantic visual QC`
     );
     if (rejected.length > 0) {
       const sample = rejected.slice(0, 10).map((q) => `${q.index}:${q.score.toFixed(2)} ${q.reason}`).join(" | ");
