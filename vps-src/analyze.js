@@ -1480,6 +1480,10 @@ export function reconcileExactIndexedRows(expected, returned) {
   };
 }
 
+export function semanticQuarantineLimit(totalBeats) {
+  return Math.max(2, Math.ceil(Math.max(0, Number(totalBeats) || 0) * 0.05));
+}
+
 /**
  * Orchestrate the full 3-pass scene-aware analysis (v3.0).
  *
@@ -1886,6 +1890,26 @@ export async function analyzeWithScenes({
         if (rescoredMap.has(semanticQc[i].index)) semanticQc[i] = rescoredMap.get(semanticQc[i].index);
       }
       rejected = semanticQc.filter((q) => !q.ok || q.score < 0.65);
+
+      // Deterministic second fallback: use the short factual Stage-A note that
+      // was already validated against these exact frames. This removes dialogue
+      // specificity/plot inference that a free-form rewrite may reintroduce.
+      if (rejected.length > 0) {
+        for (const failure of rejected) {
+          const beat = beatByIndex.get(failure.index);
+          const literal = String(beat?.reason || "").trim();
+          if (!beat || !literal) continue;
+          beat.narration = literal;
+          narrationByIndex.set(failure.index, literal);
+        }
+        const literalScenes = rejected.map((q) => sceneByIndex.get(q.index)).filter(Boolean);
+        const literalScores = await runQc(literalScenes);
+        const literalMap = new Map(literalScores.map((q) => [q.index, q]));
+        for (let i = 0; i < semanticQc.length; i++) {
+          if (literalMap.has(semanticQc[i].index)) semanticQc[i] = literalMap.get(semanticQc[i].index);
+        }
+        rejected = semanticQc.filter((q) => !q.ok || q.score < 0.65);
+      }
     }
     console.log(
       `[analyzeWithScenes] ${qcProvider.toUpperCase()}-QC: ` +
@@ -1893,9 +1917,24 @@ export async function analyzeWithScenes({
     );
     if (rejected.length > 0) {
       const sample = rejected.slice(0, 10).map((q) => `${q.index}:${q.score.toFixed(2)} ${q.reason}`).join(" | ");
-      throw new Error(
-        `Semantic visual QC rejected ${rejected.length}/${semanticQc.length} beat(s): ${sample}. ` +
-        `Analysis stopped; timestamps were not relocated.`
+      // A few isolated ambiguous shots are safer to omit than to force into the
+      // recap. A systemic failure (>5%) still aborts; small residuals are
+      // quarantined and never reach TTS/render.
+      const quarantineLimit = semanticQuarantineLimit(semanticQc.length);
+      if (rejected.length > quarantineLimit) {
+        throw new Error(
+          `Semantic visual QC rejected ${rejected.length}/${semanticQc.length} beat(s): ${sample}. ` +
+          `Systemic mismatch exceeds quarantine limit ${quarantineLimit}; analysis stopped.`
+        );
+      }
+      const rejectedIds = new Set(rejected.map((q) => q.index));
+      syncedBeats = syncedBeats.filter((b) => !rejectedIds.has(b.index));
+      for (const q of semanticQc) {
+        if (rejectedIds.has(q.index)) q.quarantined = true;
+      }
+      console.warn(
+        `[analyzeWithScenes] SEMANTIC-QUARANTINE: omitted ${rejected.length}/${semanticQc.length} ` +
+        `isolated mismatched beat(s) [${[...rejectedIds].join(",")}]; ${sample}`
       );
     }
   }

@@ -7,6 +7,7 @@ import {
   buildSceneNotesMessages,
   parseAnalysisResponse,
   reconcileExactIndexedRows,
+  semanticQuarantineLimit,
 } from "./analyze.js";
 
 describe("buildAnalyzeMessages", () => {
@@ -169,6 +170,14 @@ describe("reconcileExactIndexedRows", () => {
     ]);
     assert.equal(result.complete, true);
     assert.deepEqual(result.ordered.map((x) => x.note), ["a", "b", "c"]);
+  });
+});
+
+describe("semanticQuarantineLimit", () => {
+  it("allows a small isolated set but caps at five percent", () => {
+    assert.equal(semanticQuarantineLimit(20), 2);
+    assert.equal(semanticQuarantineLimit(120), 6);
+    assert.equal(semanticQuarantineLimit(200), 10);
   });
 });
 
