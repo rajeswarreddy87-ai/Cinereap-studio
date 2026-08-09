@@ -5566,90 +5566,30 @@ Return every slot exactly once and obey each MAX word count.`;
         //   even            → mismatch (e.g. 7 files, 44 beats) → equal slice per beat
         //   word-count      → narration text available and lengths match → proportional
         const voiceBeatMatch = voDurs.length === scenes.length && scenes.length > 0;
-        let useEvenDist = !voiceBeatMatch;
-        const distMode = voiceBeatMatch ? "per-beat-audio" : "even";
+        if (!voiceBeatMatch) {
+          throw new Error(
+            `PRO-QC requires one measured TTS file per beat; got ${voDurs.length} files for ${scenes.length} beats`
+          );
+        }
+        const useEvenDist = false;
+        const distMode = "measured-per-beat-tts";
         console.log(`[render ${jobId}] SYNC: distribution=${distMode} (${voDurs.length} voiceFiles, ${scenes.length} beats)`);
 
-        // Whisper word-level alignment (req #3): when voice file count ≠ beat count
-        // (even-distribution mode) AND an OpenAI key is available, run Whisper on the
-        // combined voiceover to get EXACT per-beat durations from actual speech timing.
-        // This eliminates word-count estimation drift (the cause of 15s vs 54s swings).
+        // v5 single duration authority: each independently-generated TTS file's
+        // measured duration drives fit, timeline, trim, mux, subtitles, and QC.
+        // Re-transcribing TTS with Whisper introduced a second, slightly
+        // different duration array; mux could then use a third fallback and fail
+        // after a successful preflight by ~0.3s.
         whisperBeatDurations = null; // reset each sync pass (declared at function scope above)
-        // ChatGPT pipeline: run Whisper alignment whenever an OpenAI key is available
-        // and voice files + beat texts are ready — not just on even-distribution paths.
-        // Per-beat TTS (one file per beat) gives the BEST Whisper word alignment since
-        // the word-count cursor matches exactly one narration text per audio file.
-        if (SERVER_OPENAI_KEY && voiceoverFileIds.length > 0 && beatTexts.length === scenes.length) {
-          try {
-            await jobStore.update(jobId, { message: "Aligning beat timing with Whisper word timestamps" });
-            const wDurs = await alignBeatsByWhisperWords(voiceoverFileIds, beatTexts, SERVER_OPENAI_KEY, UPLOADS_DIR);
-            if (Array.isArray(wDurs) && wDurs.length === beatTexts.length && wDurs.every((d) => d !== null && d > 0)) {
-              whisperBeatDurations = wDurs;
-              useEvenDist = false;
-              console.log(`[render ${jobId}] SYNC: Whisper word alignment succeeded → exact per-beat durations`);
-            } else {
-              console.warn(`[render ${jobId}] SYNC: Whisper alignment returned partial nulls; falling back to even dist`);
-            }
-          } catch (wErr) {
-            console.warn(`[render ${jobId}] SYNC: Whisper alignment failed (using even distribution):`, wErr?.message || wErr);
-          }
-        }
-
-        // ── Long Scene Subdivision ──────────────────────────────────────────
-        // Any scene window longer than 60s is split into ~20s sub-ranges before
-        // planSyncedRender. This prevents a single long conversation scene from
-        // filling the entire forward cursor with one static shot.
-        function subdivideScenes(sceneArr, maxSec = 60, subSec = 20) {
-          const out = [];
-          for (const sc of sceneArr) {
-            const dur = Number(sc.endSec) - Number(sc.startSec);
-            // MULTI-EVENT: a scene with subWindows already represents several
-            // small, individually vision-verified clips rather than one
-            // continuous span — subdividing by raw startSec/endSec would
-            // slice across sub-window boundaries and destroy them (and the
-            // subWindows array itself wouldn't survive the ...sc spread
-            // correctly split). Always keep these intact.
-            if (dur <= maxSec || (Array.isArray(sc.subWindows) && sc.subWindows.length > 1)) { out.push(sc); continue; }
-            // Split into subSec-length chunks; last chunk absorbs the remainder.
-            let cur = Number(sc.startSec);
-            let sub = 0;
-            while (cur < Number(sc.endSec) - 0.5) {
-              const next = Math.min(cur + subSec, Number(sc.endSec));
-              out.push({ ...sc, startSec: cur, endSec: next, _subLabel: `${sc.index ?? "?"}${String.fromCharCode(65 + sub)}` });
-              cur = next;
-              sub++;
-            }
-          }
-          return out;
-        }
-        // Skip SUBDIVIDE when exact per-beat TTS durations are available.
-        // SUBDIVIDE expands scene count (e.g. 80→251) but whisperBeatDurations stays at 80.
-        // planSyncedRender requires beatDurations.length === scenes.length to use real TTS
-        // durations — a mismatch causes it to fall back to equal distribution (all clips same
-        // length → zero sync). When we have per-beat audio, subdivision is unnecessary anyway:
-        // each beat already has an exact measured duration and the forward cursor handles variety.
-        //
-        // IMPORTANT: also skip when per-beat Speechify voDurs matches scene count —
-        // previously whisperBeatDurations was always null for Speechify, causing subdivide
-        // to always run and produce a scenes/durations length mismatch → equal distribution
-        // → all clips 2.80s → 33% gap-fill → zigzag video.
-        const hasExactBeatDurs = (
-          (Array.isArray(whisperBeatDurations) && whisperBeatDurations.length === scenes.length) ||
-          (Array.isArray(voDurs) && voDurs.length === scenes.length)
-        );
-        const scenesForPlan = hasExactBeatDurs ? scenes : subdivideScenes(scenes, 60, 20);
-        if (hasExactBeatDurs) {
-          const _durSrc = Array.isArray(whisperBeatDurations) ? 'whisper' : 'speechify';
-          console.log(`[render ${jobId}] SUBDIVIDE: skipped — exact per-beat TTS durations present (${scenes.length} scenes, source=${_durSrc})`);
-        } else if (scenesForPlan.length !== scenes.length) {
-          console.log(`[render ${jobId}] SUBDIVIDE: ${scenes.length} scenes → ${scenesForPlan.length} after splitting long scenes (>60s)`);
-        }
+        _perBeatTtsDurations = voDurs.slice();
+        const scenesForPlan = scenes;
+        console.log(`[render ${jobId}] TIMING-SOURCE: measured TTS is authoritative for ${voDurs.length} beats`);
 
         const plan = planSyncedRender({
           scenes: scenesForPlan,
           voiceTotalSec: voiceTotalPre,
           beatTexts,
-          beatDurations: whisperBeatDurations || voDurs,
+          beatDurations: voDurs,
           // When voice file count does not match beat count we cannot know how
           // narration maps to individual beats.  Even distribution (equal seconds
           // per beat) is far more accurate than word-count of short reason labels
@@ -5667,6 +5607,32 @@ Return every slot exactly once and obey each MAX word count.`;
           lockWindows: true,
         });
         if (Array.isArray(plan.timeline) && plan.timeline.length > 0) {
+          // Comprehensive preflight before launching hundreds of FFmpeg trims.
+          // Every beat must have enough planned moving footage for the same
+          // measured TTS duration that Phase B will mux.
+          const plannedByBeat = new Array(beats.length).fill(0);
+          for (const seg of plan.timeline) {
+            const bi = Number(seg.beatIndex);
+            if (Number.isInteger(bi) && bi >= 0 && bi < plannedByBeat.length) {
+              plannedByBeat[bi] += Math.max(0, Number(seg.endSec) - Number(seg.startSec));
+            }
+          }
+          const preflightFailures = voDurs.map((tts, i) => ({
+            i,
+            tts: Number(tts) || 0,
+            video: plannedByBeat[i] || 0,
+          })).filter((x) => x.tts - x.video > 0.15);
+          if (preflightFailures.length > 0) {
+            const sample = preflightFailures.slice(0, 10)
+              .map((x) => `beat${x.i}[planned=${x.video.toFixed(2)}s tts=${x.tts.toFixed(2)}s]`)
+              .join(", ");
+            throw new Error(
+              `PRO-QC timeline preflight failed for ${preflightFailures.length}/${beats.length} beat(s): ${sample}`
+            );
+          }
+          console.log(
+            `[render ${jobId}] TIMELINE-PREFLIGHT PASS: ${beats.length}/${beats.length} beats covered by authoritative TTS durations`
+          );
           const _durLog = (Array.isArray(plan.beatDurations) ? plan.beatDurations : [])
             .map((d) => (Number.isFinite(Number(d)) ? Number(d).toFixed(2) : "?"))
             .join(",");
@@ -5845,12 +5811,13 @@ Return every slot exactly once and obey each MAX word count.`;
       end = Math.min(start + MIN_CLIP_SEC, Number.isFinite(hardMax) ? Math.max(0, hardMax - 0.05) : start + MIN_CLIP_SEC);
     }
     if (end - start < 0.1) { droppedCount++; continue; }
-    // QC: skip clips that are predominantly black screen.
-    if (_isBlackClip(start, end)) { blackDropped++; droppedCount++; continue; }
+    // v5: do not silently drop timeline material after duration preflight.
+    // Dark movie scenes can be intentional; semantic/final QC decides quality.
+    if (_isBlackClip(start, end)) blackDropped++;
     cleanClips.push({ startSec: start, endSec: end, beatIndex: ts?.beatIndex });
   }
   if (blackDropped > 0) {
-    console.log(`[render ${jobId}] QC: dropped ${blackDropped} black-frame clip(s) from timeline`);
+    console.warn(`[render ${jobId}] QC: retained ${blackDropped} predominantly dark clip(s) to preserve A/V mapping`);
   }
 
   if (cleanClips.length === 0) {
@@ -5860,8 +5827,31 @@ Return every slot exactly once and obey each MAX word count.`;
     );
   }
   if (droppedCount > 0) {
-    await jobStore.update(jobId, { message: `Skipped ${droppedCount} invalid clip range(s)` });
-    console.warn(`[render ${jobId}] dropped ${droppedCount}/${timestamps.length} invalid clip ranges`);
+    throw new Error(
+      `PRO-QC: sanitization rejected ${droppedCount}/${timestamps.length} planned clip range(s); ` +
+      `refusing a shortened/index-shifted timeline`
+    );
+  }
+  if (Array.isArray(_perBeatTtsDurations) && Array.isArray(beats)) {
+    const sourceByBeat = new Array(beats.length).fill(0);
+    for (const clip of cleanClips) {
+      const bi = Number(clip.beatIndex);
+      if (Number.isInteger(bi) && bi >= 0 && bi < sourceByBeat.length) {
+        sourceByBeat[bi] += Math.max(0, Number(clip.endSec) - Number(clip.startSec));
+      }
+    }
+    const shortages = beats.map((beat, i) => {
+      const speed = Number(beat?.slowFactor) > 0 ? Number(beat.slowFactor) : 1;
+      const requiredSource = (Number(_perBeatTtsDurations[i]) || 0) * speed;
+      return { i, have: sourceByBeat[i], need: requiredSource };
+    }).filter((x) => x.need - x.have > 0.15);
+    if (shortages.length > 0) {
+      const sample = shortages.slice(0, 10)
+        .map((x) => `beat${x.i}[source=${x.have.toFixed(2)}s need=${x.need.toFixed(2)}s]`)
+        .join(", ");
+      throw new Error(`PRO-QC sanitized timeline shortage for ${shortages.length} beat(s): ${sample}`);
+    }
+    console.log(`[render ${jobId}] SANITIZED-PREFLIGHT PASS: ${beats.length}/${beats.length} beats retain required source duration`);
   }
 
   // ── HOOK V2 TTS + FOOTAGE ─────────────────────────────────────────────────
@@ -6194,11 +6184,44 @@ Return every slot exactly once and obey each MAX word count.`;
     launchNext(); // kick off the pool
   });
 
-  // Compact to only successfully-trimmed clips (no holes).
-  let clipPaths = trimResults.filter((p) => p);
-  if (clipPaths.length === 0) {
-    throw new Error("All clip trims failed — check the source file and timestamps.");
+  // v5: never compact trim holes. Compacting shifts clipPaths[j] away from
+  // cleanClips[j], assigning every later source clip to the wrong beat.
+  const _failedTrimIndices = trimResults
+    .map((p, i) => p ? -1 : i)
+    .filter((i) => i >= 0);
+  if (_failedTrimIndices.length > 0) {
+    throw new Error(
+      `PRO-QC: ${_failedTrimIndices.length}/${trimResults.length} clip trim(s) failed ` +
+      `[${_failedTrimIndices.slice(0, 20).join(",")}]; refusing index-shifted fallback`
+    );
   }
+  let clipPaths = trimResults;
+
+  // Verify actual encoded clip durations before grouping/mux. This catches
+  // frame-rate quantization, setpts mistakes, or truncated FFmpeg outputs in
+  // one consolidated preflight instead of failing beat-by-beat later.
+  const _actualTrimDurs = await Promise.all(
+    clipPaths.map((p) => probeDurationSec(p).catch(() => 0))
+  );
+  const _actualByBeat = new Array(beats.length).fill(0);
+  for (let i = 0; i < clipPaths.length; i++) {
+    const bi = Number(cleanClips[i]?.beatIndex);
+    if (Number.isInteger(bi) && bi >= 0 && bi < _actualByBeat.length) {
+      _actualByBeat[bi] += Number(_actualTrimDurs[i]) || 0;
+    }
+  }
+  const _encodedShortages = beats.map((_, i) => ({
+    i,
+    video: _actualByBeat[i],
+    tts: Number(_perBeatTtsDurations?.[i]) || 0,
+  })).filter((x) => x.tts - x.video > 0.45);
+  if (_encodedShortages.length > 0) {
+    const sample = _encodedShortages.slice(0, 10)
+      .map((x) => `beat${x.i}[encoded=${x.video.toFixed(2)}s tts=${x.tts.toFixed(2)}s]`)
+      .join(", ");
+    throw new Error(`PRO-QC encoded trim shortage for ${_encodedShortages.length} beat(s): ${sample}`);
+  }
+  console.log(`[render ${jobId}] ENCODED-PREFLIGHT PASS: ${beats.length}/${beats.length} beat(s) within 450ms tolerance`);
 
   // Hook is kept separate — it will be muxed as an independent segment after
   // the body BEAT-MUX completes, then prepended to the final manifest.
@@ -6443,19 +6466,14 @@ Return every slot exactly once and obey each MAX word count.`;
     _beatGroupMap.get(_bi).push(clipPaths[_j]);
   }
   // Ordered list of unique beat indices (preserves timeline order)
-  let _beatOrder = [...new Set(cleanClips.map((cc) => typeof cc.beatIndex === "number" ? cc.beatIndex : 0))];
-  // v4.0.4 NEVER-DROP-NARRATION: in per-beat-audio mode, a beat whose window
-  // degenerated to zero sub-clips used to silently vanish — its narration
-  // audio was dropped from the recap (render j5t4Kc84MF lost 2 beats ≈ 32s of
-  // story). Re-insert every voiced beat; Phase A below direct-trims fallback
-  // footage from the beat's own window for them.
-  if (Array.isArray(beats) && voiceoverFileIds.length === beats.length) {
-    const _withClips = new Set(_beatOrder);
-    const _missing = beats.map((_, i) => i).filter((i) => !_withClips.has(i) && voiceoverFileIds[i]);
-    if (_missing.length > 0) {
-      _beatOrder = beats.map((_, i) => i).filter((i) => _withClips.has(i) || voiceoverFileIds[i]);
-      console.log(`[render ${jobId}] BEAT-MUX MAP: re-inserted ${_missing.length} clip-less voiced beat(s) [${_missing.join(",")}] — fallback footage will be direct-trimmed`);
-    }
+  const _beatOrder = [...new Set(cleanClips.map((cc) => typeof cc.beatIndex === "number" ? cc.beatIndex : 0))];
+  if (Array.isArray(beats) && _beatOrder.length !== beats.length) {
+    const withClips = new Set(_beatOrder);
+    const missing = beats.map((_, i) => i).filter((i) => !withClips.has(i));
+    throw new Error(
+      `PRO-QC beat map incomplete: ${_beatOrder.length}/${beats.length} beats have clips; ` +
+      `missing=[${missing.slice(0, 30).join(",")}]`
+    );
   }
   console.log(`[render ${jobId}] BEAT-MUX MAP: ${cleanClips.length} sub-clips → ${_beatOrder.length} body beats`);
 
@@ -6551,29 +6569,7 @@ Return every slot exactly once and obey each MAX word count.`;
   for (const _bi of _beatOrder) {
     const _beatClips = _beatGroupMap.get(_bi) || [];
     if (_beatClips.length === 0) {
-      // v4.0.4: voiced beat with no sub-clips (degenerate window) — direct-trim
-      // fallback footage from the beat's own window so its narration survives.
-      const _fb = Array.isArray(beats) ? beats[_bi] : null;
-      const _fbStart = Math.max(0, Number(_fb?.startSec));
-      if (_fb && Number.isFinite(_fbStart)) {
-        const _fbWin = Math.max(0, Number(_fb.endSec) - _fbStart);
-        const _fbLen = Math.max(4, Math.min(20, _fbWin > 1 ? _fbWin : 8));
-        const _fbPath = path.join(UPLOADS_DIR, `beat-fallback-${jobId}-${String(_bi).padStart(3, "0")}.mp4`);
-        const _fbOk = await new Promise((res) => {
-          const ff = spawn("ffmpeg", buildTrimArgs({
-            inputPath: sourcePath, startSec: _fbStart, endSec: _fbStart + _fbLen,
-            outputPath: _fbPath, reencode: true,
-          }), { stdio: "ignore" });
-          const t = setTimeout(() => { try { ff.kill("SIGKILL"); } catch {} res(false); }, 90_000);
-          ff.on("close", (c) => { clearTimeout(t); res(c === 0); });
-          ff.on("error", () => { clearTimeout(t); res(false); });
-        });
-        if (_fbOk) {
-          _beatVideoStore.set(_bi, _fbPath);
-          console.log(`[render ${jobId}] PHASE-A: beat ${_bi} had no sub-clips — direct-trimmed ${_fbLen.toFixed(1)}s fallback from its own window`);
-        }
-      }
-      continue;
+      throw new Error(`PRO-QC beat ${_bi}: no planned sub-clips after successful preflight`);
     }
     let _beatVidPath;
     if (_beatClips.length === 1) {
@@ -6582,8 +6578,7 @@ Return every slot exactly once and obey each MAX word count.`;
       _beatVidPath = path.join(UPLOADS_DIR, `beat-concat-${jobId}-${String(_bi).padStart(3, "0")}.mp4`);
       const concatOk = await _concatVideoClips(_beatClips, _beatVidPath);
       if (!concatOk) {
-        console.warn(`[render ${jobId}] beat-concat ${_bi} failed — using first sub-clip`);
-        _beatVidPath = _beatClips[0];
+        throw new Error(`PRO-QC beat ${_bi}: sub-clip concat failed; refusing first-clip fallback`);
       }
     }
     _beatVideoStore.set(_bi, _beatVidPath);
@@ -6612,16 +6607,12 @@ Return every slot exactly once and obey each MAX word count.`;
     const _voPath  = _voId ? path.join(UPLOADS_DIR, _voId) : null;
 
     if (!_voPath) {
-      _muxedPaths.push(_beatRawVidPath);
-      _beatMuxDone++;
-      continue;
+      throw new Error(`PRO-QC beat ${_bi}: missing narration file ID`);
     }
     let _hasVoice = false;
     try { await fs.access(_voPath); _hasVoice = true; } catch {}
     if (!_hasVoice) {
-      _muxedPaths.push(_beatRawVidPath);
-      _beatMuxDone++;
-      continue;
+      throw new Error(`PRO-QC beat ${_bi}: narration file not found (${_voId})`);
     }
 
     let _beatVideoPath = _beatRawVidPath;
@@ -6650,9 +6641,7 @@ Return every slot exactly once and obey each MAX word count.`;
       // caused gap-fill to fire on every beat trying to match silence that the mux
       // discards anyway. Use whisperBeatDurations (content-only, from Whisper word
       // alignment) or _perBeatTtsDurations (measured during generation) instead.
-      const _tsDurArr = Array.isArray(whisperBeatDurations) ? whisperBeatDurations
-                      : Array.isArray(_perBeatTtsDurations) ? _perBeatTtsDurations
-                      : null;
+      const _tsDurArr = Array.isArray(_perBeatTtsDurations) ? _perBeatTtsDurations : null;
       const _voiDur = (_tsDurArr && Number(_tsDurArr[_bi]) > 0.05)
         ? Number(_tsDurArr[_bi])
         : await probeDurationSec(_voPath).catch(() => 0);
@@ -6662,7 +6651,7 @@ Return every slot exactly once and obey each MAX word count.`;
       // v5 professional gate: a short video segment indicates an upstream
       // narration/footage contract violation. Never borrow adjacent scenes,
       // stack another slow-motion pass, or hide it with a long cloned frame.
-      if (_gap > 0.30) {
+      if (_gap > 0.45) {
         throw new Error(
           `PRO-QC beat ${_bi}: rendered moving footage ${_vidDur.toFixed(2)}s is ` +
           `${_gap.toFixed(2)}s shorter than narration ${_voiDur.toFixed(2)}s. ` +
@@ -6670,7 +6659,7 @@ Return every slot exactly once and obey each MAX word count.`;
         );
       }
 
-      if (false && _gap > 0.30 && _vidDur > 0) {
+      if (false && _gap > 0.45 && _vidDur > 0) {
         // CASE 1: video shorter than TTS by > 0.30s
         const _beat      = beats[_bi];
         const _nextBeat  = beats[_bi + 1];
@@ -6835,7 +6824,7 @@ Return every slot exactly once and obey each MAX word count.`;
       // v5: only a sub-frame/encoder-delay tail is allowed. Larger deficits
       // already fail above; never hide them behind multi-second still images.
       if (_drift > 0) {
-        _muxPadSec = Math.min(0.35, Math.max(_muxPadSec, _drift + 0.05));
+        _muxPadSec = Math.min(0.50, Math.max(_muxPadSec, _drift + 0.05));
       }
     }
     // ── END GAP-FILL ──────────────────────────────────────────────────────────
