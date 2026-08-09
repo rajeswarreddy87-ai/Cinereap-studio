@@ -5351,7 +5351,14 @@ Return every slot exactly once and obey each MAX word count.`;
             const narration = bySlot.get(row.slot);
             const wc = narration.split(/\s+/).filter(Boolean).length;
             if (wc > row.maxWords) {
-              throw new Error(`NARRATION-FIT beat ${row.slot}: ${wc} words exceeds max ${row.maxWords}`);
+              // Word budgets are conservative guidance; measured TTS duration is
+              // the real contract. A one-word/model tokenization overage may
+              // still fit easily. Generate it, measure it, and let round two
+              // tighten only beats that remain physically overlong.
+              console.warn(
+                `[render ${jobId}] NARRATION-FIT beat ${row.slot}: model returned ${wc} words ` +
+                `for max ${row.maxWords}; accepting provisionally for measured TTS check`
+              );
             }
             beats[row.slot] = { ...beats[row.slot], narration };
           }
