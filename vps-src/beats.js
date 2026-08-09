@@ -415,7 +415,15 @@ export function buildSyncedTimeline(scenes, beatDurations, opts = {}) {
       // maxClipSec is a hard cap. In copyright-safe mode the render passes 3.0s;
       // high-importance/climax beats still get more sub-clips, not longer raw clips.
       const beatMaxCut = Math.min(maxClipSec, computedMaxCut);
-      const clipLen = Math.min(need, beatMaxCut);
+      let clipLen = Math.min(need, beatMaxCut);
+      // v5: never strand a residual shorter than minSegSec. Example: need
+      // 2.64s with a 2.50s cut cap previously emitted 2.50s, then silently
+      // dropped the remaining 0.14s. Absorb that tiny residual into this clip;
+      // the copyright cut cap is exceeded by <minSegSec only.
+      const residualAfterCut = need - clipLen;
+      if (residualAfterCut > 0 && residualAfterCut < minSegSec) {
+        clipLen = need;
+      }
       // FIX (overflow guard, 2026-07-05): clipEnd was only ever clamped to the
       // GLOBAL ceiling (end of the whole source video), never to this
       // window's own (possibly coverage-expanded) sceneEnd. When a window is

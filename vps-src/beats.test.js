@@ -71,6 +71,17 @@ test("buildSyncedTimeline: own scene long enough -> single trimmed seg, no repea
   assert.ok(Math.abs(tl[1].startSec - 100) < 1e-6);
 });
 
+test("buildSyncedTimeline: absorbs sub-minimum residual into preceding cut", () => {
+  const tl = buildSyncedTimeline(
+    [{ startSec: 10, endSec: 20 }],
+    [2.64],
+    { sourceDurationSec: 100, maxClipSec: 2.5, minSegSec: 0.4, lockWindows: true },
+  );
+  const total = tl.reduce((sum, seg) => sum + (seg.endSec - seg.startSec), 0);
+  assert.equal(tl.length, 1);
+  assert.ok(Math.abs(total - 2.64) < 0.01, `total=${total}`);
+});
+
 test("buildSyncedTimeline: short own scene pulls NEXT scene footage forward", () => {
   const scenes = [
     { startSec: 0, endSec: 2 },     // beat 0 needs 5s but only has 2s
