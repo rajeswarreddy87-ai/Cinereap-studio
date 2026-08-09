@@ -536,7 +536,7 @@ export async function fetchWikipediaFilmGrounding({ title, year } = {}) {
   const cleanTitle = String(title || "").trim();
   if (!cleanTitle) return "";
   const query = `${cleanTitle}${year ? ` ${year}` : ""} film`;
-  const ua = "CineRecap/5.0 (movie recap metadata grounding)";
+  const ua = "CineRecap/5.0 (https://github.com/rajeswarreddy87-ai/Cinereap-studio)";
   const searchUrl =
     `https://en.wikipedia.org/w/api.php?action=query&list=search&format=json&utf8=1&srsearch=${encodeURIComponent(query)}`;
   const searchRes = await fetch(searchUrl, {
@@ -2128,27 +2128,44 @@ export async function analyzeWithScenes({
       const output = [];
       for (let i = 0; i < sceneSubset.length; i += QC_BATCH) {
         const batch = sceneSubset.slice(i, i + QC_BATCH);
-        const qcText = await callLLM({
-          provider: qcProvider,
-          apiKey: qcApiKey,
-          model: qcModel,
-          messages: buildNarrationQcMessages({ scenes: batch, narrationByIndex }),
-          maxTokens: 1800,
-          jsonMode: true,
-        });
-        let qcObj;
-        try { qcObj = JSON.parse(qcText); }
-        catch { qcObj = JSON.parse(repairJson(qcText)); }
-        const results = Array.isArray(qcObj?.results) ? qcObj.results : [];
-        if (results.length !== batch.length) {
-          throw new Error(`Semantic QC count mismatch: sent ${batch.length}, received ${results.length}`);
-        }
-        results.forEach((result, j) => {
+        const messages = buildNarrationQcMessages({ scenes: batch, narrationByIndex });
+        const scoreWith = async (reviewProvider, reviewKey, reviewModel) => {
+          const qcText = await callLLM({
+            provider: reviewProvider,
+            apiKey: reviewKey,
+            model: reviewModel,
+            messages,
+            maxTokens: 1800,
+            jsonMode: true,
+          });
+          let qcObj;
+          try { qcObj = JSON.parse(qcText); }
+          catch { qcObj = JSON.parse(repairJson(qcText)); }
+          const results = Array.isArray(qcObj?.results) ? qcObj.results : [];
+          if (results.length !== batch.length) {
+            throw new Error(`${reviewProvider} semantic QC count mismatch: sent ${batch.length}, received ${results.length}`);
+          }
+          return results;
+        };
+        const primary = await scoreWith(qcProvider, qcApiKey, qcModel);
+        // When the writer is Claude and the configured independent reviewer is
+        // OpenAI/Gemini, require both to pass. A single model's visual false
+        // positive cannot approve a beat.
+        const secondary = qcProvider !== provider
+          ? await scoreWith(provider, apiKey, model)
+          : null;
+        primary.forEach((result, j) => {
+          const second = secondary?.[j];
+          const score = second
+            ? Math.min(Number(result.score) || 0, Number(second.score) || 0)
+            : Number(result.score) || 0;
           output.push({
             index: batch[j].index,
-            score: Math.max(0, Math.min(1, Number(result.score) || 0)),
-            ok: result.ok === true,
-            reason: String(result.reason || "").slice(0, 240),
+            score: Math.max(0, Math.min(1, score)),
+            ok: result.ok === true && (!second || second.ok === true),
+            reason: second
+              ? `${qcProvider}: ${String(result.reason || "")} | ${provider}: ${String(second.reason || "")}`.slice(0, 360)
+              : String(result.reason || "").slice(0, 240),
           });
         });
       }
@@ -2217,7 +2234,7 @@ export async function analyzeWithScenes({
       }
     }
     console.log(
-      `[analyzeWithScenes] ${qcProvider.toUpperCase()}-QC: ` +
+      `[analyzeWithScenes] ${qcProvider !== provider ? `${qcProvider.toUpperCase()}+${provider.toUpperCase()}` : qcProvider.toUpperCase()}-QC: ` +
       `${semanticQc.length - rejected.length}/${semanticQc.length} beats passed semantic visual QC`
     );
     if (rejected.length > 0) {
