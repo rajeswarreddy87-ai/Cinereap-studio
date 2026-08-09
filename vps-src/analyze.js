@@ -996,6 +996,7 @@ export function buildValidationMessages({ movie, scenes, noteByIndex }) {
       `For ok=false, provide a corrected note (max 14 words) describing ONLY what the frames show.\n\n` +
       `Respond with valid JSON ONLY:\n` +
       `{ "validations": [ { "index": 0, "ok": true } ] }\n` +
+      `Echo every EXACT scene index shown above, in the same order; never renumber a batch from zero.\n` +
       `Add "note": "corrected text" for ok=false entries only. No prose.`,
   });
   return [{ role: "user", content }];
@@ -1757,9 +1758,10 @@ export async function analyzeWithScenes({
 
     // Retry only missing IDs in small groups. If a 5-scene group still omits
     // rows, recursion eventually reaches single-scene requests.
-    for (let i = 0; i < missing.length; i += 5) {
-      const subset = missing.slice(i, i + 5);
-      const recovered = await requestSceneNotes(subset, `${label}/missing-${i / 5 + 1}`);
+    const chunkSize = missing.length <= 5 ? 1 : 5;
+    for (let i = 0; i < missing.length; i += chunkSize) {
+      const subset = missing.slice(i, i + chunkSize);
+      const recovered = await requestSceneNotes(subset, `${label}/missing-${Math.floor(i / chunkSize) + 1}`);
       charactersOut.push(...recovered.characters);
       for (const row of recovered.beats) acceptedById.set(Number(row.index), row);
     }
@@ -1840,6 +1842,15 @@ export async function analyzeWithScenes({
         for (const [id, row] of reconciled.acceptedById) {
           if (!acceptedById.has(id)) acceptedById.set(id, row);
         }
+        const sequentialRenumber = validations.length === sceneBatch.length &&
+          validations.every((v, j) => Number(v.index) === j) &&
+          sceneBatch.some((sc, j) => Number(sc.index) !== j);
+        if (sequentialRenumber) {
+          validations.forEach((v, j) => {
+            acceptedById.set(Number(sceneBatch[j].index), { ...v, index: sceneBatch[j].index });
+          });
+          console.warn(`[analyzeWithScenes] VALIDATION-RETRY ${label}: repaired sequentially renumbered response by position`);
+        }
         if (sceneBatch.length === 1 && validations.length === 1) {
           acceptedById.set(Number(sceneBatch[0].index), { ...validations[0], index: sceneBatch[0].index });
         }
@@ -1852,9 +1863,10 @@ export async function analyzeWithScenes({
       }
       const missing = sceneBatch.filter((sc) => !acceptedById.has(Number(sc.index)));
       if (sceneBatch.length === 1) throw new Error(`Validation omitted scene ${sceneBatch[0].index}`);
-      for (let i = 0; i < missing.length; i += 5) {
-        const subset = missing.slice(i, i + 5);
-        const recovered = await requestValidations(subset, `${label}/missing-${i / 5 + 1}`);
+      const chunkSize = missing.length <= 5 ? 1 : 5;
+      for (let i = 0; i < missing.length; i += chunkSize) {
+        const subset = missing.slice(i, i + chunkSize);
+        const recovered = await requestValidations(subset, `${label}/missing-${Math.floor(i / chunkSize) + 1}`);
         for (const row of recovered) acceptedById.set(Number(row.index), row);
       }
       return sceneBatch.map((sc) => acceptedById.get(Number(sc.index)));
@@ -2014,12 +2026,13 @@ export async function analyzeWithScenes({
     if (beatBatch.length === 1) {
       throw new Error(`Stage-B beat ${beatBatch[0].beatId || beatBatch[0].index} omitted after two attempts`);
     }
-    for (let i = 0; i < missing.length; i += 5) {
-      const subset = missing.slice(i, i + 5);
+    const chunkSize = missing.length <= 5 ? 1 : 5;
+    for (let i = 0; i < missing.length; i += chunkSize) {
+      const subset = missing.slice(i, i + chunkSize);
       const recovered = await requestNarrations(
         subset,
         { ...batchInfo, start: batchInfo.start + i, prevEnding: batchInfo.prevEnding },
-        `${label}/missing-${i / 5 + 1}`,
+        `${label}/missing-${Math.floor(i / chunkSize) + 1}`,
       );
       for (const row of recovered) acceptedById.set(Number(row.index), row);
     }
@@ -2100,9 +2113,15 @@ export async function analyzeWithScenes({
     }
     const missing = batch.filter((b) => !acceptedById.has(Number(b.index)));
     if (batch.length === 1) throw new Error(`Continuity edit omitted beat ${batch[0].index}`);
-    for (let i = 0; i < missing.length; i += 5) {
-      const subset = missing.slice(i, i + 5);
-      const recovered = await requestContinuity(subset, `${label}/missing-${i / 5 + 1}`, previousEnding, nextOpening);
+    const chunkSize = missing.length <= 5 ? 1 : 5;
+    for (let i = 0; i < missing.length; i += chunkSize) {
+      const subset = missing.slice(i, i + chunkSize);
+      const recovered = await requestContinuity(
+        subset,
+        `${label}/missing-${Math.floor(i / chunkSize) + 1}`,
+        previousEnding,
+        nextOpening,
+      );
       for (const row of recovered) acceptedById.set(Number(row.index), row);
     }
     return batch.map((b) => acceptedById.get(Number(b.index)));
