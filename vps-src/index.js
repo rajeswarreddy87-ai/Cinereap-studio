@@ -4756,6 +4756,41 @@ async function runRenderFromIngest(jobId, {
           if (_rederived > 0) {
             console.log(`[render ${jobId}] SCENE-LOCK: re-derived ${_rederived}/${beats.length} beat window(s) from sceneIds (narration↔timestamp misalignment healed)`);
           }
+
+          // ── SAME-SCENE SPLIT (v4.0.4) ─────────────────────────────────────
+          // FIX (render j5t4Kc84MF): consecutive beats that resolve to the SAME
+          // scene window collapse to zero width at OVERLAP-TRIM (16 collisions,
+          // 2 beats dropped along with their narration). Split the span from
+          // the shared start to the next DISTINCT beat start equally among the
+          // group so every beat keeps real, non-overlapping footage.
+          {
+            const _order = beats.map((_, i) => i)
+              .sort((x, y) => Number(beats[x].startSec) - Number(beats[y].startSec));
+            let _splitGroups = 0;
+            let _gi = 0;
+            while (_gi < _order.length) {
+              let _gj = _gi + 1;
+              while (_gj < _order.length &&
+                     Number(beats[_order[_gj]].startSec) - Number(beats[_order[_gi]].startSec) < 0.5) _gj++;
+              const _n = _gj - _gi;
+              if (_n > 1) {
+                const _gs = Number(beats[_order[_gi]].startSec);
+                const _nextStart = _gj < _order.length ? Number(beats[_order[_gj]].startSec) : _gs + _n * 8;
+                const _span = Math.max(_n * 3, _nextStart - _gs);
+                const _share = _span / _n;
+                for (let _k = 0; _k < _n; _k++) {
+                  const _bi2 = _order[_gi + _k];
+                  const _s = _gs + _k * _share;
+                  beats[_bi2] = { ...beats[_bi2], startSec: _s, endSec: Math.min(_gs + _span, _s + _share) };
+                }
+                _splitGroups++;
+              }
+              _gi = _gj;
+            }
+            if (_splitGroups > 0) {
+              console.log(`[render ${jobId}] SCENE-LOCK: split ${_splitGroups} same-scene beat group(s) into distinct sub-ranges`);
+            }
+          }
         }
       } catch (_slErr) {
         console.warn(`[render ${jobId}] SCENE-LOCK: re-derivation skipped (non-fatal):`, _slErr?.message || _slErr);
@@ -5298,11 +5333,12 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
             if (tts <= 0 || win >= tts * 1.05) continue; // window ≥105% TTS — OK
             const ratio = win / tts;
 
-            if (ratio >= 0.70) {
-              // Mild mismatch (≤30% short): gentle slow-motion, max 1.43× slowdown.
-              // The clip is time-stretched via FFmpeg setpts so its output duration
-              // equals the TTS length exactly — no scene-borrowing needed.
-              // Looks cinematic; ratio < 0.70 would feel unnaturally sluggish.
+            if (ratio >= 0.80) {
+              // Mild mismatch (≤20% short): gentle slow-motion, max 1.25× slowdown.
+              // v4.0.4: threshold raised 0.70→0.80 — 0.70x slow-mo is visibly
+              // sluggish (user report: "all scenes in slow motion"). Beats in
+              // the 0.70–0.80 band now go through back-extension first, which
+              // adds REAL footage instead of stretching.
               slowMo++;
               _adq[i] = { ...b, slowFactor: ratio };
               continue;
@@ -5355,9 +5391,10 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
             if (newStart < Number(b.startSec) - 0.5) changes.startSec = newStart;
             if (newRatio < 1.05) {
               // Still short after both extensions — capped slow-mo on top; the
-              // mux hold-frame tail covers whatever remains.
+              // mux hold-frame tail covers whatever remains. v4.0.4: floor
+              // raised 0.70→0.80 (0.70x reads as obvious slow motion).
               slowMo++;
-              changes.slowFactor = Math.max(0.70, Math.min(1, newRatio));
+              changes.slowFactor = Math.max(0.80, Math.min(1, newRatio));
             }
             _adq[i] = { ...b, ...changes };
           }
@@ -5406,7 +5443,10 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
             const _oe = Number(_ob.endSec ?? 0);
             const _ns = Number(_on.startSec ?? 0);
             if (_oe - _ns > 0.05) {
-              beats[_oi] = { ..._ob, endSec: _ns };
+              // v4.0.4: never trim a beat below 1.5s of footage — a sliver of
+              // overlap with the next beat is invisible; a zero-width window
+              // drops the beat (and its narration) from the recap entirely.
+              beats[_oi] = { ..._ob, endSec: Math.max(_ns, Number(_ob.startSec) + 1.5) };
               _overlapFixed++;
             }
           }
@@ -6389,7 +6429,20 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
     _beatGroupMap.get(_bi).push(clipPaths[_j]);
   }
   // Ordered list of unique beat indices (preserves timeline order)
-  const _beatOrder = [...new Set(cleanClips.map((cc) => typeof cc.beatIndex === "number" ? cc.beatIndex : 0))];
+  let _beatOrder = [...new Set(cleanClips.map((cc) => typeof cc.beatIndex === "number" ? cc.beatIndex : 0))];
+  // v4.0.4 NEVER-DROP-NARRATION: in per-beat-audio mode, a beat whose window
+  // degenerated to zero sub-clips used to silently vanish — its narration
+  // audio was dropped from the recap (render j5t4Kc84MF lost 2 beats ≈ 32s of
+  // story). Re-insert every voiced beat; Phase A below direct-trims fallback
+  // footage from the beat's own window for them.
+  if (Array.isArray(beats) && voiceoverFileIds.length === beats.length) {
+    const _withClips = new Set(_beatOrder);
+    const _missing = beats.map((_, i) => i).filter((i) => !_withClips.has(i) && voiceoverFileIds[i]);
+    if (_missing.length > 0) {
+      _beatOrder = beats.map((_, i) => i).filter((i) => _withClips.has(i) || voiceoverFileIds[i]);
+      console.log(`[render ${jobId}] BEAT-MUX MAP: re-inserted ${_missing.length} clip-less voiced beat(s) [${_missing.join(",")}] — fallback footage will be direct-trimmed`);
+    }
+  }
   console.log(`[render ${jobId}] BEAT-MUX MAP: ${cleanClips.length} sub-clips → ${_beatOrder.length} body beats`);
 
   // ── STRUCTURAL GUARD (v2.9.3): body-collapse detection ──────────────────────
@@ -6483,7 +6536,31 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
 
   for (const _bi of _beatOrder) {
     const _beatClips = _beatGroupMap.get(_bi) || [];
-    if (_beatClips.length === 0) continue;
+    if (_beatClips.length === 0) {
+      // v4.0.4: voiced beat with no sub-clips (degenerate window) — direct-trim
+      // fallback footage from the beat's own window so its narration survives.
+      const _fb = Array.isArray(beats) ? beats[_bi] : null;
+      const _fbStart = Math.max(0, Number(_fb?.startSec));
+      if (_fb && Number.isFinite(_fbStart)) {
+        const _fbWin = Math.max(0, Number(_fb.endSec) - _fbStart);
+        const _fbLen = Math.max(4, Math.min(20, _fbWin > 1 ? _fbWin : 8));
+        const _fbPath = path.join(UPLOADS_DIR, `beat-fallback-${jobId}-${String(_bi).padStart(3, "0")}.mp4`);
+        const _fbOk = await new Promise((res) => {
+          const ff = spawn("ffmpeg", buildTrimArgs({
+            inputPath: sourcePath, startSec: _fbStart, endSec: _fbStart + _fbLen,
+            outputPath: _fbPath, reencode: true,
+          }), { stdio: "ignore" });
+          const t = setTimeout(() => { try { ff.kill("SIGKILL"); } catch {} res(false); }, 90_000);
+          ff.on("close", (c) => { clearTimeout(t); res(c === 0); });
+          ff.on("error", () => { clearTimeout(t); res(false); });
+        });
+        if (_fbOk) {
+          _beatVideoStore.set(_bi, _fbPath);
+          console.log(`[render ${jobId}] PHASE-A: beat ${_bi} had no sub-clips — direct-trimmed ${_fbLen.toFixed(1)}s fallback from its own window`);
+        }
+      }
+      continue;
+    }
     let _beatVidPath;
     if (_beatClips.length === 1) {
       _beatVidPath = _beatClips[0];
