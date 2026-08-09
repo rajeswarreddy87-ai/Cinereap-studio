@@ -1,0 +1,56 @@
+# Deploy the render server with: docker compose up -d
+#
+# Environment variables you should set in a sibling .env file:
+#   AUTH_TOKEN=...           required, the bearer token your phone uses
+#   PUBLIC_URL=https://...   required if exposing through a reverse proxy
+#   YT_CLIENT_ID=...         optional, only if you want direct YouTube upload
+#   YT_CLIENT_SECRET=...
+#   YT_REFRESH_TOKEN=...     get this via `npm run yt:auth` once
+#
+# Storage volumes are bind-mounted next to this file so you can back them up.
+services:
+  render:
+    build: .
+    image: cinerecap-render-server:latest
+    container_name: cinerecap-render
+    restart: unless-stopped
+    ports:
+      - "4040:8787"
+    environment:
+      - AUTH_TOKEN=${RENDER_AUTH_TOKEN}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - ANTHROPIC_MODEL=${ANTHROPIC_MODEL:-}
+      - SPEECHIFY_API_KEY=${SPEECHIFY_API_KEY:-}
+      - SPEECHIFY_VOICE_ID=${SPEECHIFY_VOICE_ID:-}
+      - ELEVENLABS_API_KEY=${ELEVENLABS_API_KEY:-}
+      - ELEVENLABS_VOICE_ID=${ELEVENLABS_VOICE_ID:-}
+      - HUME_API_KEY=${HUME_API_KEY:-}
+      - HUME_VOICE_NAME=${HUME_VOICE_NAME:-}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - GEMINI_MODEL=${GEMINI_MODEL:-gemini-2.5-flash}
+      - PRO_SEMANTIC_QC_ENABLED=${PRO_SEMANTIC_QC_ENABLED:-1}
+      - PRO_SEMANTIC_QC_PROVIDER=${PRO_SEMANTIC_QC_PROVIDER:-openai}
+      - PRO_SEMANTIC_QC_MODEL=${PRO_SEMANTIC_QC_MODEL:-}
+      - PRO_MAX_FREEZE_SEC=${PRO_MAX_FREEZE_SEC:-2.0}
+      - NARRATION_CONTINUITY_ENABLED=${NARRATION_CONTINUITY_ENABLED:-0}
+      - COPYRIGHT_SAFE_MODE=${COPYRIGHT_SAFE_MODE:-true}
+      - COPYRIGHT_SAFE_MAX_CLIP_SEC=${COPYRIGHT_SAFE_MAX_CLIP_SEC:-3.0}
+      - COPYRIGHT_SAFE_HOOK_CLIP_SEC=${COPYRIGHT_SAFE_HOOK_CLIP_SEC:-2.5}
+      - WATERMARK_TEXT=${WATERMARK_TEXT:-Plotline Panic}
+      - THUMB_MIN_BRIGHTNESS=${THUMB_MIN_BRIGHTNESS:-58}
+      - PUBLIC_URL=${RENDER_PUBLIC_URL:-}
+      - YT_CLIENT_ID=${YT_CLIENT_ID:-}
+      - YT_CLIENT_SECRET=${YT_CLIENT_SECRET:-}
+      - YT_REFRESH_TOKEN=${YT_REFRESH_TOKEN:-}
+      - YT_DLP_COOKIES_FILE=/data/cookies/cookies.txt
+      - REAL_DEBRID_API_KEY=${REAL_DEBRID_API_KEY:-}
+      - SEEDR_USERNAME=${SEEDR_USERNAME:-}
+      - SEEDR_PASSWORD=${SEEDR_PASSWORD:-}
+    volumes:
+      - ./src:/app/src
+      - ./start.sh:/app/start.sh
+      - ./storage/uploads:/data/uploads
+      - ./storage/output:/data/output
+      - ./storage/jobs:/data/jobs
+      - ./storage/cookies:/data/cookies
