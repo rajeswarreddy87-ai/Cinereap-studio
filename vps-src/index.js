@@ -5344,6 +5344,12 @@ Return every slot exactly once and obey each MAX word count.`;
               bySlot.set(slot, narration);
             }
           }
+          // A single-beat refit is positionally unambiguous. Models frequently
+          // renumber its original slot (e.g. 90) to zero despite instructions.
+          if (rows.length === 1 && returned.length === 1 && bySlot.size === 0) {
+            const narration = String(returned[0]?.narration || "").trim();
+            if (narration) bySlot.set(rows[0].slot, narration);
+          }
           if (bySlot.size !== rows.length) {
             throw new Error(`NARRATION-FIT round ${round}: expected ${rows.length} exact slots, received ${bySlot.size}`);
           }
