@@ -5283,7 +5283,11 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
           const win = Math.max(0, Number(b.endSec) - Number(b.startSec));
           const tts = Number(voDurs[i]) || 0;
           return { i, win, tts, ratio: tts > 0 ? win / tts : 1 };
-        }).filter((x) => x.tts > 0 && x.ratio < 0.95);
+        }).filter((x) =>
+          x.tts > 0 &&
+          x.ratio < 0.95 &&
+          (x.tts - x.win) > 0.15
+        );
 
         for (let round = 1; round <= 2; round++) {
           const failures = getFitFailures();
@@ -5400,9 +5404,9 @@ Return every slot exactly once and obey each MAX word count.`;
           const tts = Number(voDurs[i]) || 0;
           if (tts <= 0 || win >= tts) return { ...b, slowFactor: 1 };
           const ratio = win / tts;
-          if (ratio >= 0.95) {
+          if (ratio >= 0.95 || (tts - win) <= 0.15) {
             _microRetime++;
-            return { ...b, slowFactor: ratio };
+            return { ...b, slowFactor: Math.max(0.95, ratio) };
           }
           return { ...b, slowFactor: 1 };
         });
