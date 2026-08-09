@@ -974,6 +974,39 @@ export function buildNarrationRepairMessages({ scene, note, narration, maxWords 
   return [{ role: "user", content }];
 }
 
+export function buildContinuityMessages({ beats, characters, previousEnding = "", nextOpening = "" }) {
+  const cast = (characters || []).map((c) => `- ${c.name}: ${c.note}`).join("\n");
+  const rows = (beats || []).map((b) => {
+    const maxWords = Math.max(6, Math.min(45, Math.floor((Number(b.endSec) - Number(b.startSec)) * 2.05)));
+    return `${b.index} | MAX ${maxWords} WORDS | VISIBLE NOTE: ${b.reason} | CURRENT: ${b.narration}`;
+  }).join("\n");
+  return [{
+    role: "user",
+    content:
+`Edit these consecutive movie-recap beats into one naturally continuing story while preserving exact visual grounding.
+
+CANONICAL CHARACTERS:
+${cast}
+
+${previousEnding ? `PREVIOUS BATCH ENDING: ${previousEnding}\n` : ""}
+${nextOpening ? `NEXT BATCH OPENING (context only): ${nextOpening}\n` : ""}
+BEATS:
+${rows}
+
+RULES:
+1. Return every numeric index exactly once and in the same order.
+2. Preserve the visible event/fact in each beat. Never move an event to another beat or add an off-screen event.
+3. Make each beat continue naturally from the previous one. Add only a short truthful time/location/causal bridge when needed.
+4. Use canonical proper names for recurring principals from their first appearance. Never use "a man", "the man",
+   "a blonde woman", "the older man", or similar generic labels for a named main character.
+5. Resolve note/transcript aliases to canonical names by role and chronology. Do not invent names for truly minor unnamed people.
+6. Stay within each MAX word budget. Complete sentences, active present tense, no headings or meta-commentary.
+
+Return JSON only:
+{"beats":[{"index":0,"narration":"..."}]}`,
+  }];
+}
+
 export function parseValidationResponse(rawText) {
   if (typeof rawText !== "string") return [];
   let s = rawText.trim();
@@ -1078,7 +1111,10 @@ function _mergeCharacterCandidate(charByName, c) {
  */
 export function buildCanonicalizeCharactersMessages({ movie, characters, beatNotes = [] }) {
   const castList = characters.map((c, i) => `${i + 1}. ${c.name}: ${c.note}`).join("\n");
-  const contextNotes = beatNotes.slice(0, 50).map((b) => `- ${b.note}`).filter(Boolean).join("\n");
+  const contextNotes = beatNotes.slice(0, 140)
+    .map((b) => `- [${b.index}] ${b.note}`)
+    .filter(Boolean)
+    .join("\n");
   return [{
     role: "user",
     content: [{
@@ -1096,13 +1132,23 @@ export function buildCanonicalizeCharactersMessages({ movie, characters, beatNot
         (contextNotes ? `SCENE CONTEXT (sample beat notes, use to identify who is who):\n${contextNotes}\n\n` : ``) +
         `Produce a CLEAN, DEDUPLICATED canonical cast list:\n` +
         `  1. Merge every candidate that plausibly refers to the SAME person into ONE entry.\n` +
-        `  2. Choose the most complete, correctly-spelled proper name as canonical. If the candidates never ` +
-        `     give a proper name, keep the clearest neutral role label (e.g. "the trainer") — do NOT invent a name.\n` +
-        `  3. Write ONE factual note per character (5-10 words). If candidates conflict, use whichever fact is ` +
+        `  2. Choose the most complete, correctly-spelled proper CHARACTER name as canonical. You may use ` +
+        `     established knowledge of "${movie.title}" only to resolve the main cast's proper character names ` +
+        `     and obvious transcript misspellings; never use actor names.\n` +
+        `  3. GENERIC-ALIAS RULE (critical): merge labels such as "the blonde woman", "the older man", ` +
+        `     "the driver", "the wife", "the father", or "the protagonist" into an existing named character ` +
+        `     whenever relationship, location, chronology, or context shows they are the same person. Do not ` +
+        `     leave a generic duplicate beside its named counterpart (for example, a protagonist's named wife ` +
+        `     and "the blonde woman" viewing a house with him must be one entry).\n` +
+        `  4. Every recurring lead, spouse, child, parent, ally, and principal antagonist must use a proper ` +
+        `     character name when the film identity is established. Keep a neutral role label only for truly ` +
+        `     unnamed/minor people.\n` +
+        `  5. Write ONE factual note per character (5-10 words). If candidates conflict, use whichever fact is ` +
         `     supported by the majority, or the LATER-appearing note if truly a toss-up. NEVER hedge with ` +
         `     "possibly"/"maybe"/"unclear" in the final note — pick a side or state the role only.\n` +
-        `  4. Do NOT invent new characters, names, or facts not present in the candidates above.\n` +
-        `  5. Keep at most 20 entries — drop truly minor one-off mentions with no narrative weight.\n\n` +
+        `  6. Do NOT invent new minor characters or facts. Proper names for established main characters are ` +
+        `     allowed only to resolve candidates already present in the scenes.\n` +
+        `  7. Keep at most 20 entries — drop truly minor one-off mentions with no narrative weight.\n\n` +
         `Respond with valid JSON ONLY: { "characters": [ { "name": "...", "note": "..." } ] }\nNo prose.`,
     }],
   }];
@@ -1264,6 +1310,12 @@ export function buildSceneScriptMessages({ movie, channelName, beats, characters
         `- Do NOT invent names for unnamed people. Use neutral labels when uncertain.
 ` +
         `- Do NOT swap character names between people in the same scene.
+` +
+        `- MAIN-CHARACTER NAMING: once the canonical cast above identifies a recurring lead, spouse, child, ` +
+        `parent, ally, or antagonist, use that character's proper name from their FIRST on-screen beat. ` +
+        `Do not call a named principal "a man", "the man", "a blonde woman", "the older man", or another ` +
+        `generic descriptor. Scene notes may contain transcript aliases/misspellings; reconcile them to the ` +
+        `canonical cast by role and chronology.
 ` +
         `- If a transcript line is ambiguous, say "one of them" or describe the action without naming.
 ` +
@@ -1810,6 +1862,83 @@ export async function analyzeWithScenes({
     const text = String(b.narration || b.reason || "");
     return Boolean(text.trim()) && !CREDITS_LABEL_RE.test(text);
   });
+
+  // ── v5 PASS 3.5: continuity + canonical-name edit ───────────────────────
+  // Stage B is intentionally scene-local for visual accuracy; this pass sees
+  // consecutive text beats and repairs choppy restarts/generic identities
+  // without changing footage ownership or exceeding scene word budgets.
+  const requestContinuity = async (batch, label, previousEnding, nextOpening) => {
+    const acceptedById = new Map();
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const text = await callLLM({
+        provider,
+        apiKey,
+        model,
+        messages: buildContinuityMessages({ beats: batch, characters, previousEnding, nextOpening }),
+        maxTokens: Math.max(1600, batch.length * 100),
+        jsonMode: true,
+      });
+      const parsed = parseSceneScriptResponse(text);
+      const reconciled = reconcileExactIndexedRows(batch, parsed);
+      for (const [id, row] of reconciled.acceptedById) {
+        if (!acceptedById.has(id)) acceptedById.set(id, row);
+      }
+      if (batch.length === 1 && parsed.length === 1) {
+        acceptedById.set(Number(batch[0].index), { ...parsed[0], index: batch[0].index });
+      }
+      const missing = batch.filter((b) => !acceptedById.has(Number(b.index)));
+      if (missing.length === 0) {
+        if (attempt > 0) console.log(`[analyzeWithScenes] CONTINUITY-RETRY ${label}: recovered all beats`);
+        return batch.map((b) => acceptedById.get(Number(b.index)));
+      }
+      console.warn(
+        `[analyzeWithScenes] CONTINUITY-RETRY ${label}: attempt ${attempt + 1}/2 ` +
+        `missing=[${missing.map((b) => b.index).join(",")}]`
+      );
+    }
+    const missing = batch.filter((b) => !acceptedById.has(Number(b.index)));
+    if (batch.length === 1) throw new Error(`Continuity edit omitted beat ${batch[0].index}`);
+    for (let i = 0; i < missing.length; i += 5) {
+      const subset = missing.slice(i, i + 5);
+      const recovered = await requestContinuity(subset, `${label}/missing-${i / 5 + 1}`, previousEnding, nextOpening);
+      for (const row of recovered) acceptedById.set(Number(row.index), row);
+    }
+    return batch.map((b) => acceptedById.get(Number(b.index)));
+  };
+
+  {
+    const CONTINUITY_BATCH = 25;
+    let previousEnding = "";
+    for (let start = 0; start < syncedBeats.length; start += CONTINUITY_BATCH) {
+      const batch = syncedBeats.slice(start, start + CONTINUITY_BATCH);
+      const nextOpening = syncedBeats[start + CONTINUITY_BATCH]?.narration || "";
+      const revised = await requestContinuity(
+        batch,
+        `batch-${Math.floor(start / CONTINUITY_BATCH)}`,
+        previousEnding,
+        nextOpening,
+      );
+      revised.forEach((row, j) => {
+        const narration = String(row?.narration || "").trim();
+        if (!narration) throw new Error(`Continuity edit returned empty narration for beat ${batch[j].index}`);
+        const maxWords = Math.max(
+          6,
+          Math.min(45, Math.floor((Number(batch[j].endSec) - Number(batch[j].startSec)) * 2.05)),
+        );
+        const wc = narration.split(/\s+/).filter(Boolean).length;
+        if (wc > maxWords) {
+          console.warn(
+            `[analyzeWithScenes] CONTINUITY beat ${batch[j].index}: ${wc} words exceeds ${maxWords}; ` +
+            `keeping original footage-fit narration`
+          );
+        } else {
+          syncedBeats[start + j] = { ...syncedBeats[start + j], narration };
+        }
+      });
+      previousEnding = syncedBeats[Math.min(start + batch.length - 1, syncedBeats.length - 1)]?.narration?.slice(-240) || "";
+    }
+    console.log(`[analyzeWithScenes] CONTINUITY: refined ${syncedBeats.length} beats with canonical-name enforcement`);
+  }
 
   // ── v5 PASS 4: independent multimodal semantic QC (score-only) ───────────
   // This replaces search/relocation systems such as Twelve Labs. The mapping

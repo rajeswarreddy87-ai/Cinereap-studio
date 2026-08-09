@@ -2,6 +2,8 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
   buildAnalyzeMessages,
+  buildCanonicalizeCharactersMessages,
+  buildContinuityMessages,
   buildNarrationRepairMessages,
   buildNarrationQcMessages,
   buildSceneNotesMessages,
@@ -178,6 +180,39 @@ describe("semanticQuarantineLimit", () => {
     assert.equal(semanticQuarantineLimit(20), 2);
     assert.equal(semanticQuarantineLimit(120), 6);
     assert.equal(semanticQuarantineLimit(200), 10);
+  });
+});
+
+describe("v5 character identity and continuity prompts", () => {
+  it("requires generic aliases to merge into named principals", () => {
+    const messages = buildCanonicalizeCharactersMessages({
+      movie: { title: "Nobody" },
+      characters: [
+        { name: "Becca", note: "Hutch's wife" },
+        { name: "The blonde woman", note: "views a house with Hutch" },
+      ],
+      beatNotes: [{ index: 1, note: "Hutch and blonde woman inspect a house." }],
+    });
+    const text = messages[0].content[0].text;
+    assert.match(text, /GENERIC-ALIAS RULE/);
+    assert.match(text, /proper CHARACTER name/);
+  });
+
+  it("enforces continuity, canonical names, and exact word budgets", () => {
+    const messages = buildContinuityMessages({
+      beats: [{
+        index: 4,
+        startSec: 10,
+        endSec: 20,
+        reason: "Hutch enters the kitchen.",
+        narration: "A man enters the kitchen.",
+      }],
+      characters: [{ name: "Hutch", note: "protagonist" }],
+    });
+    const text = messages[0].content;
+    assert.match(text, /naturally continuing story/);
+    assert.match(text, /canonical proper names/);
+    assert.match(text, /MAX 20 WORDS/);
   });
 });
 
