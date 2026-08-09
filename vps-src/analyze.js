@@ -1356,7 +1356,10 @@ export function buildSceneScriptMessages({ movie, channelName, beats, characters
         `  resolution = aftermath/conclusion/normalcy restored, setup = introduction/establishing/travel.\n\n` +
         `Respond with valid JSON ONLY of the form:\n` +
         `{ "beats": [ { "index": 0, "narration": "...", "mood": "tense", "importance": 7, "beatType": "action", "sceneIds": [0], "confidence": 0.91 } ] }\n` +
-        `Include EVERY beat index shown above, in the same order. No prose, no other keys.`,
+        `Include EVERY beat index shown above, in the same order. No prose, no other keys.\n` +
+        `CRITICAL — index values: echo the EXACT "index" numbers from the beat list above. ` +
+        `They are NOT sequential (filtered scenes leave gaps like 0,1,2,7,8,14). ` +
+        `Do NOT renumber them 0,1,2,3,… — a wrong index attaches your narration to the wrong footage.`,
     }],
   }];
 }
@@ -1570,6 +1573,27 @@ export async function analyzeWithScenes({
     // 14000 tokens: 60 beats × ~200 tokens/beat = 12,000 + JSON wrapper headroom.
     const scriptText = await callLLM({ provider, apiKey, model, messages: scriptMessages, maxTokens: 14000 });
     const parsed = parseSceneScriptResponse(scriptText);
+    // FIX (2026-08-09): POSITIONAL PAIRING. The kept-beat indexes are GAPPED
+    // (SKIP-filtered scenes leave holes: 0,1,2,7,8,14,…) but Claude frequently
+    // renumbers its response sequentially (0,1,2,3,…). Pairing by returned
+    // index then attaches each narration to the WRONG beat — narration and
+    // sceneIds shift N beats forward of their startSec, desyncing EVERY beat
+    // of the render (root cause of the "no visual match" reports). The
+    // response order always mirrors the prompt order, so when counts match,
+    // pair by POSITION and overwrite the returned index with the real one.
+    if (parsed.length === scriptBatches[bi].length) {
+      let _renumbered = 0;
+      parsed.forEach((p, j) => {
+        const realIdx = scriptBatches[bi][j].index;
+        if (p.index !== realIdx) _renumbered++;
+        p.index = realIdx;
+      });
+      if (_renumbered > 0) {
+        console.log(`[analyzeWithScenes] SCRIPT-PAIRING: batch ${bi} — corrected ${_renumbered}/${parsed.length} renumbered beat indexes (positional pairing)`);
+      }
+    } else {
+      console.warn(`[analyzeWithScenes] SCRIPT-PAIRING: batch ${bi} returned ${parsed.length} beats for ${scriptBatches[bi].length} sent — falling back to index pairing (misalignment possible)`);
+    }
     if (parsed.length > 0) prevNarrationEnd = parsed[parsed.length - 1].narration.slice(-300);
     beatScript = beatScript.concat(parsed);
   }

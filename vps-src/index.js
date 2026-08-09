@@ -4723,6 +4723,46 @@ async function runRenderFromIngest(jobId, {
   let _preTrimBeats = null;
   if (Array.isArray(beats) && beats.length > 0 &&
       (voiceoverFileIds.length > 0 || !!(SERVER_SPEECHIFY_KEY || SERVER_OPENAI_KEY))) {
+    // ── SCENE-LOCK RE-DERIVATION (v4.0.3) ─────────────────────────────────
+    // FIX (2026-08-09, render gKveEYHNmO): Stage-B analyze paired each beat's
+    // narration with the WRONG beat — Claude renumbered the gapped scene
+    // indexes sequentially, shifting every narration N beats forward while
+    // startSec stayed with the original beat (verified: "black Russian" line
+    // narrated at startSec 2590s while Whisper + sceneIds place it at 3214s /
+    // scene 24). The narration and its sceneIds stayed TOGETHER through the
+    // bug, so sceneIds are the trustworthy source of where each narration's
+    // footage lives. Re-derive every beat's window from its sceneIds via the
+    // analyze job's scenesList — heals corrupted jobs at render time for both
+    // the app-sent and auto-load paths.
+    if (_analyzeJobId) {
+      try {
+        const _slJob = await jobStore.get(_analyzeJobId).catch(() => null);
+        const _sl = _slJob?.result?.scenesList;
+        if (Array.isArray(_sl) && _sl.length > 0) {
+          const _slMap = new Map(_sl.map((s) => [Number(s.index), s]));
+          let _rederived = 0;
+          beats = beats.map((b) => {
+            const sids = Array.isArray(b.sceneIds) ? b.sceneIds.map(Number).filter(Number.isFinite) : [];
+            if (sids.length === 0) return b;
+            const first = _slMap.get(Math.min(...sids));
+            const last  = _slMap.get(Math.max(...sids));
+            if (!first || !last) return b;
+            const ns = Number(first.startSec);
+            const ne = Math.max(Number(last.endSec), ns + 2);
+            if (!Number.isFinite(ns) || !Number.isFinite(ne)) return b;
+            if (Math.abs(ns - Number(b.startSec)) > 1.0 || Math.abs(ne - Number(b.endSec)) > 1.0) _rederived++;
+            return { ...b, startSec: ns, endSec: ne };
+          });
+          if (_rederived > 0) {
+            console.log(`[render ${jobId}] SCENE-LOCK: re-derived ${_rederived}/${beats.length} beat window(s) from sceneIds (narration↔timestamp misalignment healed)`);
+          }
+        }
+      } catch (_slErr) {
+        console.warn(`[render ${jobId}] SCENE-LOCK: re-derivation skipped (non-fatal):`, _slErr?.message || _slErr);
+      }
+    }
+    // ── END SCENE-LOCK RE-DERIVATION ──────────────────────────────────────
+
     // ── UNIVERSAL BEAT NORMALISATION ──────────────────────────────────────
     // Runs BEFORE anything else in the sync block so it applies whether
     // beats came from the app request body OR were auto-loaded from the
