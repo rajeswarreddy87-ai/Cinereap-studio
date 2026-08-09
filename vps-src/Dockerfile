@@ -1,5 +1,5 @@
 # CineRecap Render Server
-# Node 20 + FFmpeg + Python CLIP sidecar (CPU-only torch for semantic frame matching).
+# Node 20 + FFmpeg render server.
 FROM node:20-bookworm-slim
 
 # System packages: ffmpeg, python3, pip, ca-certs, curl, unzip (for Deno)
@@ -15,14 +15,6 @@ RUN pip3 install --no-cache-dir --break-system-packages "yt-dlp[default,curl-cff
 RUN curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh \
     && /usr/local/bin/deno --version
 
-# CLIP sidecar dependencies — CPU-only torch keeps image portable
-# torch is ~230MB compressed; model weights (~600MB) download to /data/models on first run.
-RUN pip3 install --no-cache-dir --break-system-packages \
-    torch --index-url https://download.pytorch.org/whl/cpu
-RUN pip3 install --no-cache-dir --break-system-packages \
-    open_clip_torch Pillow transformers sentencepiece protobuf transformers sentencepiece \
-    --extra-index-url https://download.pytorch.org/whl/cpu "fastapi[standard]" "uvicorn[standard]" numpy
-
 WORKDIR /app
 
 # Node deps first (cache layer)
@@ -34,8 +26,6 @@ COPY src ./src
 COPY gen_music.sh ./gen_music.sh
 COPY public ./public
 
-# CLIP sidecar + startup script
-COPY clip_server.py ./clip_server.py
 COPY start.sh ./start.sh
 RUN chmod +x start.sh
 
@@ -46,7 +36,7 @@ ENV NODE_ENV=production
 ENV PORT=8787
 ENV STORAGE_DIR=/data
 
-EXPOSE 8787 8788
+EXPOSE 8787
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
   CMD curl -fsS http://127.0.0.1:8787/health || exit 1

@@ -20,7 +20,10 @@ import path from "node:path";
  * 120–180 detected scenes per 2-hour feature film, giving Claude far more
  * diverse visual coverage and dramatically reducing footage repetition.
  */
-export const SCENE_THRESHOLD = 0.25;
+// v5: 0.15 reliably finds enough real cuts for a normal-speed recap. The old
+// 0.25 produced only ~56 ten-second packets for a 15-minute target, forcing the
+// renderer to manufacture duration with slow-motion/frozen frames.
+export const SCENE_THRESHOLD = 0.15;
 
 /**
  * Number of frames extracted per detected scene sent to Claude.

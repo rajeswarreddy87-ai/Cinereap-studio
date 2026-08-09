@@ -841,7 +841,11 @@ export function buildSceneNotesMessages({ movie, scenes, segments, isFirstBatch 
     } else {
       content.push({ type: "image", source: { type: "base64", media_type: "image/jpeg", data: sc.base64 } });
     }
-    const dialogue = transcriptForWindow(segments, sc.sceneStart ?? sc.startSec, sc.sceneEnd ?? sc.endSec);
+    // v5: Ground the note in exactly the footage Claude can see and the renderer
+    // may use. The old full-scene span could include dialogue minutes beyond a
+    // capped 10s clip window, causing the note/narration to describe off-screen
+    // events.
+    const dialogue = transcriptForWindow(segments, sc.startSec, sc.endSec);
     content.push({
       type: "text",
       text: `SCENE ${sc.index} @ [${secToMmSs(sc.startSec)}] (window ${sc.startSec.toFixed(1)}-${sc.endSec.toFixed(1)}s).` +
@@ -867,6 +871,7 @@ export function buildSceneNotesMessages({ movie, scenes, segments, isFirstBatch 
       `Respond with valid JSON ONLY:\n` +
       `{ ${isFirstBatch ? `"characters": [ { "name": "...", "note": "..." } ], ` : ``}` +
       `"beats": [ { "index": 0, "note": "..." } ] }\n` +
+      `Echo the EXACT scene indexes shown above, in the SAME order. Do not renumber them.\n` +
       `No prose, no script.`,
   });
   return [{ role: "user", content }];
@@ -913,6 +918,57 @@ export function buildValidationMessages({ movie, scenes, noteByIndex }) {
       `Respond with valid JSON ONLY:\n` +
       `{ "validations": [ { "index": 0, "ok": true } ] }\n` +
       `Add "note": "corrected text" for ok=false entries only. No prose.`,
+  });
+  return [{ role: "user", content }];
+}
+
+/**
+ * v5 independent semantic QC. Gemini reviews the same approved scene frames
+ * against the finished narration, but can only score/reject — it never chooses
+ * timestamps or relocates footage.
+ */
+export function buildNarrationQcMessages({ scenes, narrationByIndex }) {
+  const content = [];
+  for (const sc of scenes) {
+    const frames = Array.isArray(sc.frameBase64s) ? sc.frameBase64s : (sc.base64 ? [sc.base64] : []);
+    // Three frames are enough for QC and keep Gemini request size predictable.
+    const picks = frames.length <= 3 ? frames : [frames[0], frames[Math.floor(frames.length / 2)], frames[frames.length - 1]];
+    for (const data of picks) {
+      content.push({ type: "image", source: { type: "base64", media_type: "image/jpeg", data } });
+    }
+    content.push({
+      type: "text",
+      text: `SCENE ${sc.index} (${sc.startSec.toFixed(1)}-${sc.endSec.toFixed(1)}s)\n` +
+        `NARRATION: ${String(narrationByIndex.get(sc.index) || "").slice(0, 900)}`,
+    });
+  }
+  content.push({
+    type: "text",
+    text:
+      `Act as a strict movie-recap visual QC reviewer. For every SCENE, score how well the narration ` +
+      `describes what is visibly shown in that scene's frames. Dialogue/plot knowledge may clarify names, ` +
+      `but do not accept narration about an event not visible here. Return JSON only:\n` +
+      `{"results":[{"index":0,"score":0.0,"ok":false,"reason":"short reason"}]}\n` +
+      `score 0.85-1.0 = direct visible match; 0.65-0.84 = acceptable same-event context; below 0.65 = reject.`,
+  });
+  return [{ role: "user", content }];
+}
+
+export function buildNarrationRepairMessages({ scene, note, narration, maxWords }) {
+  const content = [];
+  const frames = Array.isArray(scene.frameBase64s) ? scene.frameBase64s : (scene.base64 ? [scene.base64] : []);
+  const picks = frames.length <= 3 ? frames : [frames[0], frames[Math.floor(frames.length / 2)], frames[frames.length - 1]];
+  for (const data of picks) {
+    content.push({ type: "image", source: { type: "base64", media_type: "image/jpeg", data } });
+  }
+  content.push({
+    type: "text",
+    text:
+      `Rewrite this movie-recap narration so every event is directly visible in the attached frames. ` +
+      `Use the factual note as ground truth. Preserve names only when supported. Maximum ${maxWords} words; ` +
+      `complete sentences; present tense; no meta-commentary.\n\n` +
+      `NOTE: ${note}\nCURRENT NARRATION: ${narration}\n\n` +
+      `Return JSON only: {"narration":"corrected text"}`,
   });
   return [{ role: "user", content }];
 }
@@ -1157,21 +1213,20 @@ export function buildSceneScriptMessages({ movie, channelName, beats, characters
       storyOutline.map((a) => `  ${a.act} [${a.startSec}–${a.endSec}s] ${a.characters?.join(", ") || ""}: ${a.summary} (tone: ${a.tone || "dramatic"})`).join("\n") + "\n\n"
     : "";
   // List the beats WITH their index + timecode so Claude returns narration per beat, in order.
-  // v4.0.2 WORD BUDGET (render ohrbb51X87): narration length must be roughly
-  // proportional to the beat's available footage span, or the render is forced
-  // into long frozen frames (e.g. 27s narration on a 6s scene window). Budget
-  // ≈ span-to-next-beat × 2.3 words/sec, clamped 25–80 words. The span is
-  // measured to the NEXT beat's start (the render expands windows the same way).
+  // v5 WORD BUDGET: narration must fit the exact approved clip window at normal
+  // speed. It may not use the gap to the next selected scene. Speechify's real
+  // measured pace is ~2.0–2.2 words/sec, so 2.05 wps leaves a small transition
+  // margin. Short clips get short narration instead of freeze-frame padding.
   // Fix D: embed per-beat windowed dialogue directly in the beat list so
   // Stage B can only reference what was actually spoken at each beat's timestamp,
   // rather than reading ahead in the full 2-hour transcript and narrating events
   // that haven't appeared on screen yet.
   const beatText = beats && beats.length
     ? beats.map((b, bi) => {
-        const nextStart = bi + 1 < beats.length ? Number(beats[bi + 1].startSec) : Number(b.endSec) + 60;
-        const spanSec = Math.max(Number(b.endSec) - Number(b.startSec), nextStart - Number(b.startSec));
-        const wordBudget = Math.max(25, Math.min(80, Math.round(spanSec * 2.3)));
-        let line = `- index ${b.index} @ [${b.t}] (${b.startSec.toFixed(1)}-${b.endSec.toFixed(1)}s, narration budget ≤${wordBudget} words): ${b.note || "(no note)"}`;
+        const spanSec = Math.max(1.5, Number(b.endSec) - Number(b.startSec));
+        const wordBudget = Math.max(6, Math.min(45, Math.floor(spanSec * 2.05)));
+        let line = `- beatId ${b.beatId || `beat-${String(b.index).padStart(4, "0")}`} | index ${b.index} @ [${b.t}] ` +
+          `(${b.startSec.toFixed(1)}-${b.endSec.toFixed(1)}s, narration budget ≤${wordBudget} words): ${b.note || "(no note)"}`;
         if (Array.isArray(segments) && segments.length > 0) {
           const dlg = transcriptForWindow(segments, b.startSec - 5, b.endSec + 5, 350);
           if (dlg) line += `\n  Dialogue: "${dlg}"`;
@@ -1326,12 +1381,9 @@ export function buildSceneScriptMessages({ movie, channelName, beats, characters
         `     future events before their beat's timestamp.\n` +
         `  C. NO REPETITION: if a fact was established in a prior beat (character identity, plot event, ` +
         `     revelation), do NOT restate it verbatim — reference briefly instead.\n` +
-        `  D. BEAT DURATION TARGET (v3.0.0): each beat narration MUST take 12–18 seconds to speak aloud ` +
-        `     (approximately 3–4 full sentences, 35–55 words). Target 15 seconds. ` +
-        `     Major climax or revelation beats may extend to 20 seconds (60–70 words). ` +
-        `     CRITICAL: always complete the last sentence — never cut a thought mid-sentence. ` +
-        `     End each beat at a natural pause (end of sentence, comma-then-pause, or scene conclusion). ` +
-        `     Do NOT write 1–2 sentence micro-beats (under 25 words) — these create abrupt jumps.\n` +
+        `  D. PER-BEAT LENGTH: obey the exact "narration budget ≤N words" printed on each beat. ` +
+        `     It is derived from that beat's available moving footage and overrides every other length target. ` +
+        `     Use complete concise sentences, end at a natural pause, and never pad a short event to a minimum length.\n` +
         `  E. YOUTUBE NARRATION STYLE: punchy, direct, present-tense active voice. Specific nouns and ` +
         `     actions. No film-theory commentary, no meta-references to "the film" or "the scene". ` +
         `     Speak as if narrating the events AS they happen on screen.\n\n` +
@@ -1339,10 +1391,7 @@ export function buildSceneScriptMessages({ movie, channelName, beats, characters
         `ALSO assign an importance score 1–10 to each beat:\n` +
         `  1–3 = transitional/establishing shot, 4–6 = regular story beat,\n` +
         `  7–8 = significant moment (confrontation, discovery), 9–10 = climax or major reveal.\n` +
-        `ALSO assign sceneIds: an array of scene indices this narration covers.\n` +
-        `  Normally a single scene: [index]. Use multiple CONSECUTIVE indices only when one\n` +
-        `  story beat naturally spans 2–3 adjacent scenes (e.g. a continuous action [12,13,14]).\n` +
-        `  Never skip indices or go out of order.\n\n` +
+        `Footage identity is server-controlled. Do NOT choose sceneIds or timestamps.\n\n` +
         `ALSO assign confidence (0.0–1.0): how confident you are that the narration accurately\n` +
         `  matches the visible footage at this beat's timestamp.\n` +
         `  0.9–1.0 = strong match (you can clearly identify the action from transcript + frames).\n` +
@@ -1355,7 +1404,7 @@ export function buildSceneScriptMessages({ movie, channelName, beats, characters
         `  reveal = twist/revelation/information disclosed, emotion = grief/joy/love/loss visible on screen,\n` +
         `  resolution = aftermath/conclusion/normalcy restored, setup = introduction/establishing/travel.\n\n` +
         `Respond with valid JSON ONLY of the form:\n` +
-        `{ "beats": [ { "index": 0, "narration": "...", "mood": "tense", "importance": 7, "beatType": "action", "sceneIds": [0], "confidence": 0.91 } ] }\n` +
+        `{ "beats": [ { "index": 0, "narration": "...", "mood": "tense", "importance": 7, "beatType": "action", "confidence": 0.91 } ] }\n` +
         `Include EVERY beat index shown above, in the same order. No prose, no other keys.\n` +
         `CRITICAL — index values: echo the EXACT "index" numbers from the beat list above. ` +
         `They are NOT sequential (filtered scenes leave gaps like 0,1,2,7,8,14). ` +
@@ -1423,6 +1472,7 @@ export function parseSceneScriptResponse(rawText) {
 export async function analyzeWithScenes({
   apiKey, model, provider = "claude", movie, channelName, scenes, segments = [], transcriptBlock = "", narrationLang = "English",
   overview = "", keywords = "",
+  semanticQcEnabled = false, qcApiKey = "", qcModel = "gemini-2.5-flash",
 }) {
   if (!scenes || scenes.length === 0) throw new Error("analyzeWithScenes: no scenes provided");
 
@@ -1452,7 +1502,18 @@ export async function analyzeWithScenes({
     for (const c of parsed.characters) {
       _mergeCharacterCandidate(charByName, c);
     }
-    for (const b of parsed.beats) noteByIndex.set(b.index, b.note);
+    // v5 deterministic Stage-A merge: the LLM is allowed to write text, never
+    // choose identity. Scene indexes can be gapped after frame extraction; if
+    // Claude renumbers them, index-based merge attaches notes to wrong footage.
+    if (parsed.beats.length !== batches[bi].length) {
+      throw new Error(
+        `Stage-A scene-note count mismatch in batch ${bi}: ` +
+        `sent ${batches[bi].length}, received ${parsed.beats.length}. Refusing ambiguous mapping.`
+      );
+    }
+    parsed.beats.forEach((b, j) => {
+      noteByIndex.set(batches[bi][j].index, b.note);
+    });
   }
   // Preserve first-appearance order (protagonists first); cap to avoid a bloated
   // cast of one-off minor names poisoning the Stage-B prompt.
@@ -1463,7 +1524,7 @@ export async function analyzeWithScenes({
   // Claude is instructed to label studio logos, title cards, and production
   // company screens as "SKIP". We honour that judgement and drop only those
   // beats. No hard time thresholds — story content varies by film and region.
-  const CREDITS_LABEL_RE = /\b(studio|logo|production\s*company|distributor|credit|title\s*card|opening\s*credit)\b/i;
+  const CREDITS_LABEL_RE = /\b(studio|logo|production\s*company|distributor|credits?|title\s*card|opening\s*credits?|closing\s*credits?|credits?\s+roll)\b/i;
   // FIX (SYNC-FIXES #4): missing indices used to vanish silently, making it
   // impossible to tell whether the length shortfall was Claude writing nothing,
   // Claude explicitly flagging SKIP, or the credits-label regex over-firing
@@ -1472,13 +1533,23 @@ export async function analyzeWithScenes({
   // from logs instead of just "56 of 179 survived".
   const _dropReasons = { empty: 0, skip: 0, credits: 0 };
   const _droppedIdx = { empty: [], skip: [], credits: [] };
-  const beats = scenes
-    .map((sc) => ({ index: sc.index, t: secToMmSs(sc.startSec), note: noteByIndex.get(sc.index) || "", startSec: sc.startSec, endSec: sc.endSec }))
+  let beats = scenes
+    .map((sc) => ({
+      index: sc.index,
+      t: secToMmSs(sc.startSec),
+      note: noteByIndex.get(sc.index) || "",
+      startSec: sc.startSec,
+      endSec: sc.endSec,
+      // Opening logo safety: actual story may be silent, but an opening visual
+      // with no dialogue in the first 90s is too ambiguous to narrate reliably.
+      hasDialogue: Boolean(transcriptForWindow(segments, sc.startSec, sc.endSec, 80)),
+    }))
     .filter((b) => {
       const note = b.note.trim();
       if (!note) { _dropReasons.empty++; _droppedIdx.empty.push(b.index); return false; }                                     // Claude wrote nothing — skip
       if (note.toUpperCase().startsWith("SKIP")) { _dropReasons.skip++; _droppedIdx.skip.push(b.index); return false; }     // Claude flagged it
       if (CREDITS_LABEL_RE.test(note)) { _dropReasons.credits++; _droppedIdx.credits.push(b.index); return false; }               // Claude described credits
+      if (b.startSec < 90 && !b.hasDialogue) { _dropReasons.credits++; _droppedIdx.credits.push(b.index); return false; }
       return true;                                                  // real story content — keep
     })
     .sort((a, b) => a.startSec - b.startSec);
@@ -1520,6 +1591,23 @@ export async function analyzeWithScenes({
       console.log(`[analyzeWithScenes] NOTE-VALIDATION: ${_valFlagged} note(s) flagged as potentially hallucinated, ${_valCorrected} corrected`);
     }
   }
+
+  // v5: validation updates noteByIndex, so rebuild the beat list before any
+  // downstream prompt. Previously Stage B, character canonicalization, and the
+  // story outline all consumed stale pre-validation notes.
+  beats = beats
+    .map((b) => ({ ...b, note: noteByIndex.get(b.index) || b.note || "" }))
+    .filter((b) => {
+      const note = String(b.note || "").trim();
+      return Boolean(note)
+        && !note.toUpperCase().startsWith("SKIP")
+        && !CREDITS_LABEL_RE.test(note);
+    })
+    .sort((a, b) => a.startSec - b.startSec)
+    .map((b, denseIndex) => ({
+      ...b,
+      beatId: `beat-${String(denseIndex).padStart(4, "0")}`,
+    }));
 
   // ── PASS 1.5 (Character canonicalization): resolve semantic name drift ──
   // The prefix-merge above only catches simple substring aliases. Names that
@@ -1581,27 +1669,33 @@ export async function analyzeWithScenes({
     // of the render (root cause of the "no visual match" reports). The
     // response order always mirrors the prompt order, so when counts match,
     // pair by POSITION and overwrite the returned index with the real one.
-    if (parsed.length === scriptBatches[bi].length) {
-      let _renumbered = 0;
-      parsed.forEach((p, j) => {
-        const realIdx = scriptBatches[bi][j].index;
-        if (p.index !== realIdx) _renumbered++;
-        p.index = realIdx;
-      });
-      if (_renumbered > 0) {
-        console.log(`[analyzeWithScenes] SCRIPT-PAIRING: batch ${bi} — corrected ${_renumbered}/${parsed.length} renumbered beat indexes (positional pairing)`);
-      }
-    } else {
-      console.warn(`[analyzeWithScenes] SCRIPT-PAIRING: batch ${bi} returned ${parsed.length} beats for ${scriptBatches[bi].length} sent — falling back to index pairing (misalignment possible)`);
+    if (parsed.length !== scriptBatches[bi].length) {
+      throw new Error(
+        `Stage-B narration count mismatch in batch ${bi}: ` +
+        `sent ${scriptBatches[bi].length}, received ${parsed.length}. Refusing ambiguous mapping.`
+      );
+    }
+    let _renumbered = 0;
+    parsed.forEach((p, j) => {
+      const sourceBeat = scriptBatches[bi][j];
+      if (p.index !== sourceBeat.index) _renumbered++;
+      p.index = sourceBeat.index;
+      // Immutable server identity; never trust an LLM-returned scene span.
+      p.beatId = sourceBeat.beatId;
+      p.sceneIds = [sourceBeat.index];
+    });
+    if (_renumbered > 0) {
+      console.log(`[analyzeWithScenes] SCRIPT-PAIRING: batch ${bi} — corrected ${_renumbered}/${parsed.length} renumbered beat indexes (positional pairing)`);
     }
     if (parsed.length > 0) prevNarrationEnd = parsed[parsed.length - 1].narration.slice(-300);
     beatScript = beatScript.concat(parsed);
   }
 
   const narrByIndex = new Map(beatScript.map((b) => [b.index, b]));
-  const syncedBeats = beats.map((b) => {
+  let syncedBeats = beats.map((b) => {
     const n = narrByIndex.get(b.index);
     return {
+      beatId: b.beatId,
       index: b.index,
       startSec: b.startSec,
       endSec: b.endSec,
@@ -1609,21 +1703,116 @@ export async function analyzeWithScenes({
       mood: n?.mood || "dramatic",
       // ChatGPT pipeline: importance (1-10) drives dynamic cut timing at render.
       importance: n?.importance ?? null,
-      // ChatGPT pipeline: sceneIds = detected scene indices this beat covers.
-      // Defaults to [b.index] (single scene) when Claude doesn't provide them.
-      sceneIds: Array.isArray(n?.sceneIds) && n.sceneIds.length > 0 ? n.sceneIds : [b.index],
+      // v5: footage identity is server-assigned and immutable. Claude writes
+      // narration only; it may not relocate or widen the source scene.
+      sceneIds: [b.index],
       // ChatGPT pipeline: confidence (0.0-1.0) — how well narration matches footage.
       // Values below 0.7 trigger window expansion at render time (FIX B).
       confidence: n?.confidence ?? null,
       reason: b.note || "",
     };
+  }).filter((b) => {
+    const text = String(b.narration || b.reason || "");
+    return Boolean(text.trim()) && !CREDITS_LABEL_RE.test(text);
   });
+
+  // ── v5 PASS 4: independent Gemini semantic QC (score-only) ───────────────
+  // This replaces search/relocation systems such as Twelve Labs. The mapping
+  // stays deterministic; Gemini may only approve or reject the authored beat.
+  const semanticQc = [];
+  if (semanticQcEnabled && qcApiKey) {
+    const narrationByIndex = new Map(syncedBeats.map((b) => [b.index, b.narration]));
+    const qcScenes = scenes.filter((s) => narrationByIndex.has(s.index));
+    const QC_BATCH = 12;
+    const runQc = async (sceneSubset) => {
+      const output = [];
+      for (let i = 0; i < sceneSubset.length; i += QC_BATCH) {
+        const batch = sceneSubset.slice(i, i + QC_BATCH);
+        const qcText = await callLLM({
+          provider: "gemini",
+          apiKey: qcApiKey,
+          model: qcModel,
+          messages: buildNarrationQcMessages({ scenes: batch, narrationByIndex }),
+          maxTokens: 1800,
+          jsonMode: true,
+        });
+        let qcObj;
+        try { qcObj = JSON.parse(qcText); }
+        catch { qcObj = JSON.parse(repairJson(qcText)); }
+        const results = Array.isArray(qcObj?.results) ? qcObj.results : [];
+        if (results.length !== batch.length) {
+          throw new Error(`Semantic QC count mismatch: sent ${batch.length}, received ${results.length}`);
+        }
+        results.forEach((result, j) => {
+          output.push({
+            index: batch[j].index,
+            score: Math.max(0, Math.min(1, Number(result.score) || 0)),
+            ok: result.ok === true,
+            reason: String(result.reason || "").slice(0, 240),
+          });
+        });
+      }
+      return output;
+    };
+
+    semanticQc.push(...await runQc(qcScenes));
+    let rejected = semanticQc.filter((q) => !q.ok || q.score < 0.65);
+    if (rejected.length > 0) {
+      // One automatic correction pass: original writer rewrites only rejected
+      // beats against their frames; independent Gemini then scores them again.
+      const sceneByIndex = new Map(scenes.map((s) => [s.index, s]));
+      const beatByIndex = new Map(syncedBeats.map((b) => [b.index, b]));
+      for (const failure of rejected) {
+        const scene = sceneByIndex.get(failure.index);
+        const beat = beatByIndex.get(failure.index);
+        if (!scene || !beat) continue;
+        const maxWords = Math.max(6, Math.min(45, Math.floor((scene.endSec - scene.startSec) * 2.05)));
+        const repairText = await callLLM({
+          provider,
+          apiKey,
+          model,
+          messages: buildNarrationRepairMessages({
+            scene,
+            note: beat.reason,
+            narration: beat.narration,
+            maxWords,
+          }),
+          maxTokens: 500,
+          jsonMode: true,
+        });
+        let repair;
+        try { repair = JSON.parse(repairText); }
+        catch { repair = JSON.parse(repairJson(repairText)); }
+        const corrected = String(repair?.narration || "").trim();
+        if (!corrected) throw new Error(`Semantic QC repair returned empty narration for scene ${failure.index}`);
+        beat.narration = corrected;
+        narrationByIndex.set(failure.index, corrected);
+      }
+      const rejectedScenes = rejected.map((q) => sceneByIndex.get(q.index)).filter(Boolean);
+      const rescored = await runQc(rejectedScenes);
+      const rescoredMap = new Map(rescored.map((q) => [q.index, q]));
+      for (let i = 0; i < semanticQc.length; i++) {
+        if (rescoredMap.has(semanticQc[i].index)) semanticQc[i] = rescoredMap.get(semanticQc[i].index);
+      }
+      rejected = semanticQc.filter((q) => !q.ok || q.score < 0.65);
+    }
+    console.log(
+      `[analyzeWithScenes] GEMINI-QC: ${semanticQc.length - rejected.length}/${semanticQc.length} beats passed semantic visual QC`
+    );
+    if (rejected.length > 0) {
+      const sample = rejected.slice(0, 10).map((q) => `${q.index}:${q.score.toFixed(2)} ${q.reason}`).join(" | ");
+      throw new Error(
+        `Semantic visual QC rejected ${rejected.length}/${semanticQc.length} beat(s): ${sample}. ` +
+        `Analysis stopped; timestamps were not relocated.`
+      );
+    }
+  }
 
   // Stripped scene list (no base64 frames) for use in render-time sceneId resolution.
   const scenesList = scenes.map(({ index, startSec, endSec }) => ({ index, startSec, endSec }));
 
   const script = syncedBeats.map((b) => b.narration).filter(Boolean).join(" ").replace(/\s+/g, " ").trim();
   const timestamps = syncedBeats.map((b) => ({ startSec: b.startSec, endSec: b.endSec, reason: b.reason }));
-  return { script, timestamps, characters, beats: syncedBeats, storyOutline, scenesList };
+  return { script, timestamps, characters, beats: syncedBeats, storyOutline, scenesList, semanticQc };
 }
 

@@ -1,6 +1,12 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { buildAnalyzeMessages, parseAnalysisResponse } from "./analyze.js";
+import {
+  buildAnalyzeMessages,
+  buildNarrationRepairMessages,
+  buildNarrationQcMessages,
+  buildSceneNotesMessages,
+  parseAnalysisResponse,
+} from "./analyze.js";
 
 describe("buildAnalyzeMessages", () => {
   const baseMovie = {
@@ -79,6 +85,53 @@ describe("parseAnalysisResponse", () => {
     assert.throws(() => parseAnalysisResponse(`{"script":"only"}`));
     assert.throws(() => parseAnalysisResponse(`{"timestamps":[]}`));
     assert.throws(() => parseAnalysisResponse("not json at all"));
+  });
+});
+
+describe("v5 deterministic scene prompts", () => {
+  const scene = {
+    index: 7,
+    startSec: 100,
+    endSec: 110,
+    sceneStart: 90,
+    sceneEnd: 150,
+    frameBase64s: ["A", "B", "C"],
+  };
+
+  it("requires exact Stage-A scene indexes", () => {
+    const messages = buildSceneNotesMessages({
+      movie: { title: "Test", durationSec: 1000 },
+      scenes: [scene],
+      segments: [{ start: 120, end: 121, text: "outside clip" }],
+    });
+    const text = messages[0].content.at(-1).text;
+    assert.match(text, /EXACT scene indexes/);
+    // Dialogue outside the approved 100-110s clip must not enter the prompt.
+    assert.doesNotMatch(messages[0].content.find((b) => b.text?.startsWith("SCENE"))?.text || "", /outside clip/);
+  });
+
+  it("builds score-only Gemini QC without timestamp relocation instructions", () => {
+    const messages = buildNarrationQcMessages({
+      scenes: [scene],
+      narrationByIndex: new Map([[7, "A man opens the door."]]),
+    });
+    const finalText = messages[0].content.at(-1).text;
+    assert.match(finalText, /strict movie-recap visual QC/);
+    assert.match(finalText, /score/);
+    assert.doesNotMatch(finalText, /choose.*timestamp/i);
+  });
+
+  it("builds a bounded frame-grounded repair prompt", () => {
+    const messages = buildNarrationRepairMessages({
+      scene,
+      note: "A man opens a door.",
+      narration: "A car explodes elsewhere.",
+      maxWords: 20,
+    });
+    const text = messages[0].content.at(-1).text;
+    assert.match(text, /Maximum 20 words/);
+    assert.match(text, /directly visible/);
+    assert.match(text, /A man opens a door/);
   });
 });
 

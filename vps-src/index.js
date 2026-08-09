@@ -39,12 +39,11 @@ import { uploadToYouTube } from "./youtube.js";
 import { google } from "googleapis";
 import { ingestFromUrl } from "./ingest-worker.js";
 import { buildAnalyzeMessages, callClaude, callClaudeWithFrameBatching, extractFrames, enforceMaxClipDurationServer, frameToBase64, parseAnalysisResponse, probeDurationSec, analyzeWithScenes, callLLM } from "./analyze.js";
-import { analyzeScenes, SCENE_THRESHOLD, sceneFrameTimes } from "./scenes.js";
+import { analyzeScenes, SCENE_THRESHOLD } from "./scenes.js";
 import { promises as fsp } from "node:fs";
 import { transcribeMovie, buildTranscriptBlock } from "./transcribe.js";
 import { planSyncedRender, buildSyncedTimeline } from "./beats.js";
 import { planMusicTimeline, dominantMood } from "./music.js";
-import { ensureMovieIndexed, localizeBeatsWithTwelveLabs, isTwelveLabsEnabled, ensurePegasusIndexed, getPegasusChapters, splitAndIndexWithPegasus } from "./lib/twelvelabs.js";
 
 const PORT = Number(process.env.PORT || 8787);
 const STORAGE_DIR = process.env.STORAGE_DIR || "/data";
@@ -90,12 +89,6 @@ const SERVER_ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL      || "";
 const SERVER_GEMINI_KEY   = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || "";
 const SERVER_GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
 
-// Twelve Labs Marengo — primary visual matcher (replaces GSPAN + SigLIP/CLIP).
-const SERVER_TWELVELABS_KEY = process.env.TWELVELABS_API_KEY || "";
-// CLIP ViT-B-32 sidecar — last-resort Tier D visual matcher. Enabled when
-// CLIP_SIDECAR_ENABLED=1 (docker-compose env). Python FastAPI on :8788.
-const CLIP_SIDECAR_URL = process.env.CLIP_SIDECAR_URL || "http://localhost:8788";
-const TWELVELABS_CACHE_DIR = path.join(STORAGE_DIR, "twelvelabs-cache");
 
 if (!AUTH_TOKEN) {
   console.warn("[WARN] AUTH_TOKEN is empty — server is wide open. Set it in .env before exposing publicly.");
@@ -560,17 +553,17 @@ app.get("/health", (_req, res) => {
 
   res.json({
     ok: true,
-    version: "4.0.0",
+    version: "5.0.0",
     serverTranscription: Boolean(SERVER_OPENAI_KEY),
     serverAnalysis: Boolean(SERVER_ANTHROPIC_KEY),
     serverModel: SERVER_ANTHROPIC_MODEL || null,
     geminiVerifier: Boolean(SERVER_GEMINI_KEY),
     geminiModel: SERVER_GEMINI_KEY ? SERVER_GEMINI_MODEL : null,
-    twelvelabsConfigured: Boolean(SERVER_TWELVELABS_KEY),
-    twelvelabsEnabled: isTwelveLabsEnabled(),
-    twelvelabsSdk: true,
+    twelvelabsConfigured: false,
+    twelvelabsEnabled: false,
+    twelvelabsSdk: false,
     gspanLocalization: false,
-    clipSidecarEnabled: String(process.env.CLIP_SIDECAR_ENABLED || "0").toLowerCase() === "1",
+    clipSidecarEnabled: false,
     aiProviders: aiProviderList,
     defaultAiProvider,
     youtubeConfigured: Boolean(process.env.YT_CLIENT_ID && process.env.YT_CLIENT_SECRET),
@@ -600,7 +593,9 @@ app.get("/health", (_req, res) => {
       "ai-thumbnails",      // new in 2.6.0 — DALL-E thumbnail generation via server key
       "translate-transcript", // new in 2.5.0 — Whisper translation endpoint for non-English films
       "uncapped-narration", // new in 2.5.0 — full-length narration, no word-count ceiling
-      "locked-windows",     // v4.0.0 — construction-based sync: footage cut from the exact analyzed scene windows, no visual search
+      "deterministic-beat-manifest", // v5.0.0 — immutable server beat/scene identity; LLM writes text only
+      "pts-safe-concat",     // v5.0.0 — PTS-reset filter concat with exact rational FPS
+      "gemini-qc",           // v5.0.0 — optional low-confidence semantic QC, never timestamp relocation
       "multi-tts",          // new in 2.7.0 — ttsProvider field selects speechify|openai|elevenlabs|hume
       "storage-api",        // new in 2.7.0 — GET /system/storage, DELETE /system/clear-renders
       "source-download",    // new in 2.7.0 — GET /uploads/:fileId/download
@@ -2056,10 +2051,12 @@ app.post("/analyze", requireAuth, async (req, res) => {
   // AI provider selection: "claude" (default) or "gemini". Falls back to
   // claude if gemini was requested but the server has no Gemini key.
   const activeAiProvider = (aiProvider === "gemini" && SERVER_GEMINI_KEY) ? "gemini" : "claude";
-  // Derive beat target from targetMinutes (1 beat per 15s of recap, clamped 40–120).
-  // Falls back to app-supplied targetClipCount, then to 80 (≈20 min default).
+  // v5: select approximately one approved visual packet per 8 seconds of
+  // requested recap. Many real shots are shorter than the 10s clip cap; this
+  // over-selection provides enough normal-speed moving footage after credits,
+  // QC rejects, and short scenes are removed.
   const effectiveTargetClipCount = Number(targetClipCount) ||
-    (analyzeTargetMinutes ? Math.max(40, Math.min(120, Math.round(Number(analyzeTargetMinutes) * 60 / 15))) : 80);
+    (analyzeTargetMinutes ? Math.max(50, Math.min(200, Math.round(Number(analyzeTargetMinutes) * 60 / 8))) : 150);
   let { useTranscript, openaiApiKey } = req.body || {};
   const openaiKeyPreview = req.body?.openaiApiKey ? req.body.openaiApiKey.slice(0, 10) + '...' : 'none';
   const debugMsg = `[/analyze] Incoming: useTranscript=${useTranscript}, openaiKey=${openaiKeyPreview}, serverKey=${!!SERVER_OPENAI_KEY}`;
@@ -2125,6 +2122,8 @@ app.post("/analyze", requireAuth, async (req, res) => {
           const prev = allJobs
             .filter((j) => j.id !== jobId && j.kind === "analyze" && j.status === "done" &&
               (j.sourceFileId === fileId || j.result?.sourceFileId === fileId) &&
+              j.result?.pipelineVersion === "5.0.0" &&
+              Number(j.result?.targetMinutes || 0) === Number(analyzeTargetMinutes || 20) &&
               j.result?.beats?.length > 0)
             .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0))[0];
           if (prev) {
@@ -2196,7 +2195,7 @@ app.post("/analyze", requireAuth, async (req, res) => {
       // Long films used duration/40 (~180 scenes) then render discarded 60% by
       // importance sampling — causing press conference → wife shooting jumps.
       const recapBeatCap = effectiveTargetClipCount > 0
-        ? Math.round(effectiveTargetClipCount * 1.15)
+        ? Math.round(effectiveTargetClipCount * 1.10)
         : 350;
       const targetScenes = Math.max(60, Math.min(350, durationScaled, recapBeatCap));
       console.log(`[analyze ${jobId}] scene target: ${targetScenes} (durationScaled=${durationScaled}, recapCap=${recapBeatCap}, targetMinutes=${analyzeTargetMinutes || 'unset'})`);
@@ -2257,43 +2256,6 @@ app.post("/analyze", requireAuth, async (req, res) => {
           }
         }
 
-        // Write CLIP frame metadata so render can use correct per-scene timestamps.
-        // One midpoint frame per scene (framePath). Render reads this file instead
-        // of reconstructing timestamps with the wrong even-spacing formula.
-        // Without this file, CLIP embeds frames at wrong timestamps (e.g. frame #372
-        // at 8s spacing instead of actual 3050s), the ±15% radius check fails, and
-        // zero corrections are applied — CLIP silently does nothing every render.
-        // CLIP/SigLIP sidecar disabled (v3.1.0) — skip frame metadata when off.
-        const _clipSidecarOn = String(process.env.CLIP_SIDECAR_ENABLED || "0").toLowerCase() === "1";
-        if (_clipSidecarOn) {
-        try {
-          // FIX (SYNC-FIXES #3c): emit EVERY extracted frame with its true per-frame
-          // timestamp, not just one midpoint entry per scene. The sidecar's
-          // multi-frame averaging (/match with sceneWindows) only activates when a
-          // beat window contains >=2 stored frames — with one frame per scene it
-          // never had a chance to fire, so every render silently fell back to
-          // single-frame global-argmax matching. Reusing sceneFrameTimes() here also
-          // means the stamped time matches the position actually extracted (Fix 1
-          // already scopes those times inside the rendered [startSec,endSec] window).
-          const _clipMeta = scenes.flatMap((sc) => {
-            const times = sceneFrameTimes(sc, effectiveDuration);
-            return (sc.framePaths || []).map((fp, fi) => ({
-              file: path.basename(fp),
-              timeSec: times[fi],
-              sceneIndex: sc.index,
-            }));
-          });
-          await fs.writeFile(
-            path.join(framesDir, 'clip-metadata.json'),
-            JSON.stringify(_clipMeta),
-            'utf8'
-          );
-          console.log(`[analyze ${jobId}] CLIP metadata: ${_clipMeta.length} frames timestamped across ${scenes.length} scenes`);
-        } catch (_cmErr) {
-          console.warn(`[analyze ${jobId}] CLIP metadata write failed (non-fatal):`, _cmErr?.message);
-        }
-        }
-
         // TMDb grounding removed (v3.0.5): TMDb cast/overview lookups were
         // producing WORSE character names than the Whisper transcript alone
         // (wrong actor↔character mapping, stale/incomplete cast lists for
@@ -2312,6 +2274,10 @@ app.post("/analyze", requireAuth, async (req, res) => {
             transcriptBlock,
             narrationLang,
             targetClipCount: effectiveTargetClipCount,
+            semanticQcEnabled: Boolean(SERVER_GEMINI_KEY) &&
+              String(process.env.PRO_SEMANTIC_QC_ENABLED ?? "1").toLowerCase() !== "0",
+            qcApiKey: SERVER_GEMINI_KEY,
+            qcModel: process.env.PRO_SEMANTIC_QC_MODEL || SERVER_GEMINI_MODEL,
           });
         } catch (providerErr) {
           // FIX (2026-07-03): Gemini free tier sporadically hard-blocks whole
@@ -2341,6 +2307,10 @@ app.post("/analyze", requireAuth, async (req, res) => {
               transcriptBlock,
               narrationLang,
               targetClipCount: effectiveTargetClipCount,
+              semanticQcEnabled: Boolean(SERVER_GEMINI_KEY) &&
+                String(process.env.PRO_SEMANTIC_QC_ENABLED ?? "1").toLowerCase() !== "0",
+              qcApiKey: SERVER_GEMINI_KEY,
+              qcModel: process.env.PRO_SEMANTIC_QC_MODEL || SERVER_GEMINI_MODEL,
             });
           } else {
             throw providerErr;
@@ -2348,26 +2318,11 @@ app.post("/analyze", requireAuth, async (req, res) => {
         }
         await jobStore.update(jobId, { progress: 90, message: `Scene analysis complete (${scenes.length} scenes, ${parsed.characters?.length || 0} characters)` });
       } catch (sceneErr) {
-        console.error(`[analyze ${jobId}] scene analysis failed, falling back to fixed frames:`, sceneErr);
-        await jobStore.update(jobId, { progress: 50, message: `Scene mode unavailable (${String(sceneErr.message || sceneErr).slice(0, 60)}); using frames` });
-        const targetFrames = Math.max(8, Math.min(140, Number(frameBudget) || 60));
-        const { frames } = await extractFrames({ filePath, outDir: framesDir, count: targetFrames });
-        if (await isJobSuperseded(jobId)) { console.log(`[analyze ${jobId}] superseded in fallback path — aborting before Claude call`); return; }
-        await jobStore.update(jobId, { progress: 60, message: `Sending ${frames.length} frames to Claude` });
-        const withBase64 = [];
-        for (const f of frames) withBase64.push({ ...f, base64: await frameToBase64(f.path) });
-        parsed = await callClaudeWithFrameBatching({
-          apiKey: claudeApiKey,
-          model: claudeModel,
-          provider: activeAiProvider,
-          frames: withBase64,
-          movie: { ...movie, durationSec: duration },
-          channelName: channelName || "Plotline Panic",
-          maxClipSeconds: maxClipSeconds,
-          targetClipCount: effectiveTargetClipCount,
-          transcriptBlock,
-        });
-        await jobStore.update(jobId, { progress: 90, message: "Parsing response" });
+        // v5 professional mode: fixed-grid / arbitrary timestamp fallback is not
+        // visually trustworthy. Fail clearly and let the operator retry scene
+        // detection instead of silently producing a mismatched recap.
+        console.error(`[analyze ${jobId}] deterministic scene analysis failed:`, sceneErr);
+        throw new Error(`Deterministic scene analysis failed: ${String(sceneErr.message || sceneErr).slice(0, 240)}`);
       }
       // Defensive clamp: enforce max clip duration even if Claude ignored it.
       if (Number.isFinite(maxClipSeconds) && maxClipSeconds > 0) {
@@ -2578,7 +2533,11 @@ Timestamps in chapters must be evenly spaced across the ${_estMins2}-minute esti
         progress: 100,
         message: "Analysis complete",
         result: {
-          duration, sourceFileId: fileId, aiProvider: activeAiProvider, ...parsed,
+          duration, sourceFileId: fileId, aiProvider: activeAiProvider,
+          targetMinutes: Number(analyzeTargetMinutes) || 20,
+          targetClipCount: effectiveTargetClipCount,
+          pipelineVersion: "5.0.0",
+          ...parsed,
           // Persist Whisper transcript segments so the render step can check
           // for real dialogue near t=0 (soft logo floor — see _whisperSegments
           // at render time) when scene detection fell back to an even grid.
@@ -2927,7 +2886,8 @@ app.get("/history", requireAuth, async (req, res) => {
         hasPoster:    !!(job.posterPath),
         movieTitle:   job.result?.title || job.settings?.channelName || null,
         beatCount:    Array.isArray(job.result?.beats) ? job.result.beats.length : null,
-        syncScore:    job.syncScore || null,
+        footageCoverageScore: job.footageCoverageScore || null,
+        avDriftSec: job.qc?.avDriftSec ?? null,
         downloadUrl:  job.outputPath ? `/jobs/${job.id}/download` : null,
         posterUrl:    job.posterPath ? `/jobs/${job.id}/poster` : null,
       };
@@ -3966,36 +3926,15 @@ async function generatePerBeatTTS(jobId, beats, apiKey, opts = {}) {
     }
   }
 
-  // ── Phase 3: Truncated text (first 200 chars) for still-failed clips ────────
-  for (const [i] of _chainExhausted() ? [] : [...failed]) {
-    const fullText = _buildTtsText(beats[i]);
-    if (!fullText) continue;
-    const shortText = fullText.slice(0, 200).replace(/\s+\S*$/, "").trim() + "\u2026";
-    if (shortText.length < 10) continue;
-    const ttsId = `${jobId}-tts-beat-${String(i).padStart(3, "0")}.mp3`;
-    const ttsPath = path.join(UPLOADS_DIR, ttsId);
-    await new Promise((r) => setTimeout(r, 2000));
-    try {
-      const { cacheHit } = await _ttsCall(shortText, ttsPath);
-      if (cacheHit) _cacheHits++;
-      const dur = await probeDurationSec(ttsPath);
-      if (dur < 0.05) throw new Error("zero-length");
-      results[i] = { id: ttsId, duration: dur };
-      failed.delete(i);
-      console.log(`[render ${jobId}] PER-BEAT TTS: beat-${i} recovered with truncated text`);
-    } catch (err) {
-      failed.set(i, String(err.message));
-    }
-  }
+  // v5: never replace a narrated beat with truncated text. Full-text retries
+  // and provider fallback are the only acceptable recovery paths.
   console.log(`[render ${jobId}] PER-BEAT TTS: ${_cacheHits}/${beats.length} beats served from cache (${beats.length - _cacheHits} fresh API calls)`);
 
   // ── FAIL-LOUD GUARD (v4.0.1) ────────────────────────────────────────────────
-  // If more than 30% of narrated beats have no voice, the output would be a
-  // mostly-silent video (53-minute silent render, 2026-08-04). Abort with an
-  // actionable error instead of shipping garbage. The HOOK-V2 caller wraps this
-  // in its own try/catch, so a dead hook TTS just skips the hook gracefully.
+  // Any missing narrated beat is a failed professional render. Never ship
+  // partial narration or substitute silence.
   const _narratedCount = beats.filter((b) => _buildTtsText(b)).length;
-  if (_narratedCount > 0 && failed.size > _narratedCount * 0.3) {
+  if (_narratedCount > 0 && failed.size > 0) {
     const firstErr = [...failed.values()][0] || "unknown error";
     throw new Error(
       `TTS failed for ${failed.size}/${_narratedCount} beats — aborting render instead of producing a silent video. ` +
@@ -4597,7 +4536,7 @@ async function runRenderFromIngest(jobId, {
           rawBeats = rawBeats.filter((b) => {
             const narr = String(b.narration || b.reason || "").trim();
             if (narr.toUpperCase().startsWith("SKIP")) return false;
-            if (/\b(studio|logo|production\s*company|distributor|credit|title\s*card|opening\s*credit)\b/i.test(narr)) return false;
+            if (/\b(studio|logo|production\s*company|distributor|credits?|title\s*card|opening\s*credits?|closing\s*credits?|credits?\s+roll)\b/i.test(narr)) return false;
             return true;
           });
           if (rawBeats.length < beforeSkip) {
@@ -4630,7 +4569,7 @@ async function runRenderFromIngest(jobId, {
               const firstSc = _scenesMap.get(b.sceneIds[0]);
               const lastSc  = _scenesMap.get(b.sceneIds[b.sceneIds.length - 1]);
               if (firstSc && lastSc) {
-                let resolvedStart = Math.min(Number(b.startSec), firstSc.startSec);
+                let resolvedStart = Number(firstSc.startSec);
                 let resolvedEnd = _ceilAL > 0
                   ? Math.min(lastSc.endSec, _ceilAL) : lastSc.endSec;
 
@@ -4647,15 +4586,10 @@ async function runRenderFromIngest(jobId, {
                 };
               }
             }
-            // FIX B fallback (no sceneIds stored or scene not found in map):
-            // extend window to next beat's start — same as original FIX B.
+            // v5: missing identity is fatal. Never invent a visual window from
+            // neighboring beat timestamps.
             _sceneIdsResolved.fallback++;
-            if (i < rawBeats.length - 1) {
-              return { ...b, endSec: Math.max(Number(b.endSec), Number(rawBeats[i + 1].startSec)) };
-            }
-            // Last beat: extend window to safe ceiling.
-            const lastEnd = _ceilAL > Number(b.startSec) ? _ceilAL : Number(b.endSec);
-            return { ...b, endSec: Math.max(Number(b.endSec), lastEnd) };
+            throw new Error(`Beat ${b.beatId || b.index || i} has no valid server scene identity`);
           });
           console.log(
             `[render ${jobId}] FIX-B: sceneIds resolved ${_sceneIdsResolved.count} beats, ` +
@@ -4663,6 +4597,10 @@ async function runRenderFromIngest(jobId, {
           );
 
           _analyzeJobId = analyzeJob.id;
+          if (Number(analyzeJob.result.targetMinutes) > 0) {
+            targetMinutes = Number(analyzeJob.result.targetMinutes);
+            console.log(`[render ${jobId}] target duration inherited from analyze job: ${targetMinutes}min`);
+          }
           // FIX (2026-07-03): carry the scene-detection-fallback flag and the
           // Whisper transcript forward so the UNIVERSAL BEAT NORMALISATION
           // soft logo floor (below) can tell fallback-grid renders apart from
@@ -4737,13 +4675,24 @@ async function runRenderFromIngest(jobId, {
     if (_analyzeJobId) {
       try {
         const _slJob = await jobStore.get(_analyzeJobId).catch(() => null);
+        if (_slJob?.result?.pipelineVersion !== "5.0.0") {
+          throw new Error(
+            `Analyze job ${_analyzeJobId} was created by pipeline ${_slJob?.result?.pipelineVersion || "legacy"}. ` +
+            `Professional v5 render requires a fresh v5 analyze job.`
+          );
+        }
+        if (Number(_slJob.result.targetMinutes) > 0) {
+          targetMinutes = Number(_slJob.result.targetMinutes);
+        }
         const _sl = _slJob?.result?.scenesList;
         if (Array.isArray(_sl) && _sl.length > 0) {
           const _slMap = new Map(_sl.map((s) => [Number(s.index), s]));
           let _rederived = 0;
           beats = beats.map((b) => {
             const sids = Array.isArray(b.sceneIds) ? b.sceneIds.map(Number).filter(Number.isFinite) : [];
-            if (sids.length === 0) return b;
+            if (sids.length !== 1 || sids[0] !== Number(b.index)) {
+              throw new Error(`Beat ${b.beatId || b.index} has non-deterministic scene identity`);
+            }
             const first = _slMap.get(Math.min(...sids));
             const last  = _slMap.get(Math.max(...sids));
             if (!first || !last) return b;
@@ -4793,8 +4742,10 @@ async function runRenderFromIngest(jobId, {
           }
         }
       } catch (_slErr) {
-        console.warn(`[render ${jobId}] SCENE-LOCK: re-derivation skipped (non-fatal):`, _slErr?.message || _slErr);
+        throw new Error(`SCENE-LOCK failed: ${_slErr?.message || _slErr}`);
       }
+    } else {
+      throw new Error("Professional v5 render requires analyzeJobId and a deterministic scene manifest");
     }
     // ── END SCENE-LOCK RE-DERIVATION ──────────────────────────────────────
 
@@ -4849,14 +4800,7 @@ async function runRenderFromIngest(jobId, {
           }
           return true;
         })
-        .sort((a, b) => Number(a.startSec) - Number(b.startSec))
-        .map((b, i, arr) => {
-          // Expand each window to the full scene range (next beat's startSec).
-          if (i < arr.length - 1) {
-            return { ...b, endSec: Math.max(Number(b.endSec), Number(arr[i + 1].startSec)) };
-          }
-          return b; // last beat: extended to safeCeiling below
-        });
+        .sort((a, b) => Number(a.startSec) - Number(b.startSec));
 
       // Reorder audio files to match the sorted beat order.
       if (voicePerBeat && taggedBeats.length > 0) {
@@ -4874,7 +4818,7 @@ async function runRenderFromIngest(jobId, {
       const poolSec = beats.reduce((s, b) => s + Math.max(0, Number(b.endSec) - Number(b.startSec)), 0);
       console.log(
         `[render ${jobId}] SYNC: beats normalised ${beatsBefore}→${beats.length}` +
-        ` (SKIP/intro filtered, windows expanded, unique pool=${poolSec.toFixed(0)}s)`,
+        ` (SKIP/intro filtered, exact scene windows preserved, pool=${poolSec.toFixed(0)}s)`,
       );
       if (_logoFloorDropped > 0) {
         console.log(`[render ${jobId}] LOGO-FLOOR: dropped ${_logoFloorDropped} fallback-grid beat(s) ending before ${LOGO_FLOOR_SEC}s with no dialogue detected`);
@@ -4913,8 +4857,10 @@ async function runRenderFromIngest(jobId, {
       console.log(`[render ${jobId}] BEAT-TRIM: median narration ${_medianWords.toFixed(0)}w → ${_estSecPerBeat.toFixed(1)}s/beat TTS → using ${AVG_BEAT_SEC.toFixed(1)}s/beat avg`);
       const BEATS_TARGET  = Math.max(40, Math.min(120, Math.round((+targetMinutes || 20) * 60 / AVG_BEAT_SEC)));
       const _trimMode = String(process.env.BEAT_TRIM_MODE || "chronological").toLowerCase();
-      const _trimOff = String(process.env.BEAT_TRIM_ENABLED ?? "1").toLowerCase() === "0"
-        || _trimMode === "off" || _trimMode === "none";
+      // v5: analyze selects exactly the target-length visual manifest. Dropping
+      // authored beats at render destroys story continuity and invalidates the
+      // TTS/footage contract.
+      const _trimOff = true;
       if (!_trimOff && beats.length > BEATS_TARGET) {
         const original = beats.slice();
 
@@ -5179,6 +5125,9 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
       }
     }
     // ── END HOOK V2 GENERATION ─────────────────────────────────────────────
+    if (HOOK_V2 && (!String(_hookText || "").trim() || !Array.isArray(_hookV2BeatIds) || _hookV2BeatIds.length === 0)) {
+      throw new Error("HOOK-QC failed: hook text/source beats were not generated");
+    }
 
     console.log(`[render ${jobId}] SYNC: beats=${beats.length}, voiceFiles=${voiceoverFileIds.length}`);
 
@@ -5300,115 +5249,40 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
         const creditsTail = Math.min(srcDur * 0.08, Math.max(90, srcDur * 0.035));
         safeCeiling = Math.max(srcDur * 0.5, srcDur - creditsTail);
       }
-      // Extend the last beat's window to safeCeiling so it has full movie
-      // footage rather than the AI's original 6-second clip window.
-      if (beats.length > 0 && safeCeiling > 0) {
-        const lastB = beats[beats.length - 1];
-        if (safeCeiling > Number(lastB.startSec)) {
-          beats[beats.length - 1] = { ...lastB, endSec: Math.max(Number(lastB.endSec), safeCeiling) };
+      // v5 professional gate: preserve exact analyzed scene windows. Never
+      // extend the last beat to credits, borrow a neighboring scene, or solve a
+      // writing/footage mismatch with visible slow motion/frozen frames.
+      if (beats.length > 0 && voiceTotalPre > 0.5) {
+        const _fitFailures = [];
+        let _microRetime = 0;
+        beats = beats.map((b, i) => {
+          const win = Math.max(0, Number(b.endSec) - Number(b.startSec));
+          const tts = Number(voDurs[i]) || 0;
+          if (tts <= 0 || win >= tts) return { ...b, slowFactor: 1 };
+          const ratio = win / tts;
+          if (ratio >= 0.95) {
+            _microRetime++;
+            return { ...b, slowFactor: ratio };
+          }
+          _fitFailures.push({ i, win, tts, ratio });
+          return { ...b, slowFactor: 1 };
+        });
+        if (_microRetime > 0) {
+          console.log(`[render ${jobId}] PRO-QC: ${_microRetime} beat(s) use imperceptible micro-retime (0.95–1.00x)`);
         }
-        const poolSec = beats.reduce((s, b) => s + Math.max(0, Number(b.endSec) - Number(b.startSec)), 0);
-        const winSizes = beats.slice(0, 3).map(b => (Number(b.endSec)-Number(b.startSec)).toFixed(0));
-        console.log(`[render ${jobId}] SYNC: last beat extended to ${safeCeiling.toFixed(0)}s ceiling, pool=${poolSec.toFixed(0)}s, first3windows=${winSizes.join(',')}s`);
+        if (_fitFailures.length > 0) {
+          const sample = _fitFailures.slice(0, 8)
+            .map((x) => `beat${x.i}[video=${x.win.toFixed(1)}s tts=${x.tts.toFixed(1)}s ratio=${x.ratio.toFixed(2)}]`)
+            .join(', ');
+          throw new Error(
+            `PRO-QC failed: ${_fitFailures.length}/${beats.length} narration beat(s) exceed their approved moving footage by >5%. ` +
+            `${sample}. Re-run analyze with pipeline v5 so narration is rewritten to the exact clip budget; ` +
+            `the renderer will not ship slow-motion/frozen footage.`
+          );
+        }
       }
+
       if (voiceTotalPre > 0.5) {
-        // ── WINDOW ADEQUACY EXPANSION ─────────────────────────────────────────
-        // After measuring exact per-beat TTS durations (voDurs), expand any beat
-        // whose footage window is shorter than its narration.  Borrowing from the
-        // next 1-2 beats is safe because the forward cursor in buildSyncedTimeline
-        // is strictly monotonic — the adjacent beat simply advances past the
-        // section borrowed here, so no footage is repeated within a single beat.
-        // This expansion updates `beats` in-place so that:
-        //   (a) computeSyncScore reports accurate coverage (not a pre-TTS guess),
-        //   (b) buildSyncedTimeline receives correctly-sized windows.
-        {
-          let expanded = 0;
-          let slowMo = 0;
-          let backExtended = 0;
-          const _adq = beats.slice();
-          for (let i = 0; i < _adq.length; i++) {
-            const b = _adq[i];
-            const win = Math.max(0, Number(b.endSec) - Number(b.startSec));
-            const tts = Number(voDurs[i]) || 0;
-            if (tts <= 0 || win >= tts * 1.05) continue; // window ≥105% TTS — OK
-            const ratio = win / tts;
-
-            if (ratio >= 0.80) {
-              // Mild mismatch (≤20% short): gentle slow-motion, max 1.25× slowdown.
-              // v4.0.4: threshold raised 0.70→0.80 — 0.70x slow-mo is visibly
-              // sluggish (user report: "all scenes in slow motion"). Beats in
-              // the 0.70–0.80 band now go through back-extension first, which
-              // adds REAL footage instead of stretching.
-              slowMo++;
-              _adq[i] = { ...b, slowFactor: ratio };
-              continue;
-            }
-
-            // v4.0.0 LOCKED-WINDOWS: severe mismatch (>30% short). Extend ONLY
-            // into the unclaimed gap between this beat's window end and the NEXT
-            // beat's window start — that is contiguous continuation of the same
-            // scene region and belongs to no other beat. Never borrow the next
-            // beats' own windows (that showed their footage under this beat's
-            // narration — the old "wrong scene" bug).
-            const targetEnd = Number(b.startSec) + tts * 1.2;
-            const nextStart = i + 1 < _adq.length ? Number(_adq[i + 1].startSec) : (safeCeiling || targetEnd);
-            const newEnd = Math.min(targetEnd, Math.max(Number(b.endSec), nextStart), safeCeiling || targetEnd);
-            const grew = newEnd > Number(b.endSec) + 0.5;
-            if (grew) expanded++;
-            let newStart = Number(b.startSec);
-            let newWin = Math.max(0, newEnd - newStart);
-
-            // v4.0.2 BACKWARD EXTENSION (render ohrbb51X87): analyze sometimes
-            // clusters several long-narration beats 3–10s apart, leaving a beat
-            // with e.g. a 6s window for 27s of narration → a long frozen frame.
-            // Pull the window START earlier into the PREVIOUS beat's UNUSED
-            // footage tail. Safe because: (a) the previous beat only consumes
-            // ~its own TTS-length of source seconds from its window start (we
-            // keep a +1s pad past that), and (b) OVERLAP-TRIM below re-assigns
-            // the tail formally so no footage is shown twice. Lead-in footage
-            // of the same contiguous region is professionally acceptable —
-            // a 15s freeze is not.
-            if (newWin < tts * 1.05 && i > 0) {
-              const prev = _adq[i - 1];
-              const prevTts = Number(voDurs[i - 1]) || 0;
-              const prevStart = Number(prev.startSec);
-              const prevWin = Math.max(0, Number(prev.endSec) - prevStart);
-              // Source seconds prev actually consumes ≤ its TTS length (slow-mo
-              // shows FEWER source seconds per output second, never more).
-              const prevUsedEnd = prevStart + Math.min(prevWin, prevTts) + 1.0;
-              const wantStart = newEnd - tts * 1.2;
-              const backStart = Math.max(0, prevUsedEnd, wantStart);
-              if (backStart < newStart - 0.5) {
-                newStart = backStart;
-                newWin = newEnd - newStart;
-                backExtended++;
-              }
-            }
-
-            const newRatio = tts > 0 ? newWin / tts : 1;
-            const changes = {};
-            if (grew) changes.endSec = newEnd;
-            if (newStart < Number(b.startSec) - 0.5) changes.startSec = newStart;
-            if (newRatio < 1.05) {
-              // Still short after both extensions — capped slow-mo on top; the
-              // mux hold-frame tail covers whatever remains. v4.0.4: floor
-              // raised 0.70→0.80 (0.70x reads as obvious slow motion).
-              slowMo++;
-              changes.slowFactor = Math.max(0.80, Math.min(1, newRatio));
-            }
-            _adq[i] = { ...b, ...changes };
-          }
-          beats = _adq;
-          const parts = [];
-          if (expanded > 0)     parts.push(`${expanded} window-expanded`);
-          if (backExtended > 0) parts.push(`${backExtended} back-extended into prev beat's unused tail`);
-          if (slowMo > 0)       parts.push(`${slowMo} time-stretched (slow-mo, ratio ≥70%)`);
-          if (parts.length > 0) {
-            console.log(`[render ${jobId}] SYNC: window-adequacy: ${parts.join(', ')}`);
-          }
-        }
-        // ── END WINDOW ADEQUACY EXPANSION ─────────────────────────────────────
-
         let scenes = beats.map((b) => ({ startSec: Number(b.startSec), endSec: Number(b.endSec), reason: b.reason || b.narration || "" }));
         const beatTexts = beats.map((b) => (typeof b.narration === "string" ? b.narration : ""));
 
@@ -5700,7 +5574,7 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
   }
 
   // ── Sync Validator + Subtitle Generation (Steps 9, 11, 12 of Timeline Orchestrator) ──
-  let _finalSyncScore = null;
+  let _footageCoverageScore = null;
   if (syncMode && Array.isArray(beats) && Array.isArray(syncBeatDurations) && syncBeatDurations.length > 0) {
 
     // Duration coverage (footage length vs TTS) — NOT semantic visual match
@@ -5712,15 +5586,15 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
         `[render ${jobId}] DURATION COVERAGE: ${_sv.overall}% overall ` +
         `(${_good.length}/${_sv.n} beats have enough footage ≥95%, ${_poor.length} beats short <80%)`
       );
-      _finalSyncScore = _sv.overall;
+      _footageCoverageScore = _sv.overall;
       if (_poor.length > 0) {
         const worst = _poor.slice(0, 5)
           .map(b => `beat${b.i}[tts=${b.ttsDur}s win=${b.win}s → ${b.score}%]`).join(", ");
         console.warn(`[render ${jobId}] LOW COVERAGE BEATS: ${worst}`);
       }
       console.log(
-        `[render ${jobId}] VISUAL MATCH: locked-windows — footage cut from the exact ` +
-        `analyzed scene windows (${_sv.n} beats, matched by construction, no search)`
+        `[render ${jobId}] SOURCE PROVENANCE: ${_sv.n} beat(s) use immutable server-assigned scene windows; ` +
+        `semantic match is independently checked by Gemini QC during analyze`
       );
     } catch (_svErr) {
       console.warn(`[render ${jobId}] sync score error:`, _svErr?.message || _svErr);
@@ -6075,13 +5949,18 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
 
       // Validation log
       const _hv2FinalDur = _hv2ClipDurs.reduce((a, b) => a + b, 0);
+      if (_hv2VoiceDur - _hv2FinalDur > 0.25) {
+        throw new Error(
+          `hook moving footage ${_hv2FinalDur.toFixed(2)}s is shorter than narration ${_hv2VoiceDur.toFixed(2)}s`
+        );
+      }
       console.log(`[render ${jobId}] HOOK-V2 READY ✓`);
       console.log(`  text: "${_hookText.slice(0, 80)}..."`);
       console.log(`  sourceBeatIds: [${_hookV2BeatIds.join(",")}]`);
       console.log(`  footage: ${_hookV2BeatIds.map((idx) => { const b = beats[idx]; return b ? `${idx}→${Math.round(b.startSec)}-${Math.round(b.endSec)}s` : `${idx}→?`; }).join(", ")}`);
       console.log(`  narration=${_hv2VoiceDur.toFixed(2)}s footage=${_hv2FinalDur.toFixed(2)}s diff=${Math.abs(_hv2VoiceDur - _hv2FinalDur).toFixed(2)}s ${Math.abs(_hv2VoiceDur - _hv2FinalDur) <= 0.25 ? "PASS" : "WARN"}`);
     } catch (hv2Err) {
-      console.warn(`[render ${jobId}] HOOK-V2 failed (non-fatal, video continues without hook):`, hv2Err?.message || hv2Err);
+      throw new Error(`HOOK-QC failed: ${hv2Err?.message || hv2Err}`);
     }
   }
   // ── END HOOK V2 TTS + FOOTAGE ─────────────────────────────────────────────
@@ -6645,7 +6524,18 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
 
       const _gap    = _voiDur - _vidDur;  // +ve = video short, -ve = video long
 
-      if (_gap > 0.30 && _vidDur > 0) {
+      // v5 professional gate: a short video segment indicates an upstream
+      // narration/footage contract violation. Never borrow adjacent scenes,
+      // stack another slow-motion pass, or hide it with a long cloned frame.
+      if (_gap > 0.30) {
+        throw new Error(
+          `PRO-QC beat ${_bi}: rendered moving footage ${_vidDur.toFixed(2)}s is ` +
+          `${_gap.toFixed(2)}s shorter than narration ${_voiDur.toFixed(2)}s. ` +
+          `Aborting instead of applying slow-motion/freeze-frame gap fill.`
+        );
+      }
+
+      if (false && _gap > 0.30 && _vidDur > 0) {
         // CASE 1: video shorter than TTS by > 0.30s
         const _beat      = beats[_bi];
         const _nextBeat  = beats[_bi + 1];
@@ -6807,24 +6697,10 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
       else if (_drift <= 0.75) { _syncWarn++; console.warn(`[render ${jobId}] SYNC-WARN beat ${_bi}: post-fill drift=${_drift.toFixed(2)}s`); }
       else                     { _syncFix++;  console.warn(`[render ${jobId}] SYNC-FIX  beat ${_bi}: post-fill drift=${_drift.toFixed(2)}s`); }
 
-      // Widen the mux pad so -shortest never has less video than audio left —
-      // video is still short by up to `_drift` after gap-fill maxed out, and
-      // (post Fix 9b) the audio has no trailing silence left to absorb that.
-      // FIX (2026-07-03, take 2): the 3.0s cap still let -shortest truncate
-      // narration mid-sentence on beats where gap-fill (re-trim/adjacent-
-      // scene/slow-mo to 0.80x) left more than ~2.85s of residual drift.
-      // Audio is the master timeline (see PHASE B comment above) — a held
-      // final frame, however long, is always preferable to cutting off a
-      // sentence. Uncap the pad (sanity-bounded at 15s so a data error can't
-      // produce an absurd freeze) so the tpad tail always outlasts the full
-      // voiceover file and -shortest can never end before the narration does.
+      // v5: only a sub-frame/encoder-delay tail is allowed. Larger deficits
+      // already fail above; never hide them behind multi-second still images.
       if (_drift > 0) {
-        _muxPadSec = Math.min(15.0, Math.max(_muxPadSec, _drift + 0.15));
-        if (_drift + 0.15 > 15.0) {
-          console.warn(`[render ${jobId}] SYNC-FIX beat ${_bi}: residual drift ${_drift.toFixed(2)}s exceeds sanity cap (15.0s) — narration may still be truncated by ${(_drift + 0.15 - 15.0).toFixed(2)}s`);
-        } else if (_drift + 0.15 > 3.0) {
-          console.warn(`[render ${jobId}] SYNC-FIX beat ${_bi}: residual drift ${_drift.toFixed(2)}s — held final frame for ${_muxPadSec.toFixed(2)}s to avoid cutting narration`);
-        }
+        _muxPadSec = Math.min(0.35, Math.max(_muxPadSec, _drift + 0.05));
       }
     }
     // ── END GAP-FILL ──────────────────────────────────────────────────────────
@@ -6833,8 +6709,7 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
     const _beatMuxPath = path.join(UPLOADS_DIR, `beat-muxed-${jobId}-${String(_bi).padStart(3, "0")}.mp4`);
     const muxOk = await _muxVideoWithVoice(_beatVideoPath, _voPath, _beatMuxPath, _muxPadSec);
     if (!muxOk) {
-      console.warn(`[render ${jobId}] beat-mux ${_bi} failed — silent fallback`);
-      _muxedPaths.push(_beatVideoPath);
+      throw new Error(`PRO-QC beat ${_bi}: video+voice mux failed; refusing silent fallback`);
     } else {
       _muxedPaths.push(_beatMuxPath);
     }
@@ -6902,7 +6777,11 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
       let _domKey = null, _domN = -1;
       for (const [k,n] of _counts) { if (n > _domN) { _domN = n; _domKey = k; } }
       const _dom = _allP[_allP.findIndex((pp) => `${pp.w}x${pp.h}@${pp.fr}` === _domKey)] || _allP[0];
-      const _domFps = (() => { const m = String(_dom.fr).split("/"); const n = Number(m[0])||24, d = Number(m[1])||1; return Math.max(1, Math.round(n/d)); })();
+      // Preserve the exact rational rate. Rounding 24000/1001 to 24 produced
+      // incompatible MP4 timebases; concat then inserted a ~28s video delay at
+      // the hook/body boundary while audio continued normally.
+      const _domFps = /^\d+\/\d+$/.test(String(_dom.fr)) ? String(_dom.fr) : "24000/1001";
+      const _domTimescale = Math.max(1000, Number(_domFps.split("/")[0]) || 24000);
       if (_dom.w > 0 && _dom.h > 0 && _counts.size > 1) {
         let _normCount = 0;
         for (let _i = 0; _i < _muxedPaths.length; _i++) {
@@ -6915,6 +6794,7 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
               "-y","-hide_banner","-loglevel","error","-i", _src,
               "-vf", `scale=${_dom.w}:${_dom.h}:force_original_aspect_ratio=increase,crop=${_dom.w}:${_dom.h},fps=${_domFps},setsar=1`,
               "-c:v","libx264","-preset","ultrafast","-crf","23","-pix_fmt","yuv420p",
+              "-video_track_timescale", String(_domTimescale),
               "-c:a","aac","-b:a","192k","-ar","48000","-ac","2",
               _normPath,
             ], { stdio: "ignore" });
@@ -7043,12 +6923,9 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
   const _finalVf = [
     ..._safeVf,
     `fps=${_finalS.fps}`,
-    // Small safety pad so the video stream cannot end a few frames before the
-    // narration audio (last word never clipped). The whole output is then hard-
-    // clamped to outputDurationSec (sum of muxed segment durations) via -t below,
-    // so this no longer produces a long frozen tail. (Was stop_duration=120 with
-    // NO clamp → ~74s of frozen last frame after narration ended.)
-    `tpad=stop_mode=clone:stop_duration=2`,
+    // Sub-frame encoder-delay safety only. Professional mode forbids visible
+    // still-frame tails.
+    `tpad=stop_mode=clone:stop_duration=0.10`,
   ].join(",");
   if (COPYRIGHT_SAFE_MODE) console.log(`[render ${jobId}] COPYRIGHT_SAFE_MODE: watermark/transform enabled, captions disabled`);
 
@@ -7057,15 +6934,27 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
   // Sidechaincompress ducks it further (~20:1) whenever narration is audible,
   // so music is practically inaudible during speech and rises in pauses.
   const _musicVol = Number.isFinite(Number(musicVolumeDb)) ? Number(musicVolumeDb) : -18;
+  // v5 PTS-safe concat: each finished segment is an independent input. Reset
+  // video/audio PTS for every segment and join with the concat FILTER, not the
+  // concat demuxer. This prevents the reproduced hook/body corruption where a
+  // rounded 24fps hook plus 24000/1001 body inserted ~56s of video delay while
+  // narration continued normally.
+  const _segmentSetup = _muxedPaths.map((_, i) =>
+    `[${i}:v]setpts=PTS-STARTPTS[v${i}];` +
+    `[${i}:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,asetpts=PTS-STARTPTS[a${i}]`
+  ).join(";");
+  const _segmentPads = _muxedPaths.map((_, i) => `[v${i}][a${i}]`).join("");
+  const _concatPrefix = `${_segmentSetup};${_segmentPads}concat=n=${_muxedPaths.length}:v=1:a=1[basev][basea];`;
+  const _musicInputIndex = _muxedPaths.length;
   const _finalFilter = _hasFinalMusic
-    ? `[0:v]${_finalVf}[vout];` +
+    ? _concatPrefix + `[basev]${_finalVf}[vout];` +
       // aresample=async=1 → absorbs accumulated AAC encoder-delay drift from
       // 75 individually-muxed beat segments (~21 ms/segment × 75 = ~1.6 s without fix).
       // apad=pad_dur=0.5 → ensures narration audio never ends before the video
       // track (prevents silent final scene when audio is microseconds short).
       // asplit → one copy goes to the output mix, one acts as sidechain detector.
-      `[0:a]aresample=async=1,apad=pad_dur=0.5,asplit=2[voice_out][voice_sc];` +
-      `[1:a]aloop=loop=-1:size=2147483647,volume=${_musicVol}dB,` +
+      `[basea]aresample=async=1,apad=pad_dur=0.10,asplit=2[voice_out][voice_sc];` +
+      `[${_musicInputIndex}:a]aloop=loop=-1:size=2147483647,volume=${_musicVol}dB,` +
       `aformat=sample_fmts=fltp:channel_layouts=stereo[music_raw];` +
       // sidechaincompress: threshold=0.02 (voice above 2% amplitude triggers ducking),
       // ratio=20:1 (heavy compression so music is nearly inaudible during speech),
@@ -7073,8 +6962,8 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
       `[music_raw][voice_sc]sidechaincompress=threshold=0.02:ratio=20:` +
       `attack=100:release=800:level_sc=0.8[music_ducked];` +
       `[voice_out][music_ducked]amix=inputs=2:duration=first:normalize=0[aout]`
-    : `[0:v]${_finalVf}[vout];` +
-      `[0:a]aresample=async=1,aformat=sample_fmts=fltp:channel_layouts=stereo[aout]`;
+    : _concatPrefix + `[basev]${_finalVf}[vout];` +
+      `[basea]aresample=async=1,aformat=sample_fmts=fltp:channel_layouts=stereo[aout]`;
 
   // QUALITY (v2.9.5): the final encode is the delivered file — do NOT use the
   // ultrafast preset here (it produces visible blocking, worsened by the upscale).
@@ -7084,7 +6973,7 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
   const _finalCrf = Math.min(Number(_finalS.crf) || 23, 20);
   const _finalArgs = [
     "-y", "-hide_banner", "-loglevel", "info", "-stats", "-progress", "pipe:1",
-    "-f", "concat", "-safe", "0", "-i", manifestPath,
+    ..._muxedPaths.flatMap((p) => ["-i", p]),
     ...(_hasFinalMusic ? ["-i", musicPath] : []),
     "-filter_complex", _finalFilter,
     "-map", "[vout]", "-map", "[aout]",
@@ -7159,6 +7048,82 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
       finish(new Error(`ffmpeg encode failed (code ${code}): ${tail || "see server logs"}`));
     });
   });
+
+  // ── v5 FINAL PROFESSIONAL QC ─────────────────────────────────────────────
+  // Validate the delivered artifact, not theoretical pre-render windows.
+  const _finalProbe = await new Promise((resolve, reject) => {
+    const ff = spawn("ffprobe", [
+      "-v", "error",
+      "-show_entries", "format=duration:stream=index,codec_type,duration,avg_frame_rate",
+      "-of", "json", outputPath,
+    ], { stdio: ["ignore", "pipe", "pipe"] });
+    let out = "", err = "";
+    ff.stdout.on("data", (d) => { out += d; });
+    ff.stderr.on("data", (d) => { err += d; });
+    ff.on("close", (code) => {
+      if (code !== 0) return reject(new Error(`Final ffprobe failed: ${err.slice(-300)}`));
+      try { resolve(JSON.parse(out)); } catch (e) { reject(e); }
+    });
+    ff.on("error", reject);
+  });
+  const _videoStream = _finalProbe.streams?.find((s) => s.codec_type === "video");
+  const _audioStream = _finalProbe.streams?.find((s) => s.codec_type === "audio");
+  const _videoDur = Number(_videoStream?.duration);
+  const _audioDur = Number(_audioStream?.duration);
+  const _formatDur = Number(_finalProbe.format?.duration);
+  const _avDriftSec = Math.abs(_videoDur - _audioDur);
+  const _expectedDriftSec = Math.abs(_formatDur - outputDurationSec);
+  if (!Number.isFinite(_videoDur) || !Number.isFinite(_audioDur) ||
+      _avDriftSec > 0.12 || _expectedDriftSec > 0.25) {
+    throw new Error(
+      `FINAL-QC failed: video=${_videoDur.toFixed?.(3)}s audio=${_audioDur.toFixed?.(3)}s ` +
+      `A/V drift=${_avDriftSec.toFixed?.(3)}s expected=${outputDurationSec.toFixed(3)}s ` +
+      `actual=${_formatDur.toFixed?.(3)}s`
+    );
+  }
+
+  // Detect visible held/frozen frames. Normal movie shots may move slowly, so
+  // use a conservative 2s threshold; any hit blocks publication for review.
+  const _maxFreezeSec = Math.max(1, Number(process.env.PRO_MAX_FREEZE_SEC) || 2.0);
+  const _freezeDurations = await new Promise((resolve, reject) => {
+    const ff = spawn("ffmpeg", [
+      "-hide_banner", "-nostats", "-i", outputPath,
+      "-vf", `freezedetect=n=-55dB:d=${_maxFreezeSec}`,
+      "-an", "-f", "null", "-",
+    ], { stdio: ["ignore", "ignore", "pipe"] });
+    let err = "";
+    ff.stderr.on("data", (d) => { err = (err + d.toString()).slice(-20000); });
+    const timer = setTimeout(() => {
+      try { ff.kill("SIGKILL"); } catch {}
+      reject(new Error("FINAL-QC freeze scan timed out"));
+    }, 300_000);
+    ff.on("close", () => {
+      clearTimeout(timer);
+      resolve([...err.matchAll(/freeze_duration:\s*([0-9.]+)/g)].map((m) => Number(m[1])).filter(Number.isFinite));
+    });
+    ff.on("error", (e) => { clearTimeout(timer); reject(e); });
+  });
+  if (_freezeDurations.length > 0) {
+    throw new Error(
+      `FINAL-QC failed: detected ${_freezeDurations.length} frozen interval(s) ` +
+      `(max ${Math.max(..._freezeDurations).toFixed(2)}s, allowed ${_maxFreezeSec.toFixed(2)}s).`
+    );
+  }
+  await jobStore.update(jobId, {
+    qc: {
+      pipelineVersion: "5.0.0",
+      sourceWindowPolicy: "strict",
+      visualSemanticQc: "gemini-score-only",
+      avDriftSec: Number(_avDriftSec.toFixed(4)),
+      durationDriftSec: Number(_expectedDriftSec.toFixed(4)),
+      frozenIntervals: 0,
+    },
+  }).catch(() => {});
+  console.log(
+    `[render ${jobId}] FINAL-QC PASS: A/V drift=${_avDriftSec.toFixed(3)}s, ` +
+    `duration drift=${_expectedDriftSec.toFixed(3)}s, frozen intervals=0`
+  );
+  // ── END FINAL PROFESSIONAL QC ────────────────────────────────────────────
 
   // Generate a poster/thumbnail JPG from the finished recap (best-effort, never
   // fails the job). Grab a frame ~10% in (avoids the very first dark frame).
@@ -7284,7 +7249,7 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
     outputPath,
     posterPath: posterPath || undefined,
     completedAt: Date.now(),
-    syncScore: _finalSyncScore != null ? _finalSyncScore : undefined,
+    footageCoverageScore: _footageCoverageScore != null ? _footageCoverageScore : undefined,
   });
 
   // Best-effort cleanup of intermediate clip files + manifest + subs (keep the source).

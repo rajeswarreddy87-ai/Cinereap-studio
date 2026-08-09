@@ -100,20 +100,22 @@ test("buildSyncedTimeline: COVERAGE — visuals always reach the full voiceover 
   assert.ok(Math.abs(visTotal - 240) < 2.0, `visTotal=${visTotal} should ~= 240`);
 });
 
-test("buildSyncedTimeline: CREDITS-SAFE — no produced range exceeds the ceiling", () => {
+test("buildSyncedTimeline: LOCKED + CREDITS-SAFE — never wraps into unrelated footage", () => {
   // Windows span the whole movie; ceiling excludes the last region (credits).
+  // v5 intentionally leaves a visual shortfall for upstream QC to reject
+  // instead of wrapping/repeating unrelated footage to fake full coverage.
   const scenes = [];
   for (let i = 0; i < 10; i++) scenes.push({ startSec: i * 10, endSec: i * 10 + 4 });
   const durs = scenes.map(() => 30); // far more than available -> forces re-passes
   const ceiling = 80; // credits-safe ceiling well below the last window starts
-  const tl = buildSyncedTimeline(scenes, durs, { sourceDurationSec: ceiling });
+  const tl = buildSyncedTimeline(scenes, durs, { sourceDurationSec: ceiling, lockWindows: true });
   for (const s of tl) {
     assert.ok(s.endSec <= ceiling - 0.05 + 1e-6, `range ${JSON.stringify(s)} exceeds ceiling ${ceiling}`);
   }
-  // And it still covered the full narration length.
+  // Locked windows do NOT manufacture coverage by wrapping the movie.
   const visTotal = tl.reduce((a, s) => a + (s.endSec - s.startSec), 0);
   const need = durs.reduce((a, b) => a + b, 0);
-  assert.ok(Math.abs(visTotal - need) < 2.0, `visTotal=${visTotal} should ~= ${need}`);
+  assert.ok(visTotal < need, `visTotal=${visTotal} should remain below impossible need=${need}`);
 });
 
 test("planSyncedRender end-to-end shape", () => {
