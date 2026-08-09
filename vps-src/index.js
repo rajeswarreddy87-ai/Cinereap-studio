@@ -5396,8 +5396,41 @@ Return every slot exactly once and obey each MAX word count.`;
           const sample = _fitFailures.slice(0, 8)
             .map((x) => `beat${x.i}[video=${x.win.toFixed(1)}s tts=${x.tts.toFixed(1)}s ratio=${x.ratio.toFixed(2)}]`)
             .join(", ");
-          throw new Error(
-            `PRO-QC failed after two narration-fit rounds: ${_fitFailures.length}/${beats.length} beat(s) remain overlong. ${sample}`
+          const quarantineLimit = Math.max(2, Math.ceil(beats.length * 0.05));
+          if (_fitFailures.length > quarantineLimit) {
+            throw new Error(
+              `PRO-QC failed after two narration-fit rounds: ${_fitFailures.length}/${beats.length} beat(s) remain overlong. ${sample}`
+            );
+          }
+          // Some sub-2s shots cannot carry natural TTS because provider onset /
+          // ending cadence is longer than the image itself. Omit a small residual
+          // set rather than stretching/freeze-framing it. Remap every dependent
+          // array and hook source index in lockstep.
+          const drop = new Set(_fitFailures.map((x) => x.i));
+          const oldToNew = new Map();
+          const keptBeats = [];
+          const keptVoiceIds = [];
+          const keptDurs = [];
+          for (let old = 0; old < beats.length; old++) {
+            if (drop.has(old)) continue;
+            oldToNew.set(old, keptBeats.length);
+            keptBeats.push(beats[old]);
+            keptVoiceIds.push(voiceoverFileIds[old]);
+            keptDurs.push(voDurs[old]);
+          }
+          beats = keptBeats;
+          voiceoverFileIds = keptVoiceIds;
+          voDurs = keptDurs;
+          _perBeatTtsDurations = keptDurs.slice();
+          if (Array.isArray(_hookV2BeatIds)) {
+            _hookV2BeatIds = _hookV2BeatIds
+              .map((old) => oldToNew.get(old))
+              .filter((x) => Number.isInteger(x));
+          }
+          voiceTotalPre = voDurs.reduce((a, b) => a + (Number(b) || 0), 0);
+          console.warn(
+            `[render ${jobId}] FIT-QUARANTINE: omitted ${drop.size} physically unfit beat(s) ` +
+            `[${[...drop].join(",")}]; ${sample}`
           );
         }
 
