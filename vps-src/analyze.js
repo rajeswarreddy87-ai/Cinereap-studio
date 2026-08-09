@@ -1129,8 +1129,8 @@ Start the body at the earliest chronological SETUP beat where the protagonist's 
 goal, or inciting circumstances can be clearly introduced. Do not skip genuine chronological setup.
 If there is no nonlinear cold open, choose the first scene index.
 
-Return one exact sceneIndex from OPENING VISUAL BEATS and JSON only:
-{"bodyStartIndex":0,"reason":"short explanation"}`,
+Return the zero-based LIST POSITION from OPENING VISUAL BEATS (the number before the dot), not sceneIndex, and JSON only:
+{"bodyStartPosition":0,"reason":"short explanation"}`,
   }];
 }
 
@@ -1830,11 +1830,38 @@ export async function analyzeWithScenes({
   // Only corrects flagged beats, so extra API calls are proportional to error rate.
   {
     let _valFlagged = 0, _valCorrected = 0;
-    for (let bi = 0; bi < batches.length; bi++) {
-      try {
-        const valMessages = buildValidationMessages({ movie, scenes: batches[bi], noteByIndex });
+    const requestValidations = async (sceneBatch, label) => {
+      const acceptedById = new Map();
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const valMessages = buildValidationMessages({ movie, scenes: sceneBatch, noteByIndex });
         const valText = await callLLM({ provider, apiKey, model, messages: valMessages });
         const validations = parseValidationResponse(valText);
+        const reconciled = reconcileExactIndexedRows(sceneBatch, validations);
+        for (const [id, row] of reconciled.acceptedById) {
+          if (!acceptedById.has(id)) acceptedById.set(id, row);
+        }
+        if (sceneBatch.length === 1 && validations.length === 1) {
+          acceptedById.set(Number(sceneBatch[0].index), { ...validations[0], index: sceneBatch[0].index });
+        }
+        const missing = sceneBatch.filter((sc) => !acceptedById.has(Number(sc.index)));
+        if (missing.length === 0) return sceneBatch.map((sc) => acceptedById.get(Number(sc.index)));
+        console.warn(
+          `[analyzeWithScenes] VALIDATION-RETRY ${label}: attempt ${attempt + 1}/2 ` +
+          `missing=[${missing.map((s) => s.index).join(",")}]`
+        );
+      }
+      const missing = sceneBatch.filter((sc) => !acceptedById.has(Number(sc.index)));
+      if (sceneBatch.length === 1) throw new Error(`Validation omitted scene ${sceneBatch[0].index}`);
+      for (let i = 0; i < missing.length; i += 5) {
+        const subset = missing.slice(i, i + 5);
+        const recovered = await requestValidations(subset, `${label}/missing-${i / 5 + 1}`);
+        for (const row of recovered) acceptedById.set(Number(row.index), row);
+      }
+      return sceneBatch.map((sc) => acceptedById.get(Number(sc.index)));
+    };
+    for (let bi = 0; bi < batches.length; bi++) {
+      try {
+        const validations = await requestValidations(batches[bi], `batch-${bi}`);
         for (const v of validations) {
           if (!v.ok) {
             _valFlagged++;
@@ -1926,11 +1953,10 @@ export async function analyzeWithScenes({
       let startObj;
       try { startObj = JSON.parse(startText); }
       catch { startObj = JSON.parse(repairJson(startText)); }
-      const requested = Number(startObj?.bodyStartIndex);
-      const position = beats.findIndex((b) => Number(b.index) === requested);
+      const position = Number(startObj?.bodyStartPosition);
       const maxPosition = Math.min(34, Math.floor(beats.length * 0.25));
-      if (position >= 0 && position <= maxPosition) {
-        bodyStartIndex = requested;
+      if (Number.isInteger(position) && position >= 0 && position <= maxPosition) {
+        bodyStartIndex = beats[position].index;
         coldOpenBeats = beats.slice(0, position);
         beats = beats.slice(position);
         console.log(
@@ -1938,7 +1964,7 @@ export async function analyzeWithScenes({
           `(omitted ${coldOpenBeats.length} cold-open beat(s)): ${String(startObj?.reason || "").slice(0, 180)}`
         );
       } else {
-        console.warn(`[analyzeWithScenes] STORY-START: invalid/out-of-range scene ${requested}; keeping first beat`);
+        console.warn(`[analyzeWithScenes] STORY-START: invalid/out-of-range position ${startObj?.bodyStartPosition}; keeping first beat`);
       }
     } catch (startErr) {
       console.warn("[analyzeWithScenes] STORY-START pass failed (keeping first beat):", startErr?.message || startErr);

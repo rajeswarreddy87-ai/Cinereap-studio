@@ -229,7 +229,7 @@ describe("v5 character identity and continuity prompts", () => {
     const text = messages[0].content;
     assert.match(text, /flash-forward/);
     assert.match(text, /chronological SETUP/);
-    assert.match(text, /bodyStartIndex/);
+    assert.match(text, /bodyStartPosition/);
   });
 });
 
