@@ -38,7 +38,19 @@ import { JobStore } from "./jobs.js";
 import { uploadToYouTube } from "./youtube.js";
 import { google } from "googleapis";
 import { ingestFromUrl } from "./ingest-worker.js";
-import { buildAnalyzeMessages, callClaude, callClaudeWithFrameBatching, extractFrames, enforceMaxClipDurationServer, frameToBase64, parseAnalysisResponse, probeDurationSec, analyzeWithScenes, callLLM } from "./analyze.js";
+import {
+  buildAnalyzeMessages,
+  callClaude,
+  callClaudeWithFrameBatching,
+  extractFrames,
+  enforceMaxClipDurationServer,
+  frameToBase64,
+  parseAnalysisResponse,
+  probeDurationSec,
+  analyzeWithScenes,
+  callLLM,
+  fetchWikipediaFilmGrounding,
+} from "./analyze.js";
 import { analyzeScenes, SCENE_THRESHOLD } from "./scenes.js";
 import { promises as fsp } from "node:fs";
 import { transcribeMovie, buildTranscriptBlock } from "./transcribe.js";
@@ -2175,6 +2187,19 @@ app.post("/analyze", requireAuth, async (req, res) => {
       }
       // Narration language: default English; if caller passed a language, narrate in it.
       const narrationLang = (typeof language === "string" && language.trim()) ? language.trim() : "English";
+      let referenceGrounding = "";
+      try {
+        referenceGrounding = await fetchWikipediaFilmGrounding({
+          title: movie.title,
+          year: movie.year,
+        });
+        console.log(
+          `[analyze ${jobId}] CHARACTER-GROUNDING: Wikipedia reference ` +
+          `${referenceGrounding ? `loaded (${referenceGrounding.length} chars)` : "not found"}`
+        );
+      } catch (groundErr) {
+        console.warn(`[analyze ${jobId}] CHARACTER-GROUNDING: Wikipedia unavailable (continuing with transcript/model):`, groundErr?.message);
+      }
 
       // ---- HYBRID SCENE-AWARE ANALYSIS (v2.0) ------------------------------
       // Detect real scenes, extract one key frame per scene, fuse each scene
@@ -2275,12 +2300,17 @@ app.post("/analyze", requireAuth, async (req, res) => {
             transcriptBlock,
             narrationLang,
             targetClipCount: effectiveTargetClipCount,
-            semanticQcEnabled: Boolean(SERVER_GEMINI_KEY || effectiveAnthropicKey) &&
+            referenceGrounding,
+            semanticQcEnabled: Boolean(SERVER_GEMINI_KEY || SERVER_OPENAI_KEY || effectiveAnthropicKey) &&
               String(process.env.PRO_SEMANTIC_QC_ENABLED ?? "1").toLowerCase() !== "0",
-            qcProvider: PRO_SEMANTIC_QC_PROVIDER === "gemini" ? "gemini" : "claude",
-            qcApiKey: PRO_SEMANTIC_QC_PROVIDER === "gemini" ? SERVER_GEMINI_KEY : effectiveAnthropicKey,
+            qcProvider: ["gemini", "openai"].includes(PRO_SEMANTIC_QC_PROVIDER) ? PRO_SEMANTIC_QC_PROVIDER : "claude",
+            qcApiKey: PRO_SEMANTIC_QC_PROVIDER === "gemini"
+              ? SERVER_GEMINI_KEY
+              : PRO_SEMANTIC_QC_PROVIDER === "openai" ? SERVER_OPENAI_KEY : effectiveAnthropicKey,
             qcModel: process.env.PRO_SEMANTIC_QC_MODEL ||
-              (PRO_SEMANTIC_QC_PROVIDER === "gemini" ? SERVER_GEMINI_MODEL : effectiveAnthropicModel),
+              (PRO_SEMANTIC_QC_PROVIDER === "gemini"
+                ? SERVER_GEMINI_MODEL
+                : PRO_SEMANTIC_QC_PROVIDER === "openai" ? "gpt-4o-mini" : effectiveAnthropicModel),
           });
         } catch (providerErr) {
           // FIX (2026-07-03): Gemini free tier sporadically hard-blocks whole
@@ -2310,12 +2340,17 @@ app.post("/analyze", requireAuth, async (req, res) => {
               transcriptBlock,
               narrationLang,
               targetClipCount: effectiveTargetClipCount,
-              semanticQcEnabled: Boolean(SERVER_GEMINI_KEY || effectiveAnthropicKey) &&
+              referenceGrounding,
+              semanticQcEnabled: Boolean(SERVER_GEMINI_KEY || SERVER_OPENAI_KEY || effectiveAnthropicKey) &&
                 String(process.env.PRO_SEMANTIC_QC_ENABLED ?? "1").toLowerCase() !== "0",
-              qcProvider: PRO_SEMANTIC_QC_PROVIDER === "gemini" ? "gemini" : "claude",
-              qcApiKey: PRO_SEMANTIC_QC_PROVIDER === "gemini" ? SERVER_GEMINI_KEY : effectiveAnthropicKey,
+              qcProvider: ["gemini", "openai"].includes(PRO_SEMANTIC_QC_PROVIDER) ? PRO_SEMANTIC_QC_PROVIDER : "claude",
+              qcApiKey: PRO_SEMANTIC_QC_PROVIDER === "gemini"
+                ? SERVER_GEMINI_KEY
+                : PRO_SEMANTIC_QC_PROVIDER === "openai" ? SERVER_OPENAI_KEY : effectiveAnthropicKey,
               qcModel: process.env.PRO_SEMANTIC_QC_MODEL ||
-                (PRO_SEMANTIC_QC_PROVIDER === "gemini" ? SERVER_GEMINI_MODEL : effectiveAnthropicModel),
+                (PRO_SEMANTIC_QC_PROVIDER === "gemini"
+                  ? SERVER_GEMINI_MODEL
+                  : PRO_SEMANTIC_QC_PROVIDER === "openai" ? "gpt-4o-mini" : effectiveAnthropicModel),
             });
           } else {
             throw providerErr;
@@ -2542,6 +2577,7 @@ Timestamps in chapters must be evenly spaced across the ${_estMins2}-minute esti
           targetMinutes: Number(analyzeTargetMinutes) || 20,
           targetClipCount: effectiveTargetClipCount,
           pipelineVersion: "5.0.0",
+          characterGroundingSource: referenceGrounding ? "wikipedia+transcript+vision" : "transcript+vision",
           ...parsed,
           // Persist Whisper transcript segments so the render step can check
           // for real dialogue near t=0 (soft logo floor — see _whisperSegments
@@ -5083,6 +5119,9 @@ Return JSON only, no markdown, in this exact shape:
         const _hv2Prompt =
 `You write YouTube movie recap hooks (max 60 words, ~20s narration time).
 
+Canonical characters:
+${canonicalCharacters.map((c) => `- ${c.name}: ${c.note}`).join("\n")}
+
 Selected story beats:
 ${_hv2Lines}
 
@@ -5091,6 +5130,9 @@ RULES:
 • Never reveal the ending, killer identity, final twist, or who survives.
 • Immediately grab attention. Short sentences. High tension. Present tense.
 • Create curiosity and an unanswered question.
+• Use canonical proper names for any named principal. Never call Hutch/the protagonist "a man" or "the man."
+• Write exactly ONE short sentence per referenced beat, in the same order as sourceBeatIds.
+• Do not weave multiple beat events into one sentence; footage is shown in this exact sentence order.
 • End with one transition line like "Let's go back to the beginning."
 
 Return JSON only, no markdown:
@@ -5984,9 +6026,10 @@ Obey each MAX word count.`;
 
       // ── v4.0.0 FAST-CUT HOOK FOOTAGE ────────────────────────────────────
       // Professional cold-open pacing: 1.8–2.5s cuts (vs 3–6s in the body).
-      // Cycle through the source beats, each pass slicing from progressively
-      // deeper offsets inside that beat's OWN window (locked-windows: hook
-      // footage also never leaves the beats the hook text references).
+      // Keep each source beat's cuts contiguous before moving to the next beat.
+      // The hook prompt writes one sentence per beat in this same order, so
+      // narration sentence N now plays over footage event N instead of cycling
+      // through all events every 2.2 seconds.
       // The plan totals voiceDur ± one cut, so hook video ≈ hook audio with
       // no long tail clip.
       const HOOK_CUT_SEC = Math.min(2.5, Math.max(1.5, Number(process.env.HOOK_CUT_SEC) || 2.2));
@@ -6004,22 +6047,24 @@ Obey each MAX word count.`;
           .filter(Boolean);
         if (_hv2Wins.length === 0) throw new Error("All HOOK-V2 beat windows invalid");
         let _planned = 0;
-        let _guard = 0;
-        while (_planned < _hv2VoiceDur - 0.15 && _guard < 60) {
-          _guard++;
-          let _took = false;
-          for (const w of _hv2Wins) {
-            if (_planned >= _hv2VoiceDur - 0.15) break;
+        const perBeatShare = _hv2VoiceDur / _hv2Wins.length;
+        for (let wi = 0; wi < _hv2Wins.length; wi++) {
+          const w = _hv2Wins[wi];
+          const targetShare = wi === _hv2Wins.length - 1
+            ? _hv2VoiceDur - _planned
+            : Math.min(perBeatShare, _hv2VoiceDur - _planned);
+          let allocated = 0;
+          while (allocated < targetShare - 0.05) {
             const segStart = w.ws + w.offset;
             const room = w.we - segStart;
-            if (room < 0.8) continue; // window used up for this pass
-            const segLen = Math.min(HOOK_CUT_SEC, room, Math.max(0.8, _hv2VoiceDur - _planned));
+            if (room < 0.8) break;
+            const segLen = Math.min(HOOK_CUT_SEC, room, targetShare - allocated);
+            if (segLen < 0.5) break;
             _hv2Segs.push({ beatIdx: w.beatIdx, startSec: segStart, endSec: segStart + segLen });
             w.offset += segLen;
+            allocated += segLen;
             _planned += segLen;
-            _took = true;
           }
-          if (!_took) break; // all windows exhausted — mux hold-frame covers the rest
         }
         console.log(`[render ${jobId}] HOOK-V2 FAST-CUT: ${_hv2Segs.length} cuts (~${HOOK_CUT_SEC.toFixed(1)}s each) planned=${_planned.toFixed(2)}s voice=${_hv2VoiceDur.toFixed(2)}s from beats [${[..._hv2Segs.reduce((s, g) => s.add(g.beatIdx), new Set())].join(",")}]`);
       }

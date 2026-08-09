@@ -7,6 +7,7 @@ import {
   buildNarrationRepairMessages,
   buildNarrationQcMessages,
   buildSceneNotesMessages,
+  buildStoryStartMessages,
   parseAnalysisResponse,
   reconcileExactIndexedRows,
   semanticQuarantineLimit,
@@ -213,6 +214,22 @@ describe("v5 character identity and continuity prompts", () => {
     assert.match(text, /naturally continuing story/);
     assert.match(text, /canonical proper names/);
     assert.match(text, /MAX 20 WORDS/);
+    assert.match(text, /BODY INTRODUCTION/);
+  });
+
+  it("selects chronological setup after a nonlinear cold open", () => {
+    const messages = buildStoryStartMessages({
+      movie: { title: "Test Film", year: 2025 },
+      beats: [
+        { index: 3, startSec: 0, note: "Future interrogation aftermath." },
+        { index: 4, startSec: 60, note: "Protagonist begins ordinary morning routine." },
+      ],
+      characters: [{ name: "Mara", note: "protagonist" }],
+    });
+    const text = messages[0].content;
+    assert.match(text, /flash-forward/);
+    assert.match(text, /chronological SETUP/);
+    assert.match(text, /bodyStartIndex/);
   });
 });
 

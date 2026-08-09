@@ -528,6 +528,45 @@ export function getModelMaxOutputTokens(model = "") {
 function sleepMs(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
 
 /**
+ * Keyless public grounding for canonical character names/relationships.
+ * Wikipedia is never used for timestamps or visual event selection; it only
+ * helps resolve transcript aliases and family/role relationships.
+ */
+export async function fetchWikipediaFilmGrounding({ title, year } = {}) {
+  const cleanTitle = String(title || "").trim();
+  if (!cleanTitle) return "";
+  const query = `${cleanTitle}${year ? ` ${year}` : ""} film`;
+  const ua = "CineRecap/5.0 (movie recap metadata grounding)";
+  const searchUrl =
+    `https://en.wikipedia.org/w/api.php?action=query&list=search&format=json&utf8=1&srsearch=${encodeURIComponent(query)}`;
+  const searchRes = await fetch(searchUrl, {
+    headers: { "user-agent": ua, accept: "application/json" },
+    signal: AbortSignal.timeout(15_000),
+  });
+  if (!searchRes.ok) throw new Error(`Wikipedia search HTTP ${searchRes.status}`);
+  const search = await searchRes.json();
+  const results = Array.isArray(search?.query?.search) ? search.query.search : [];
+  if (results.length === 0) return "";
+  const lc = cleanTitle.toLowerCase();
+  const chosen = results.find((r) => {
+    const t = String(r.title || "").toLowerCase();
+    return t.includes(lc) && (t.includes("film") || (year && t.includes(String(year))));
+  }) || results[0];
+  if (!chosen?.title) return "";
+  const extractUrl =
+    `https://en.wikipedia.org/w/api.php?action=query&prop=extracts&explaintext=1&format=json&titles=${encodeURIComponent(chosen.title)}`;
+  const extractRes = await fetch(extractUrl, {
+    headers: { "user-agent": ua, accept: "application/json" },
+    signal: AbortSignal.timeout(15_000),
+  });
+  if (!extractRes.ok) throw new Error(`Wikipedia extract HTTP ${extractRes.status}`);
+  const data = await extractRes.json();
+  const pages = Object.values(data?.query?.pages || {});
+  const extract = String(pages[0]?.extract || "").trim();
+  return extract.slice(0, 20_000);
+}
+
+/**
  * Call Anthropic's /v1/messages endpoint with the given messages.
  * Caller supplies the API key and model.
  *
@@ -696,6 +735,45 @@ export async function callGemini({ apiKey, model, messages, maxTokens = 4000, js
   throw lastErr || new Error("Gemini request failed");
 }
 
+/** Independent OpenAI multimodal reviewer using the same message abstraction. */
+export async function callOpenAI({ apiKey, model = "gpt-4o-mini", messages, maxTokens = 4000, jsonMode = false }) {
+  const converted = messages.map((m) => ({
+    role: m.role === "assistant" ? "assistant" : "user",
+    content: (Array.isArray(m.content) ? m.content : [{ type: "text", text: String(m.content ?? "") }])
+      .map((block) => block.type === "image"
+        ? {
+            type: "image_url",
+            image_url: { url: `data:${block.source?.media_type || "image/jpeg"};base64,${block.source?.data}` },
+          }
+        : { type: "text", text: block.text || "" }),
+  }));
+  let lastErr;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const res = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${apiKey}` },
+      body: JSON.stringify({
+        model,
+        messages: converted,
+        max_tokens: maxTokens,
+        ...(jsonMode ? { response_format: { type: "json_object" } } : {}),
+      }),
+      signal: AbortSignal.timeout(180_000),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      const text = String(data?.choices?.[0]?.message?.content || "").trim();
+      if (!text) throw new Error("OpenAI returned empty content");
+      return text;
+    }
+    const body = await res.text().catch(() => "");
+    lastErr = new Error(`OpenAI ${res.status}: ${body.slice(0, 300)}`);
+    if (![429, 500, 502, 503, 504].includes(res.status) || attempt === 2) break;
+    await sleepMs([5_000, 15_000, 30_000][attempt]);
+  }
+  throw lastErr || new Error("OpenAI request failed");
+}
+
 /**
  * Provider-agnostic dispatcher used by every call site in this file (and by
  * index.js for the ad-hoc hook/YouTube-metadata calls). Defaults to Claude
@@ -703,6 +781,7 @@ export async function callGemini({ apiKey, model, messages, maxTokens = 4000, js
  */
 export async function callLLM({ provider = "claude", apiKey, model, messages, maxTokens, jsonMode = false }) {
   if (provider === "gemini") return callGemini({ apiKey, model, messages, maxTokens, jsonMode });
+  if (provider === "openai") return callOpenAI({ apiKey, model, messages, maxTokens, jsonMode });
   return callClaude({ apiKey, model, messages, maxTokens });
 }
 
@@ -1009,9 +1088,49 @@ RULES:
    and adjacent beats. When the protagonist or another named principal is clearly the person shown, replace the generic label.
    Do not invent names for truly minor unnamed people.
 6. Stay within each MAX word budget. Complete sentences, active present tense, no headings or meta-commentary.
+${!previousEnding
+  ? `7. BODY INTRODUCTION: this is the first body batch. The first beat must orient the viewer by naming the protagonist ` +
+    `and concisely establishing their canonical role/current situation when supported by the cast/outline. Never begin ` +
+    `with an unexplained generic "a man" or isolated action caption.`
+  : ""}
 
 Return JSON only:
 {"beats":[{"index":0,"narration":"..."}]}`,
+  }];
+}
+
+export function buildStoryStartMessages({ movie, beats, characters, storyOutline = [], referenceGrounding = "" }) {
+  const cast = (characters || []).map((c) => `- ${c.name}: ${c.note}`).join("\n");
+  const outline = (storyOutline || []).map((a) => `- ${a.act || "Story"}: ${a.summary || ""}`).join("\n");
+  const opening = (beats || []).slice(0, 35)
+    .map((b, pos) => `${pos}. sceneIndex=${b.index} @ ${b.startSec.toFixed(1)}s: ${b.note}`)
+    .join("\n");
+  return [{
+    role: "user",
+    content:
+`Choose where the BODY of a professional movie recap should begin.
+
+Movie: ${movie.title}${movie.year ? ` (${movie.year})` : ""}
+
+CANONICAL CHARACTERS:
+${cast}
+
+STORY OUTLINE:
+${outline}
+
+OPENING VISUAL BEATS:
+${opening}
+
+${referenceGrounding ? `PUBLIC PLOT REFERENCE (identity/structure only):\n${referenceGrounding.slice(0, 9000)}\n` : ""}
+
+The video already has a separate dramatic hook. If the source movie opens with a flash-forward, interrogation,
+aftermath montage, pre-title action teaser, or future-climax cold open, exclude those teaser beats from the body.
+Start the body at the earliest chronological SETUP beat where the protagonist's ordinary situation, family,
+goal, or inciting circumstances can be clearly introduced. Do not skip genuine chronological setup.
+If there is no nonlinear cold open, choose the first scene index.
+
+Return one exact sceneIndex from OPENING VISUAL BEATS and JSON only:
+{"bodyStartIndex":0,"reason":"short explanation"}`,
   }];
 }
 
@@ -1117,7 +1236,7 @@ function _mergeCharacterCandidate(charByName, c) {
  * spellings, relationship labels standing in for a named character,
  * contradictory notes about the same person). Runs ONCE per analyze job.
  */
-export function buildCanonicalizeCharactersMessages({ movie, characters, beatNotes = [] }) {
+export function buildCanonicalizeCharactersMessages({ movie, characters, beatNotes = [], referenceGrounding = "" }) {
   const castList = characters.map((c, i) => `${i + 1}. ${c.name}: ${c.note}`).join("\n");
   const contextNotes = beatNotes.slice(0, 140)
     .map((b) => `- [${b.index}] ${b.note}`)
@@ -1137,12 +1256,16 @@ export function buildCanonicalizeCharactersMessages({ movie, characters, beatNot
         `the same person (e.g. one says deceased, another says alive) — this is a sign they are the same ` +
         `character with an unresolved fact, not two different people.\n\n` +
         `RAW CANDIDATES:\n${castList}\n\n` +
+        (referenceGrounding
+          ? `AUTHORITATIVE PUBLIC REFERENCE (use only for proper character names and relationships; never copy prose):\n` +
+            `${referenceGrounding.slice(0, 16000)}\n\n`
+          : ``) +
         (contextNotes ? `SCENE CONTEXT (sample beat notes, use to identify who is who):\n${contextNotes}\n\n` : ``) +
         `Produce a CLEAN, DEDUPLICATED canonical cast list:\n` +
         `  1. Merge every candidate that plausibly refers to the SAME person into ONE entry.\n` +
         `  2. Choose the most complete, correctly-spelled proper CHARACTER name as canonical. You may use ` +
-        `     established knowledge of "${movie.title}" only to resolve the main cast's proper character names ` +
-        `     and obvious transcript misspellings; never use actor names.\n` +
+        `     the authoritative public reference (when supplied), then established knowledge of "${movie.title}", ` +
+        `     to resolve the main cast's proper character names and obvious transcript misspellings; never use actor names.\n` +
         `  3. GENERIC-ALIAS RULE (critical): merge labels such as "the blonde woman", "the older man", ` +
         `     "the driver", "the wife", "the father", or "the protagonist" into an existing named character ` +
         `     whenever relationship, location, chronology, or context shows they are the same person. Do not ` +
@@ -1151,8 +1274,8 @@ export function buildCanonicalizeCharactersMessages({ movie, characters, beatNot
         `  4. Every recurring lead, spouse, child, parent, ally, and principal antagonist must use a proper ` +
         `     character name when the film identity is established. Keep a neutral role label only for truly ` +
         `     unnamed/minor people.\n` +
-        `  5. Write ONE factual note per character (5-10 words). If candidates conflict, use whichever fact is ` +
-        `     supported by the majority, or the LATER-appearing note if truly a toss-up. NEVER hedge with ` +
+        `  5. Write ONE factual note per character (5-12 words), including exact family/role relationship where known. ` +
+        `     If candidates conflict, the authoritative public reference wins, then the majority/later note. NEVER hedge with ` +
         `     "possibly"/"maybe"/"unclear" in the final note — pick a side or state the role only.\n` +
         `  6. Do NOT invent new minor characters or facts. Proper names for established main characters are ` +
         `     allowed only to resolve candidates already present in the scenes.\n` +
@@ -1566,6 +1689,7 @@ export function semanticQuarantineLimit(totalBeats) {
 export async function analyzeWithScenes({
   apiKey, model, provider = "claude", movie, channelName, scenes, segments = [], transcriptBlock = "", narrationLang = "English",
   overview = "", keywords = "",
+  referenceGrounding = "",
   semanticQcEnabled = false, qcProvider = "claude", qcApiKey = "", qcModel = "claude-sonnet-4-5",
 }) {
   if (!scenes || scenes.length === 0) throw new Error("analyzeWithScenes: no scenes provided");
@@ -1753,7 +1877,12 @@ export async function analyzeWithScenes({
   // this semantically. Fails gracefully by keeping the prefix-merged list.
   if (characters.length > 1) {
     try {
-      const canonMessages = buildCanonicalizeCharactersMessages({ movie, characters, beatNotes: beats });
+      const canonMessages = buildCanonicalizeCharactersMessages({
+        movie,
+        characters,
+        beatNotes: beats,
+        referenceGrounding,
+      });
       const canonText = await callLLM({ provider, apiKey, model, messages: canonMessages, maxTokens: 2000 });
       const canonChars = parseCanonicalCharactersResponse(canonText);
       if (canonChars.length > 0) {
@@ -1775,6 +1904,45 @@ export async function analyzeWithScenes({
     storyOutline = parseStoryOutlineResponse(outlineText);
   } catch (outlineErr) {
     console.warn("[analyzeWithScenes] story outline pass failed (continuing):", outlineErr?.message || outlineErr);
+  }
+
+  // ── v5 PASS 2.5: remove nonlinear cold-open from body ────────────────────
+  // The hook already provides dramatic future/action imagery. Replaying a
+  // flash-forward as body beat zero leaves viewers without a protagonist/story
+  // introduction. Choose the chronological setup point, bounded to the opening
+  // quarter so a model cannot skip the first act.
+  let bodyStartIndex = beats[0]?.index ?? 0;
+  let coldOpenBeats = [];
+  if (beats.length > 4) {
+    try {
+      const startText = await callLLM({
+        provider,
+        apiKey,
+        model,
+        messages: buildStoryStartMessages({ movie, beats, characters, storyOutline, referenceGrounding }),
+        maxTokens: 350,
+        jsonMode: true,
+      });
+      let startObj;
+      try { startObj = JSON.parse(startText); }
+      catch { startObj = JSON.parse(repairJson(startText)); }
+      const requested = Number(startObj?.bodyStartIndex);
+      const position = beats.findIndex((b) => Number(b.index) === requested);
+      const maxPosition = Math.min(34, Math.floor(beats.length * 0.25));
+      if (position >= 0 && position <= maxPosition) {
+        bodyStartIndex = requested;
+        coldOpenBeats = beats.slice(0, position);
+        beats = beats.slice(position);
+        console.log(
+          `[analyzeWithScenes] STORY-START: body begins at scene ${bodyStartIndex} ` +
+          `(omitted ${coldOpenBeats.length} cold-open beat(s)): ${String(startObj?.reason || "").slice(0, 180)}`
+        );
+      } else {
+        console.warn(`[analyzeWithScenes] STORY-START: invalid/out-of-range scene ${requested}; keeping first beat`);
+      }
+    } catch (startErr) {
+      console.warn("[analyzeWithScenes] STORY-START pass failed (keeping first beat):", startErr?.message || startErr);
+    }
   }
 
   // ── PASS 3 (Stage B): per-beat narration + moods — batched ──────────────
@@ -2081,6 +2249,16 @@ export async function analyzeWithScenes({
 
   const script = syncedBeats.map((b) => b.narration).filter(Boolean).join(" ").replace(/\s+/g, " ").trim();
   const timestamps = syncedBeats.map((b) => ({ startSec: b.startSec, endSec: b.endSec, reason: b.reason }));
-  return { script, timestamps, characters, beats: syncedBeats, storyOutline, scenesList, semanticQc };
+  return {
+    script,
+    timestamps,
+    characters,
+    beats: syncedBeats,
+    storyOutline,
+    scenesList,
+    semanticQc,
+    bodyStartIndex,
+    coldOpenSceneIds: coldOpenBeats.map((b) => b.index),
+  };
 }
 
