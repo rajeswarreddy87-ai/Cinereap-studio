@@ -6,6 +6,7 @@ import {
   buildNarrationQcMessages,
   buildSceneNotesMessages,
   parseAnalysisResponse,
+  reconcileExactIndexedRows,
 } from "./analyze.js";
 
 describe("buildAnalyzeMessages", () => {
@@ -132,6 +133,42 @@ describe("v5 deterministic scene prompts", () => {
     assert.match(text, /Maximum 20 words/);
     assert.match(text, /directly visible/);
     assert.match(text, /A man opens a door/);
+  });
+});
+
+describe("reconcileExactIndexedRows", () => {
+  const expected = [{ index: 2 }, { index: 7 }, { index: 11 }];
+
+  it("accepts unique exact IDs and identifies only missing scenes", () => {
+    const result = reconcileExactIndexedRows(expected, [
+      { index: 2, note: "a" },
+      { index: 11, note: "c" },
+    ]);
+    assert.deepEqual(result.missing.map((x) => x.index), [7]);
+    assert.equal(result.acceptedById.get(2).note, "a");
+    assert.equal(result.complete, false);
+  });
+
+  it("ignores renumbered, duplicate, and unknown IDs", () => {
+    const result = reconcileExactIndexedRows(expected, [
+      { index: 0, note: "renumbered" },
+      { index: 2, note: "first" },
+      { index: 2, note: "duplicate" },
+      { index: 99, note: "unknown" },
+    ]);
+    assert.deepEqual(result.missing.map((x) => x.index), [7, 11]);
+    assert.equal(result.acceptedById.get(2).note, "first");
+    assert.equal(result.invalidCount, 3);
+  });
+
+  it("returns rows in server expected order", () => {
+    const result = reconcileExactIndexedRows(expected, [
+      { index: 11, note: "c" },
+      { index: 2, note: "a" },
+      { index: 7, note: "b" },
+    ]);
+    assert.equal(result.complete, true);
+    assert.deepEqual(result.ordered.map((x) => x.note), ["a", "b", "c"]);
   });
 });
 

@@ -1452,6 +1452,35 @@ export function parseSceneScriptResponse(rawText) {
 }
 
 /**
+ * Reconcile LLM rows against immutable server indexes.
+ * Only exact, unique IDs are accepted. Invalid/renumbered/duplicate rows are
+ * ignored and their expected scenes remain in `missing` for targeted retry.
+ */
+export function reconcileExactIndexedRows(expected, returned) {
+  const expectedById = new Map(
+    (Array.isArray(expected) ? expected : []).map((row) => [Number(row.index), row])
+  );
+  const acceptedById = new Map();
+  let invalidCount = 0;
+  for (const row of Array.isArray(returned) ? returned : []) {
+    const id = Number(row?.index);
+    if (!Number.isFinite(id) || !expectedById.has(id) || acceptedById.has(id)) {
+      invalidCount++;
+      continue;
+    }
+    acceptedById.set(id, row);
+  }
+  const missing = [...expectedById.values()].filter((row) => !acceptedById.has(Number(row.index)));
+  return {
+    acceptedById,
+    missing,
+    invalidCount,
+    complete: missing.length === 0 && acceptedById.size === expectedById.size,
+    ordered: [...expectedById.keys()].map((id) => acceptedById.get(id)).filter(Boolean),
+  };
+}
+
+/**
  * Orchestrate the full 3-pass scene-aware analysis (v3.0).
  *
  * Pass 1 (Stage A):  buildSceneNotesMessages → beat notes + character list.
@@ -1496,25 +1525,65 @@ export async function analyzeWithScenes({
   // per-name across all batches gives Stage B the full, consistent cast.
   const noteByIndex = new Map();
   const charByName = new Map(); // lowercased name -> { name, note }
+  const requestSceneNotes = async (sceneBatch, label) => {
+    const acceptedById = new Map();
+    const charactersOut = [];
+    // Retry the same batch once; transient omissions often recover immediately.
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const messages = buildSceneNotesMessages({ movie, scenes: sceneBatch, segments, isFirstBatch: true });
+      const text = await callLLM({ provider, apiKey, model, messages });
+      const parsed = parseSceneNotesResponse(text);
+      charactersOut.push(...parsed.characters);
+      const reconciled = reconcileExactIndexedRows(sceneBatch, parsed.beats);
+      for (const [id, row] of reconciled.acceptedById) {
+        if (!acceptedById.has(id)) acceptedById.set(id, row);
+      }
+      // A singleton request is positionally unambiguous even if the model
+      // insists on renumbering it to zero.
+      if (sceneBatch.length === 1 && parsed.beats.length === 1) {
+        acceptedById.set(Number(sceneBatch[0].index), {
+          ...parsed.beats[0],
+          index: sceneBatch[0].index,
+        });
+      }
+      const missingNow = sceneBatch.filter((sc) => !acceptedById.has(Number(sc.index)));
+      if (missingNow.length === 0) {
+        if (attempt > 0) {
+          console.log(`[analyzeWithScenes] NOTE-RETRY ${label}: recovered all ${sceneBatch.length} scenes on retry`);
+        }
+        return { beats: sceneBatch.map((sc) => acceptedById.get(Number(sc.index))), characters: charactersOut };
+      }
+      console.warn(
+        `[analyzeWithScenes] NOTE-RETRY ${label}: attempt ${attempt + 1}/2 returned ` +
+        `${acceptedById.size}/${sceneBatch.length} exact scene IDs; missing=[${missingNow.map((s) => s.index).join(",")}]`
+      );
+    }
+
+    const missing = sceneBatch.filter((sc) => !acceptedById.has(Number(sc.index)));
+    if (missing.length === 0) {
+      return { beats: sceneBatch.map((sc) => acceptedById.get(Number(sc.index))), characters: charactersOut };
+    }
+    if (sceneBatch.length === 1) {
+      throw new Error(`Stage-A scene ${sceneBatch[0].index} omitted after two exact-ID attempts`);
+    }
+
+    // Retry only missing IDs in small groups. If a 5-scene group still omits
+    // rows, recursion eventually reaches single-scene requests.
+    for (let i = 0; i < missing.length; i += 5) {
+      const subset = missing.slice(i, i + 5);
+      const recovered = await requestSceneNotes(subset, `${label}/missing-${i / 5 + 1}`);
+      charactersOut.push(...recovered.characters);
+      for (const row of recovered.beats) acceptedById.set(Number(row.index), row);
+    }
+    return { beats: sceneBatch.map((sc) => acceptedById.get(Number(sc.index))), characters: charactersOut };
+  };
+
   for (let bi = 0; bi < batches.length; bi++) {
-    const messages = buildSceneNotesMessages({ movie, scenes: batches[bi], segments, isFirstBatch: true });
-    const text = await callLLM({ provider, apiKey, model, messages });
-    const parsed = parseSceneNotesResponse(text);
+    const parsed = await requestSceneNotes(batches[bi], `batch-${bi}`);
     for (const c of parsed.characters) {
       _mergeCharacterCandidate(charByName, c);
     }
-    // v5 deterministic Stage-A merge: the LLM is allowed to write text, never
-    // choose identity. Scene indexes can be gapped after frame extraction; if
-    // Claude renumbers them, index-based merge attaches notes to wrong footage.
-    if (parsed.beats.length !== batches[bi].length) {
-      throw new Error(
-        `Stage-A scene-note count mismatch in batch ${bi}: ` +
-        `sent ${batches[bi].length}, received ${parsed.beats.length}. Refusing ambiguous mapping.`
-      );
-    }
-    parsed.beats.forEach((b, j) => {
-      noteByIndex.set(batches[bi][j].index, b.note);
-    });
+    for (const b of parsed.beats) noteByIndex.set(Number(b.index), b.note);
   }
   // Preserve first-appearance order (protagonists first); cap to avoid a bloated
   // cast of one-off minor names poisoning the Stage-B prompt.
@@ -1654,40 +1723,61 @@ export async function analyzeWithScenes({
 
   let beatScript = [];
   let prevNarrationEnd = "";
-  for (let bi = 0; bi < scriptBatches.length; bi++) {
-    const batchInfo = { start: bi * SCRIPT_BATCH, total: beats.length, prevEnding: prevNarrationEnd };
-    const scriptMessages = buildSceneScriptMessages({
-      movie, channelName, beats: scriptBatches[bi], characters, segments, transcriptBlock, narrationLang, storyOutline, batchInfo, overview, keywords,
-    });
-    // 14000 tokens: 60 beats × ~200 tokens/beat = 12,000 + JSON wrapper headroom.
-    const scriptText = await callLLM({ provider, apiKey, model, messages: scriptMessages, maxTokens: 14000 });
-    const parsed = parseSceneScriptResponse(scriptText);
-    // FIX (2026-08-09): POSITIONAL PAIRING. The kept-beat indexes are GAPPED
-    // (SKIP-filtered scenes leave holes: 0,1,2,7,8,14,…) but Claude frequently
-    // renumbers its response sequentially (0,1,2,3,…). Pairing by returned
-    // index then attaches each narration to the WRONG beat — narration and
-    // sceneIds shift N beats forward of their startSec, desyncing EVERY beat
-    // of the render (root cause of the "no visual match" reports). The
-    // response order always mirrors the prompt order, so when counts match,
-    // pair by POSITION and overwrite the returned index with the real one.
-    if (parsed.length !== scriptBatches[bi].length) {
-      throw new Error(
-        `Stage-B narration count mismatch in batch ${bi}: ` +
-        `sent ${scriptBatches[bi].length}, received ${parsed.length}. Refusing ambiguous mapping.`
+  const requestNarrations = async (beatBatch, batchInfo, label) => {
+    const acceptedById = new Map();
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const scriptMessages = buildSceneScriptMessages({
+        movie, channelName, beats: beatBatch, characters, segments,
+        transcriptBlock, narrationLang, storyOutline, batchInfo, overview, keywords,
+      });
+      const scriptText = await callLLM({ provider, apiKey, model, messages: scriptMessages, maxTokens: 14000 });
+      const parsed = parseSceneScriptResponse(scriptText);
+      const reconciled = reconcileExactIndexedRows(beatBatch, parsed);
+      for (const [id, row] of reconciled.acceptedById) {
+        if (!acceptedById.has(id)) acceptedById.set(id, row);
+      }
+      if (beatBatch.length === 1 && parsed.length === 1) {
+        acceptedById.set(Number(beatBatch[0].index), { ...parsed[0], index: beatBatch[0].index });
+      }
+      const missingNow = beatBatch.filter((beat) => !acceptedById.has(Number(beat.index)));
+      if (missingNow.length === 0) {
+        if (attempt > 0) {
+          console.log(`[analyzeWithScenes] SCRIPT-RETRY ${label}: recovered all ${beatBatch.length} beats on retry`);
+        }
+        return beatBatch.map((beat) => acceptedById.get(Number(beat.index)));
+      }
+      console.warn(
+        `[analyzeWithScenes] SCRIPT-RETRY ${label}: attempt ${attempt + 1}/2 returned ` +
+        `${acceptedById.size}/${beatBatch.length} exact beat IDs; missing=[${missingNow.map((b) => b.index).join(",")}]`
       );
     }
-    let _renumbered = 0;
+    const missing = beatBatch.filter((beat) => !acceptedById.has(Number(beat.index)));
+    if (missing.length === 0) return beatBatch.map((beat) => acceptedById.get(Number(beat.index)));
+    if (beatBatch.length === 1) {
+      throw new Error(`Stage-B beat ${beatBatch[0].beatId || beatBatch[0].index} omitted after two attempts`);
+    }
+    for (let i = 0; i < missing.length; i += 5) {
+      const subset = missing.slice(i, i + 5);
+      const recovered = await requestNarrations(
+        subset,
+        { ...batchInfo, start: batchInfo.start + i, prevEnding: batchInfo.prevEnding },
+        `${label}/missing-${i / 5 + 1}`,
+      );
+      for (const row of recovered) acceptedById.set(Number(row.index), row);
+    }
+    return beatBatch.map((beat) => acceptedById.get(Number(beat.index)));
+  };
+
+  for (let bi = 0; bi < scriptBatches.length; bi++) {
+    const batchInfo = { start: bi * SCRIPT_BATCH, total: beats.length, prevEnding: prevNarrationEnd };
+    const parsed = await requestNarrations(scriptBatches[bi], batchInfo, `batch-${bi}`);
     parsed.forEach((p, j) => {
       const sourceBeat = scriptBatches[bi][j];
-      if (p.index !== sourceBeat.index) _renumbered++;
       p.index = sourceBeat.index;
       // Immutable server identity; never trust an LLM-returned scene span.
       p.beatId = sourceBeat.beatId;
       p.sceneIds = [sourceBeat.index];
     });
-    if (_renumbered > 0) {
-      console.log(`[analyzeWithScenes] SCRIPT-PAIRING: batch ${bi} — corrected ${_renumbered}/${parsed.length} renumbered beat indexes (positional pairing)`);
-    }
     if (parsed.length > 0) prevNarrationEnd = parsed[parsed.length - 1].narration.slice(-300);
     beatScript = beatScript.concat(parsed);
   }
