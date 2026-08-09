@@ -4714,7 +4714,10 @@ async function runRenderFromIngest(jobId, {
             const last  = _slMap.get(Math.max(...sids));
             if (!first || !last) return b;
             const ns = Number(first.startSec);
-            const ne = Math.max(Number(last.endSec), ns + 2);
+            // Preserve the exact immutable analyzed window. The old 2-second
+            // floor made narration fitting validate a larger window, then
+            // OVERLAP-TRIM shrank it back to 1.5s and caused downstream failure.
+            const ne = Number(last.endSec);
             if (!Number.isFinite(ns) || !Number.isFinite(ne)) return b;
             if (Math.abs(ns - Number(b.startSec)) > 1.0 || Math.abs(ne - Number(b.endSec)) > 1.0) _rederived++;
             return { ...b, startSec: ns, endSec: ne };
@@ -5436,40 +5439,26 @@ Return every slot exactly once and obey each MAX word count.`;
         // never by showing another scene's footage.
         console.log(`[render ${jobId}] LOCKED-WINDOWS: footage locked to analyzed scene windows for ${scenes.length} beats (no visual search)`);
 
-        // ── OVERLAP TRIM: resolve adjacent-beat window collisions ─────────────
-        // When Twelve Labs relocates a beat backward in time (chronological
-        // guard bypassed for vision-verified matches, e.g. a flashback) the
-        // window of beat[i] can extend past the startSec of beat[i+1], creating
-        // a source-range collision that causes duplicate footage mid-render.
-        // Trim beat[i].endSec to beat[i+1].startSec whenever overlap > 0.05s.
+        // v5 immutable-window assertion. Never mutate windows after narration
+        // fitting; any overlap means the analyze manifest itself is invalid.
         if (Array.isArray(beats) && beats.length > 1) {
-          let _overlapFixed = 0;
+          const overlaps = [];
           for (let _oi = 0; _oi < beats.length - 1; _oi++) {
             const _ob = beats[_oi];
             const _on = beats[_oi + 1];
             const _oe = Number(_ob.endSec ?? 0);
             const _ns = Number(_on.startSec ?? 0);
             if (_oe - _ns > 0.05) {
-              // v4.0.4: never trim a beat below 1.5s of footage — a sliver of
-              // overlap with the next beat is invisible; a zero-width window
-              // drops the beat (and its narration) from the recap entirely.
-              beats[_oi] = { ..._ob, endSec: Math.max(_ns, Number(_ob.startSec) + 1.5) };
-              _overlapFixed++;
+              overlaps.push({ i: _oi, overlap: _oe - _ns });
             }
           }
-          if (_overlapFixed > 0) {
-            console.log(`[render ${jobId}] OVERLAP-TRIM: resolved ${_overlapFixed} adjacent-beat window collision(s)`);
-            // Rebuild scenes[] to keep them in sync with trimmed beats[].
-            scenes = beats.map((b, i) => ({
-              startSec: Number(b.startSec),
-              endSec:   Number(b.endSec),
-              reason:   scenes[i]?.reason || b.reason || b.narration || "",
-              ...(Number.isFinite(b.focusSec) ? { focusSec: Number(b.focusSec) } : {}),
-              ...(Array.isArray(b.subWindows) && b.subWindows.length > 1 ? { subWindows: b.subWindows } : {}),
-            }));
+          if (overlaps.length > 0) {
+            throw new Error(
+              `PRO-QC immutable scene windows overlap: ` +
+              overlaps.slice(0, 10).map((x) => `beat${x.i}=${x.overlap.toFixed(2)}s`).join(", ")
+            );
           }
         }
-        // ── END OVERLAP TRIM ──────────────────────────────────────────────────
 
         // ── STEP 12: PER-BEAT JSON LOG (written before FFmpeg) ───────────────
         // Saves a {jobId}-beat-log.json file to JOBS_DIR so every render is
