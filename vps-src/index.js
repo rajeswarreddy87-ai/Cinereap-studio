@@ -3330,6 +3330,18 @@ async function withAutoRetry(jobId, label, fn) {
     await fn();
   } catch (firstErr) {
     const msg = String(firstErr?.message || firstErr).slice(0, 200);
+    const nonRetryable = firstErr?.nonRetryable === true ||
+      /PRO-QC|FINAL-QC|HOOK-QC|SCENE-LOCK|deterministic manifest/i.test(msg);
+    if (nonRetryable) {
+      console.error(`[${label} ${jobId}] non-retryable quality failure: ${msg}`);
+      await jobStore.update(jobId, {
+        status: "failed",
+        message: String(firstErr?.message || firstErr),
+        retryCount: 0,
+        failedAt: Date.now(),
+      }).catch(() => {});
+      return;
+    }
     console.warn(`[${label} ${jobId}] attempt 1 failed: ${msg} — retrying in 3 s`);
     console.warn(`[${label} ${jobId}] stack: ${firstErr?.stack?.split('\n').slice(0,4).join(' | ')}`);
     try {
@@ -5147,6 +5159,7 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
     //   • beats have substantial narration (avg ≥15 words — not just labels)
     //   • SERVER_OPENAI_KEY is configured
     // Falls back to original voice files + even distribution on any failure.
+    let _activeTtsConfig = null;
     {
       const _avgWords = beats.length > 0
         ? beats.reduce(
@@ -5205,6 +5218,13 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
           styleNum: _vsStyleNum,
           speedNum: _vsSpeedNum,
         };
+        _activeTtsConfig = {
+          apiKey: _ttsApiKey,
+          ttsProvider: _ttsProvider,
+          ttsVoice: _ttsVoice,
+          ttsSpeed: _ttsSpeed,
+          voiceSettings: _voiceSettings,
+        };
         const _ttsRes = await generatePerBeatTTS(jobId, beats, _ttsApiKey, {
             ttsProvider: _ttsProvider,
             ttsVoice: _ttsVoice,
@@ -5238,7 +5258,7 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
     let safeCeiling = 0;
 
     try {
-      const voDurs = await Promise.all(
+      let voDurs = await Promise.all(
         voiceoverFileIds.map((id) => probeDurationSec(path.join(UPLOADS_DIR, id)).catch(() => 0)),
       );
       voiceTotalPre = voDurs.reduce((a, b) => a + (Number(b) || 0), 0);
@@ -5254,11 +5274,113 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
         const creditsTail = Math.min(srcDur * 0.08, Math.max(90, srcDur * 0.035));
         safeCeiling = Math.max(srcDur * 0.5, srcDur - creditsTail);
       }
-      // v5 professional gate: preserve exact analyzed scene windows. Never
-      // extend the last beat to credits, borrow a neighboring scene, or solve a
-      // writing/footage mismatch with visible slow motion/frozen frames.
+      // v5 professional fit loop: actual generated speech duration is the truth.
+      // If it exceeds the approved moving footage, rewrite only those beats,
+      // regenerate their TTS, and measure again. Never solve a writing mismatch
+      // with visible slow motion, adjacent scenes, or cloned frames.
       if (beats.length > 0 && voiceTotalPre > 0.5) {
-        const _fitFailures = [];
+        const getFitFailures = () => beats.map((b, i) => {
+          const win = Math.max(0, Number(b.endSec) - Number(b.startSec));
+          const tts = Number(voDurs[i]) || 0;
+          return { i, win, tts, ratio: tts > 0 ? win / tts : 1 };
+        }).filter((x) => x.tts > 0 && x.ratio < 0.95);
+
+        for (let round = 1; round <= 2; round++) {
+          const failures = getFitFailures();
+          if (failures.length === 0) break;
+          if (!_activeTtsConfig) {
+            throw new Error(`PRO-QC cannot refit ${failures.length} beats: TTS provider configuration unavailable`);
+          }
+          console.log(`[render ${jobId}] NARRATION-FIT round ${round}: rewriting ${failures.length} overlong beat(s)`);
+          const rows = failures.map((x) => {
+            const beat = beats[x.i];
+            const words = String(beat.narration || "").trim().split(/\s+/).filter(Boolean);
+            const proportional = Math.floor(words.length * x.ratio * 0.88);
+            const windowBudget = Math.floor(x.win * 1.55);
+            const maxWords = Math.max(2, Math.min(proportional || 2, windowBudget || 2));
+            return {
+              slot: x.i,
+              beatId: beat.beatId || `beat-${x.i}`,
+              maxWords,
+              note: String(beat.reason || "").slice(0, 180),
+              narration: String(beat.narration || "").slice(0, 900),
+            };
+          });
+          const fitPrompt =
+`Shorten movie-recap narration so measured speech fits each scene's exact moving footage.
+Preserve only the visible event and essential plot fact. Use complete, natural sentences.
+Do not add facts, dialogue, introductions, transitions, or commentary.
+
+BEATS:
+${rows.map((r) => `${r.slot} | ${r.beatId} | MAX ${r.maxWords} WORDS | NOTE: ${r.note} | CURRENT: ${r.narration}`).join("\n")}
+
+Return JSON only:
+{"beats":[{"slot":0,"narration":"..."}]}
+Return every slot exactly once and obey each MAX word count.`;
+          const fitProvider = SERVER_ANTHROPIC_KEY ? "claude" : "gemini";
+          const fitText = await callLLM({
+            provider: fitProvider,
+            apiKey: fitProvider === "claude" ? SERVER_ANTHROPIC_KEY : SERVER_GEMINI_KEY,
+            model: fitProvider === "claude"
+              ? (SERVER_ANTHROPIC_MODEL || "claude-sonnet-4-5")
+              : SERVER_GEMINI_MODEL,
+            messages: [{ role: "user", content: fitPrompt }],
+            maxTokens: Math.max(800, rows.length * 90),
+            jsonMode: true,
+          });
+          let fitObj;
+          try {
+            const match = String(fitText).match(/\{[\s\S]*\}/);
+            fitObj = JSON.parse(match ? match[0] : fitText);
+          } catch (e) {
+            throw new Error(`NARRATION-FIT round ${round} returned invalid JSON: ${e.message}`);
+          }
+          const returned = Array.isArray(fitObj?.beats) ? fitObj.beats : [];
+          const bySlot = new Map();
+          for (const item of returned) {
+            const slot = Number(item?.slot);
+            const narration = String(item?.narration || "").trim();
+            if (rows.some((r) => r.slot === slot) && narration && !bySlot.has(slot)) {
+              bySlot.set(slot, narration);
+            }
+          }
+          if (bySlot.size !== rows.length) {
+            throw new Error(`NARRATION-FIT round ${round}: expected ${rows.length} exact slots, received ${bySlot.size}`);
+          }
+          for (const row of rows) {
+            const narration = bySlot.get(row.slot);
+            const wc = narration.split(/\s+/).filter(Boolean).length;
+            if (wc > row.maxWords) {
+              throw new Error(`NARRATION-FIT beat ${row.slot}: ${wc} words exceeds max ${row.maxWords}`);
+            }
+            beats[row.slot] = { ...beats[row.slot], narration };
+          }
+
+          const fitBeats = rows.map((r) => beats[r.slot]);
+          const fitTts = await generatePerBeatTTS(`${jobId}-fit${round}`, fitBeats, _activeTtsConfig.apiKey, {
+            ttsProvider: _activeTtsConfig.ttsProvider,
+            ttsVoice: _activeTtsConfig.ttsVoice,
+            ttsSpeed: _activeTtsConfig.ttsSpeed,
+            voiceSettings: _activeTtsConfig.voiceSettings,
+          });
+          rows.forEach((row, j) => {
+            voiceoverFileIds[row.slot] = fitTts[j].id;
+            voDurs[row.slot] = fitTts[j].duration;
+            if (Array.isArray(_perBeatTtsDurations)) _perBeatTtsDurations[row.slot] = fitTts[j].duration;
+          });
+          voiceTotalPre = voDurs.reduce((a, b) => a + (Number(b) || 0), 0);
+        }
+
+        const _fitFailures = getFitFailures();
+        if (_fitFailures.length > 0) {
+          const sample = _fitFailures.slice(0, 8)
+            .map((x) => `beat${x.i}[video=${x.win.toFixed(1)}s tts=${x.tts.toFixed(1)}s ratio=${x.ratio.toFixed(2)}]`)
+            .join(", ");
+          throw new Error(
+            `PRO-QC failed after two narration-fit rounds: ${_fitFailures.length}/${beats.length} beat(s) remain overlong. ${sample}`
+          );
+        }
+
         let _microRetime = 0;
         beats = beats.map((b, i) => {
           const win = Math.max(0, Number(b.endSec) - Number(b.startSec));
@@ -5269,21 +5391,10 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
             _microRetime++;
             return { ...b, slowFactor: ratio };
           }
-          _fitFailures.push({ i, win, tts, ratio });
           return { ...b, slowFactor: 1 };
         });
         if (_microRetime > 0) {
           console.log(`[render ${jobId}] PRO-QC: ${_microRetime} beat(s) use imperceptible micro-retime (0.95–1.00x)`);
-        }
-        if (_fitFailures.length > 0) {
-          const sample = _fitFailures.slice(0, 8)
-            .map((x) => `beat${x.i}[video=${x.win.toFixed(1)}s tts=${x.tts.toFixed(1)}s ratio=${x.ratio.toFixed(2)}]`)
-            .join(', ');
-          throw new Error(
-            `PRO-QC failed: ${_fitFailures.length}/${beats.length} narration beat(s) exceed their approved moving footage by >5%. ` +
-            `${sample}. Re-run analyze with pipeline v5 so narration is rewritten to the exact clip budget; ` +
-            `the renderer will not ship slow-motion/frozen footage.`
-          );
         }
       }
 
@@ -5575,6 +5686,8 @@ sourceBeatIds must be the Beat # numbers from the beats you actually referenced.
       await jobStore.update(jobId, {
         message: `Sync planning error: ${String(e?.message || e).slice(0, 160)}`,
       }).catch(() => {});
+      e.nonRetryable = true;
+      throw e;
     }
   }
 
